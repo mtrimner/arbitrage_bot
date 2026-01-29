@@ -115,6 +115,7 @@ pub async fn run_ws(
                             }
                         }
                         KalshiSocketMessage::TradeUpdate(tu) => {
+                            println!("TradeUpdate: {:#?}", tu);
                             handle_trade(&cfg, &shared, tu).await?;
                         }
                         KalshiSocketMessage::UserFill(uf) => {

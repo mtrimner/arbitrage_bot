@@ -41,6 +41,7 @@ fn parse_rfc3339_utc(ts: &str) -> Result<i64> {
 /// If none are active (rare), picks the soonest future market by open_time.
 pub async fn fetch_current_market(http: &KalshiClient, series_ticker: &str) -> Result<ActiveMarketMeta> {
     let params = MarketsQuery {
+        limit: Some(1000),
         series_ticker: Some(series_ticker.to_string()),
         ..Default::default()
     };
@@ -105,13 +106,13 @@ pub async fn bootstrap_active_markets(
         let cur = fetch_current_market(http, s).await?;
         out.push(cur);
     }
+    info!("Markets: {:#?}", out);
     Ok(out)
 }
 
 /// Write open_ts / close_ts into the live per-ticker Market state.
 /// This is what the engine uses for time-remaining and mode selection.
 pub async fn seed_shared_times(shared: &Shared, markets: &[ActiveMarketMeta]) -> Result<()> {
-    info!("Seeding shared times: {:#?} - {:#?}", shared, markets);
     for m in markets {
         let ts = shared.ensure_ticker(&m.market_ticker);
 

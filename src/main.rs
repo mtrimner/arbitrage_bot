@@ -113,30 +113,30 @@ async fn main() -> Result<()> {
 
     // Bootstrap: one active market per series
     let active = market_manager::bootstrap_active_markets(&http, &cfg.series_tickers).await?;
-
+    println!("Active Tickers: {:#?}", active);
     // Create Shared with all current active tickers (so engine/ws start correct)
     let tickers: Vec<String> = active.iter().map(|m| m.market_ticker.clone()).collect();
     let shared = Shared::new(tickers.clone());
-
+    println!("Tickers: {:#?}", tickers);
     // Seed close_ts/open_ts into Market state for each ticker
     market_manager::seed_shared_times(&shared, &active).await?;
 
     // Exec channel (engine + market_manager can both send ExecCommand)
-    // let (exec_tx, exec_rx) = mpsc::channel(256);
+    let (exec_tx, exec_rx) = mpsc::channel(256);
 
     // WS control channel (market_manager -> ws task)
     let (ws_ctl_tx, ws_ctl_rx) = mpsc::channel(64);
 
 
     // WS task
-    {
-        let shared = shared.clone();
-        let http = http.clone();
-        let cfg = cfg.clone();
-        tokio::spawn(async move {
-            let _ = ws::task::run_ws(ws_client, http, cfg, shared, tickers, ws_ctl_rx).await;
-        });
-    }
+    // {
+    //     let shared = shared.clone();
+    //     let http = http.clone();
+    //     let cfg = cfg.clone();
+    //     tokio::spawn(async move {
+    //         let _ = ws::task::run_ws(ws_client, http, cfg, shared, tickers, ws_ctl_rx).await;
+    //     });
+    // }
 
     // Exec task
     // {
@@ -148,27 +148,28 @@ async fn main() -> Result<()> {
     // }
 
     // Market manager task (rotates tickers based on close_time)
-    // {
-    //     let shared = shared.clone();
-    //     let http = http.clone();
-    //     let cfg = cfg.clone();
-    //     let ws_ctl_tx = ws_ctl_tx.clone();
-    //     let exec_tx = exec_tx.clone();
+    {
+        let shared = shared.clone();
+        let http = http.clone();
+        let cfg = cfg.clone();
+        let ws_ctl_tx = ws_ctl_tx.clone();
+        let exec_tx = exec_tx.clone();
 
-    //     tokio::spawn(async move {
-    //         let _ = market_manager::run_market_manager(
-    //             cfg,
-    //             http,
-    //             shared,
-    //             ws_ctl_tx,
-    //             exec_tx,
-    //             active,
-    //         ).await;
-    //     });
-    // }
+        tokio::spawn(async move {
+            let _ = market_manager::run_market_manager(
+                cfg,
+                http,
+                shared,
+                ws_ctl_tx,
+                exec_tx,
+                active,
+            ).await;
+        });
+    }
 
     // Engine runs on the main task
     // engine::task::run_engine(cfg, shared, exec_tx).await?;
+    ws::task::run_ws(ws_client, http, cfg, shared, tickers, ws_ctl_rx).await?;
 
     Ok(())
 }
