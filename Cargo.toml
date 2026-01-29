@@ -1,0 +1,15 @@
+[package]
+name = "kalshi_bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+dashmap = "6.1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"]}
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+kalshi-rs = "0.2.1"
+dotenv = "0.15.0"
