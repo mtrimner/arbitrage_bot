@@ -3,6 +3,7 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::state::book::Book;
 use crate::state::ticker::Market;
+use crate::types::Side;
 
 /// Weighted depth helper: sums the top N bid levels with decaying weights.
 /// This is a “snapshot liquidity pressure” measure.
@@ -40,6 +41,64 @@ pub fn raw_book_imbalance(cfg: &Config, book: &Book) -> f64 {
     ((y - nqty) / denom).clamp(-1.0, 1.0)
 }
 
+/// Convert a trade update into a signed flow measurement in [-1, +1].
+/// - YES taker => positive pressure
+/// - NO taker  => negative pressure
+///
+/// We map `count` into (0..1) with diminishing returns so big prints don't instantly clamp.
+pub fn raw_trade_flow(taker_side: Side, count: i64) -> f64 {
+    let c = count.max(0) as f64;
+
+    // Tunable scale: larger => each trade moves the EMA less.
+    // With 20, count=1 => ~0.047, count=10 => ~0.333, count=50 => ~0.714
+    let mag = c / (c + 20.0);
+
+    match taker_side {
+        Side::Yes => mag,
+        Side::No => -mag,
+    }
+}
+
+/// Convert an orderbook delta into a signed flow measurement in [-1, +1].
+/// - Adding YES bids near top => positive
+/// - Canceling YES bids near top => negative
+/// - Adding NO bids near top => negative
+/// - Canceling NO bids near top => positive
+///
+/// We weight deltas closer to the current best bid more heavily.
+pub fn raw_delta_flow(side: Side, price: u8, delta: i64, book: &Book) -> (f64, u32) {
+    if delta == 0 {
+        return (0.0, 0);
+    }
+
+    // Distance from current best bid on this side (0 = at best).
+    let best = book.best_bid(side).unwrap_or(price);
+    let dist = best.saturating_sub(price) as f64;
+
+    // Near-top levels matter more.
+    let w = 1.0 / (1.0 + dist); // simple decay
+
+    // Normalize magnitude so large deltas don’t instantly clamp to +/-1.
+    let abs = delta.saturating_abs() as f64;
+    let d = abs * w;
+    let mag = d / (d + 200.0); // tunable depth-change scale
+
+    let side_sign = match side {
+        Side::Yes => 1.0,
+        Side::No => -1.0,
+    };
+
+    // delta>0 means liquidity added; delta<0 means liquidity removed (opposite pressure)
+    let dir_sign = if delta > 0 { 1.0 } else { -1.0 };
+
+    let flow = (side_sign * dir_sign * mag).clamp(-1.0, 1.0);
+
+    // convert weighted magnitude to u32 (cap)
+    let abs_w_u32 = d.round().min(u32::MAX as f64) as u32;
+
+    (flow, abs_w_u32)
+}
+
 /// Combine EMA features into one score.
 /// This is the “prediction” you asked about:
 /// - book_imb_ema: where liquidity is leaning (resting interest)
@@ -50,12 +109,14 @@ pub fn raw_book_imbalance(cfg: &Config, book: &Book) -> f64 {
 pub fn combined_score(cfg: &Config, m: &mut Market) -> (f64, f64) {
     let now = Instant::now();
 
-    // Count recent activity for confidence.
+    // trade confidence (count based)
     let trade_n = m.flow.trade_count_recent(cfg, now);
-    let delta_n = m.flow.delta_count_recent(cfg, now);
-
     let trade_factor = (trade_n as f64 / cfg.trade_full_weight_count as f64).clamp(0.0, 1.0);
-    let delta_factor = (delta_n as f64 / cfg.delta_full_weight_count as f64).clamp(0.0, 1.0);
+    
+    // delta confidence( magnitude based)
+    let delta_n = m.flow.delta_count_recent(cfg, now); // Optional used for logging;
+    let delta_abs = m.flow.delta_abs_recent(cfg, now);
+    let delta_factor = (delta_abs as f64 / cfg.delta_full_weight_abs as f64).clamp(0.0, 1.0);
 
     let w_book = cfg.w_book;
     let w_trade = cfg.w_trade * trade_factor;
@@ -65,14 +126,33 @@ pub fn combined_score(cfg: &Config, m: &mut Market) -> (f64, f64) {
 
     let raw = (w_book * m.flow.book_imb_ema.value
         + w_trade * m.flow.trade_flow_ema.value
-        + w_delta * m.flow.delta_flow_ema.value)
-        / w_sum;
+        + w_delta * m.flow.delta_flow_ema.value);
 
     // Smooth the final score too (prevents jittery side flips).
     m.flow.on_score(cfg, raw, now);
 
     // Confidence is “how much of our max weights are active right now”.
-    let conf = (w_sum / (cfg.w_book + cfg.w_trade + cfg.w_delta)).clamp(0.0, 1.0);
+    // let conf = (w_sum / (cfg.w_book + cfg.w_trade + cfg.w_delta)).clamp(0.0, 1.0);
+    let conf = w_sum.clamp(0.0, 1.0);
+    // tracing::debug!(
+    //     trade_n,
+    //     delta_n,
+    //     trade_factor,
+    //     delta_abs,
+    //     delta_factor,
+    //     w_book = cfg.w_book,
+    //     w_trade,
+    //     w_delta,
+    //     w_sum,
+    //     book_ema = m.flow.book_imb_ema.value,
+    //     trade_ema = m.flow.trade_flow_ema.value,
+    //     delta_ema = m.flow.delta_flow_ema.value,
+    //     raw,
+    //     score_ema = m.flow.score_ema.value,
+    //     conf,
+    //     "combined_score breakdown"
+    // );
+
 
     (m.flow.score_ema.value.clamp(-1.0, 1.0), conf)
 }

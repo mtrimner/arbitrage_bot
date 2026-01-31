@@ -67,6 +67,10 @@ pub struct Config {
     pub trade_full_weight_count: usize,
     pub delta_full_weight_count: usize,
 
+    // How much absolute delta (sum of |delta| in the rate window)
+    // should correspond to "full confidence" for delta weighting.
+    pub delta_full_weight_abs: u32,
+
     // Base weights for combining features into one “pressure score”
     // (positive => YES pressure; negative => NO pressure)
     pub w_book: f64,
@@ -115,12 +119,13 @@ impl Default for Config {
             tau_score_ms: 600,
 
             rate_window_ms: 10_000,
-            trade_full_weight_count: 25, // full confidence once ~25 trades in last 10s
-            delta_full_weight_count: 60, // deltas tend to be more frequent than trades
+            trade_full_weight_count: 15, // full confidence once ~25 trades in last 10s
+            delta_full_weight_count: 250, // deltas tend to be more frequent than trades
+            delta_full_weight_abs: 80000,
 
-            w_book: 0.50,
-            w_trade: 0.35,
-            w_delta: 0.15,
+            w_book: 0.35,
+            w_trade: 0.45,
+            w_delta: 0.20,
         }
     }
 }

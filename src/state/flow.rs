@@ -58,7 +58,10 @@ pub struct FlowState {
 
     // For “confidence scaling”: count recent events.
     pub trade_times: VecDeque<Instant>,
-    pub delta_times: VecDeque<Instant>,
+    pub delta_times: VecDeque<Instant>, //Optional: just for logging counts
+
+    // (time, |delta|)
+    pub delta_abs_events: VecDeque<(Instant, u32)>,
 }
 
 impl Default for FlowState {
@@ -76,19 +79,49 @@ impl Default for FlowState {
 
             trade_times: VecDeque::with_capacity(512),
             delta_times: VecDeque::with_capacity(1024),
+            delta_abs_events: VecDeque::with_capacity(1024),
+
+            
         }
     }
 }
 
 impl FlowState {
+    // fn prune_times(times: &mut VecDeque<Instant>, window: Duration, now: Instant) {
+    //     while let Some(front) = times.front().copied() {
+    //         if now.duration_since(front) > window {
+    //             times.pop_front();
+    //         } else {
+    //             break;
+    //         }
+    //     }
+    // }
+
     fn prune_times(times: &mut VecDeque<Instant>, window: Duration, now: Instant) {
-        while let Some(front) = times.front().copied() {
-            if now.duration_since(front) > window {
-                times.pop_front();
-            } else {
-                break;
-            }
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        while matches!(times.front(), Some(t) if *t < cutoff) {
+            times.pop_front();
         }
+    }
+
+    fn prune_abs_events(events: &mut VecDeque<(Instant, u32)>, window: Duration, now: Instant) {
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        while matches!(events.front(), Some((t, _)) if *t < cutoff) {
+            events.pop_front();
+        }
+    }
+
+    pub fn record_delta_abs(&mut self, cfg: &Config, now: Instant, abs_w: u32) {
+        let window = Duration::from_millis(cfg.rate_window_ms);
+
+        // Count-based (keeps delta_count_recent working)
+        self.delta_times.push_back(now);
+
+        // Magnitude-based (Lever 3 input, already distance-weighted)
+        self.delta_abs_events.push_back((now, abs_w));
+
+        Self::prune_times(&mut self.delta_times, window, now);
+        Self::prune_abs_events(&mut self.delta_abs_events, window, now);
     }
 
     pub fn trade_count_recent(&mut self, cfg: &Config, now: Instant) -> usize {
@@ -101,6 +134,13 @@ impl FlowState {
         let window = Duration::from_millis(cfg.rate_window_ms);
         Self::prune_times(&mut self.delta_times, window, now);
         self.delta_times.len()
+    }
+
+    pub fn delta_abs_recent(&mut self, cfg: &Config, now: Instant) -> u32 {
+        let window = Duration::from_millis(cfg.rate_window_ms);
+        Self::prune_abs_events(&mut self.delta_abs_events, window, now);
+        let sum: u64 = self.delta_abs_events.iter().map(|(_, mag)| *mag as u64).sum();
+        sum.min(u32::MAX as u64) as u32
     }
 
     pub fn on_book_imbalance(&mut self, cfg: &Config, raw_imb: f64, now: Instant) {
@@ -130,21 +170,17 @@ impl FlowState {
         );
     }
 
-    pub fn on_delta_flow(&mut self, cfg: &Config, raw_flow: f64, now: Instant) {
+    pub fn on_delta_flow(&mut self, cfg: &Config, raw_flow: f64, abs_w: u32, now: Instant) {
         let tau = Duration::from_millis(cfg.tau_delta_ms);
         let dt = self
             .last_delta_at
             .map(|t| now.duration_since(t))
             .unwrap_or(Duration::from_millis(cfg.tick_ms));
+
         self.delta_flow_ema.update(raw_flow.clamp(-1.0, 1.0), dt, tau);
         self.last_delta_at = Some(now);
 
-        self.delta_times.push_back(now);
-        Self::prune_times(
-            &mut self.delta_times,
-            Duration::from_millis(cfg.rate_window_ms),
-            now,
-        );
+        self.record_delta_abs(cfg, now, abs_w);
     }
 
     /// Score EMA on top of the combined score.

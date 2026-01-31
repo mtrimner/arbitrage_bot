@@ -69,10 +69,13 @@ fn allowed_imbalance(cfg: &Config, t_rem: i64) -> f64 {
 /// accumulate_s means “first X seconds from open”
 fn pick_mode(cfg: &Config, t_rem: i64, window_s: i64) -> Mode {
     if t_rem <= cfg.balance_s {
+        // println!("Balance Mode: TRem: {:#?}", t_rem);
         Mode::Balance
     } else if t_rem > (window_s - cfg.accumulate_s) {
+        // println!("Accumulate Mode: TRem: {:#?}", t_rem);
         Mode::Accumulate
     } else {
+        // println!("Hedge Mode: TRem: {:#?}", t_rem);
         Mode::Hedge
     }
 }
@@ -496,17 +499,39 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     // - fallback uses epoch-bucket id
     let wid = m.open_ts.unwrap_or_else(|| window_id(now_s, window_s));
 
+    let prev_mode = m.mode;
+    let is_new_window = m.window_id != wid;
+
     // Reset per-window counters.
-    if m.window_id != wid {
+    if is_new_window {
         m.window_id = wid;
         m.momentum_used_extra = 0;
     }
 
     // Mode uses actual window_s (not cfg.window_s).
     m.mode = pick_mode(cfg, t_rem, window_s);
+    // println!("Current Mode: {:#?}", m.mode);
 
     // Score is independent of time logic.
-    let (score, _conf) = signal::combined_score(cfg, m);
+    let (score, conf) = signal::combined_score(cfg, m);
+    println!("Score, Conf {:#?}, {:#?}", score, conf);
+
+    // log only when something meaningful changes
+    // if is_new_window || m.mode != prev_mode || score.abs() >= cfg.momentum_score_threshold {
+    //     tracing::info!(
+    //         ticker = %ticker,
+    //         wid = wid,
+    //         window_s = window_s,
+    //         t_rem = t_rem,
+    //         mode = ?m.mode,
+    //         book_ema = m.flow.book_imb_ema.value,
+    //         trade_ema = m.flow.trade_flow_ema.value,
+    //         delta_ema = m.flow.delta_flow_ema.value,
+    //         score = score,
+    //         conf = conf,
+    //         "decision inputs"
+    //     );
+    // }
 
     // 0) Cancel stale resting orders (but never churn fast).
     if let Some(cmd) = cancel_stale_if_needed(cfg, ticker, m, now) {

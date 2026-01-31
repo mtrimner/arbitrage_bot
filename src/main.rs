@@ -113,11 +113,11 @@ async fn main() -> Result<()> {
 
     // Bootstrap: one active market per series
     let active = market_manager::bootstrap_active_markets(&http, &cfg.series_tickers).await?;
-    println!("Active Tickers: {:#?}", active);
+    // println!("Active Tickers: {:#?}", active);
     // Create Shared with all current active tickers (so engine/ws start correct)
     let tickers: Vec<String> = active.iter().map(|m| m.market_ticker.clone()).collect();
     let shared = Shared::new(tickers.clone());
-    println!("Tickers: {:#?}", tickers);
+    // println!("Tickers: {:#?}", tickers);
     // Seed close_ts/open_ts into Market state for each ticker
     market_manager::seed_shared_times(&shared, &active).await?;
 
@@ -129,14 +129,14 @@ async fn main() -> Result<()> {
 
 
     // WS task
-    // {
-    //     let shared = shared.clone();
-    //     let http = http.clone();
-    //     let cfg = cfg.clone();
-    //     tokio::spawn(async move {
-    //         let _ = ws::task::run_ws(ws_client, http, cfg, shared, tickers, ws_ctl_rx).await;
-    //     });
-    // }
+    {
+        let shared = shared.clone();
+        let http = http.clone();
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            let _ = ws::task::run_ws(ws_client, http, cfg, shared, tickers, ws_ctl_rx).await;
+        });
+    }
 
     // Exec task
     // {
@@ -168,8 +168,8 @@ async fn main() -> Result<()> {
     }
 
     // Engine runs on the main task
-    // engine::task::run_engine(cfg, shared, exec_tx).await?;
-    ws::task::run_ws(ws_client, http, cfg, shared, tickers, ws_ctl_rx).await?;
+    engine::task::run_engine(cfg, shared, exec_tx).await?;
+    // ws::task::run_ws(ws_client, http, cfg, shared, tickers, ws_ctl_rx).await?;
 
     Ok(())
 }

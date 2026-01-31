@@ -42,13 +42,13 @@ fn parse_rfc3339_utc(ts: &str) -> Result<i64> {
 pub async fn fetch_current_market(http: &KalshiClient, series_ticker: &str) -> Result<ActiveMarketMeta> {
     let params = MarketsQuery {
         limit: Some(1000),
+        status: Some("open".to_string()),
         series_ticker: Some(series_ticker.to_string()),
         ..Default::default()
     };
 
     let resp = http.get_all_markets(&params).await?;
     let markets = resp.markets;
-
     let now = Utc::now().timestamp();
 
     // 1) Prefer status == "active"
