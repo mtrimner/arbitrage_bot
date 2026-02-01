@@ -664,6 +664,22 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     let (score, conf) = signal::combined_score(cfg, m);
     println!("Score, Conf {:#?}, {:#?}", score, conf);
 
+    // -------------------------------------
+    let yes_bid = m.book.best_bid(Side::Yes);
+    let yes_ask = m.book.implied_ask(Side::Yes);
+
+    let no_bid  = m.book.best_bid(Side::No);
+    let no_ask  = m.book.implied_ask(Side::No);
+
+    // quantities at best bids (direct from your arrays)
+    let yes_bid_qty = yes_bid.map(|p| m.book.yes_bids[p as usize]).unwrap_or(0);
+    let no_bid_qty  = no_bid .map(|p| m.book.no_bids [p as usize]).unwrap_or(0);
+
+    // in your model, YES ask comes from NO best bid (sell YES == buy NO), so use the opposite bid qty
+    let yes_ask_qty = no_bid_qty;
+    let no_ask_qty  = yes_bid_qty;
+    println!("yes_bid: {:#?}, yes_ask: {:#?}, no_bid: {:#?}, no_ask: {:#?}, no_bid_qty: {:#?}, yes_bid_qty: {:#?}, no_ask_qty: {:#?}, yes_ask_qty: {:#?}", yes_bid, yes_ask, no_bid, no_ask, no_bid_qty, yes_bid_qty, no_ask_qty, yes_ask_qty);
+    // -------------------------------------
     let desired_side = choose_working_side(cfg, m, t_rem, score, conf);
     m.last_desired_side = Some(desired_side);
 

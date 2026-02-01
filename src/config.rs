@@ -136,10 +136,10 @@ impl Default for Config {
             taker_cooldown_ms: 400,
             min_taker_improve_cc: 5, // 0.05 cents improvement in pair-cost
 
-            tau_book_ms: 700,
-            tau_trade_ms: 900,
-            tau_delta_ms: 800,
-            tau_score_ms: 600,
+            tau_book_ms: 500,
+            tau_trade_ms: 700,
+            tau_delta_ms: 600,
+            tau_score_ms: 400,
 
             rate_window_ms: 10_000,
             trade_full_weight_count: 16, // full confidence once ~25 trades in last 10s
@@ -148,15 +148,15 @@ impl Default for Config {
             trade_full_weight_abs: 25,
             score_full_conf_abs: 0.25,
 
-            enable_depth_norm: false,
-            depth_norm_levels: 5,
-            depth_full_weight_qty: 200.0,
-            depth_norm_min_mult: 0.5,
-            depth_norm_max_mult: 2.0,
+            enable_depth_norm: true,
+            depth_norm_levels: 3,
+            depth_full_weight_qty: 100.0,
+            depth_norm_min_mult: 0.7,
+            depth_norm_max_mult: 1.6,
 
-            w_book: 0.35,
-            w_trade: 0.45,
-            w_delta: 0.20,
+            w_book: 0.5,
+            w_trade: 0.35,
+            w_delta: 0.15,
         }
     }
 }
