@@ -74,6 +74,21 @@ pub struct Config {
     // How much absolute delta (sum of |delta| in the rate window)
     // should correspond to "full confidence" for delta weighting.
     pub delta_full_weight_abs: u32,
+    // Trade magnitude in the rate window that corresponds to "full confidence"
+    // for trade weighting (sum of trade counts in the window).
+    pub trade_full_weight_abs: u32,
+
+    // Confidence should not be high when the signal itself is tiny.
+    // When |score_ema| >= this, strength factor ~= 1.0.
+    pub score_full_conf_abs: f64,
+
+    // Optional: normalize trade/delta magnitude by current top-of-book depth.
+    // This makes the same activity "mean more" in thin books.
+    pub enable_depth_norm: bool,
+    pub depth_norm_levels: usize,     // how many top bid levels per side
+    pub depth_full_weight_qty: f64,   // reference depth; smaller depth => boost
+    pub depth_norm_min_mult: f64,     // clamp boost
+    pub depth_norm_max_mult: f64,
 
     // Base weights for combining features into one “pressure score”
     // (positive => YES pressure; negative => NO pressure)
@@ -130,6 +145,14 @@ impl Default for Config {
             trade_full_weight_count: 16, // full confidence once ~25 trades in last 10s
             delta_full_weight_count: 250, // deltas tend to be more frequent than trades
             delta_full_weight_abs: 30000,
+            trade_full_weight_abs: 25,
+            score_full_conf_abs: 0.25,
+
+            enable_depth_norm: false,
+            depth_norm_levels: 5,
+            depth_full_weight_qty: 200.0,
+            depth_norm_min_mult: 0.5,
+            depth_norm_max_mult: 2.0,
 
             w_book: 0.35,
             w_trade: 0.45,

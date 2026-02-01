@@ -258,7 +258,18 @@ async fn handle_delta(cfg: &Config, shared: &Shared, delta: OrderbookDelta) -> R
 
         // === EMA update: delta flow ===
         let (raw_df, abs_w) = crate::engine::signal::raw_delta_flow(side, m.price, m.delta, &g.book);
-        g.flow.on_delta_flow(cfg, raw_df, abs_w, now);
+
+        // Pressure sign matches raw_delta_flow:
+        // YES add => +, YES remove => -, NO add => -, NO remove => +
+        let side_sign: i64 = match side {
+            Side::Yes => 1,
+            Side::No => -1,
+        };
+        let dir_sign: i64 = if m.delta > 0 {1} else {-1};
+
+        let signed_w = side_sign * dir_sign * (abs_w as i64);
+
+        g.flow.on_delta_flow(cfg, raw_df, abs_w, signed_w, now);
 
         // === EMA update: book imbalance (because the book changed) ===
         let raw_imb = crate::engine::signal::raw_book_imbalance(cfg, &g.book);
@@ -303,7 +314,14 @@ async fn handle_trade(cfg: &Config, shared: &Shared, tu: TradeUpdate) -> Result<
     // === EMA update: trade flow ===
     let now = Instant::now();
     let raw_tf = crate::engine::signal::raw_trade_flow(taker_side, m.count);
-    g.flow.on_trade_flow(cfg, raw_tf, now);
+    
+    // YES taker => +qty, NO taker => -qty
+    let signed_qty = match taker_side {
+        Side::Yes => m.count,
+        Side::No => -m.count,
+    };
+
+    g.flow.on_trade_flow(cfg, raw_tf, signed_qty, now);
 
     // tracing::debug!(
     //     ticker = %ticker,

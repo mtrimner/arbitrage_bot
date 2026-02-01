@@ -107,17 +107,55 @@ pub fn raw_delta_flow(side: Side, price: u8, delta: i64, book: &Book) -> (f64, u
 ///
 /// We also confidence-scale trade/delta weights if recent activity is low.
 pub fn combined_score(cfg: &Config, m: &mut Market) -> (f64, f64) {
+    fn clamp01(x: f64) -> f64 { x.clamp(0.0, 1.0) }
+    fn sign01(x: f64) -> f64 {
+        if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
+    }
+
     let now = Instant::now();
 
-    // trade confidence (count based)
-    let trade_n = m.flow.trade_count_recent(cfg, now);
-    let trade_factor = (trade_n as f64 / cfg.trade_full_weight_count as f64).clamp(0.0, 1.0);
     
-    // delta confidence( magnitude based)
-    let delta_n = m.flow.delta_count_recent(cfg, now); // Optional used for logging;
-    let delta_abs = m.flow.delta_abs_recent(cfg, now);
-    let delta_factor = (delta_abs as f64 / cfg.delta_full_weight_abs as f64).clamp(0.0, 1.0);
+    // --- optional liquidity normalization (boost in thin books) ---
+    let (depth_now, depth_mult) = if cfg.enable_depth_norm {
+        let n = cfg.depth_norm_levels.max(1);
+        let y = weighted_top_n_qty(&m.book.yes_bids, n);
+        let nqty = weighted_top_n_qty(&m.book.no_bids, n);
+        let depth = (y + nqty).max(1.0);
 
+        let mult = (cfg.depth_full_weight_qty.max(1.0) / depth)
+            .clamp(cfg.depth_norm_min_mult, cfg.depth_norm_max_mult);
+
+        (depth, mult)
+    } else {
+        (0.0, 1.0)
+    };
+
+    // ---------- trade confidence (count + magnitude + coherence) ----------
+    let trade_n = m.flow.trade_count_recent(cfg, now);
+
+    let trade_abs = m.flow.trade_abs_recent(cfg, now) as f64; // sum(|qty|)
+    let trade_net = m.flow.trade_net_recent(cfg, now) as f64; // sum(signed qty)
+
+    let trade_f_n = clamp01(trade_n as f64 / (cfg.trade_full_weight_count.max(1) as f64));
+    let trade_f_abs = clamp01((trade_abs * depth_mult) / (cfg.trade_full_weight_abs.max(1) as f64));
+    let trade_coh = clamp01(trade_net.abs() / trade_abs.max(1e-9));
+
+    
+    // Geometric mean keeps scale sane; coherence kills churny prints
+    let trade_factor = (trade_f_n * trade_f_abs * trade_coh).powf(1.0 / 3.0);
+    
+    // ---------- delta confidence (count + magnitude + coherence) ----------
+    let delta_n = m.flow.delta_count_recent(cfg, now) as f64;
+    let delta_abs = m.flow.delta_abs_recent(cfg, now) as f64; // sum(|weighted delta|)
+    let delta_net = m.flow.delta_net_recent(cfg, now) as f64; // sum(signed weighted delta)
+
+    let delta_f_n = clamp01(delta_n as f64 / (cfg.delta_full_weight_count.max(1) as f64));
+    let delta_f_abs = clamp01((delta_abs * depth_mult) / (cfg.delta_full_weight_abs.max(1) as f64));
+    let delta_coh = clamp01(delta_net.abs() / delta_abs.max(1e-9));
+
+    let delta_factor = (delta_f_n * delta_f_abs * delta_coh).powf(1.0 / 3.0);
+
+    // ---------- combine features ----------
     let w_book = cfg.w_book;
     let w_trade = cfg.w_trade * trade_factor;
     let w_delta = cfg.w_delta * delta_factor;
@@ -131,29 +169,61 @@ pub fn combined_score(cfg: &Config, m: &mut Market) -> (f64, f64) {
     // Smooth the final score too (prevents jittery side flips).
     m.flow.on_score(cfg, raw, now);
 
-    // Confidence is “how much of our max weights are active right now”.
-    // let conf = (w_sum / (cfg.w_book + cfg.w_trade + cfg.w_delta)).clamp(0.0, 1.0);
-    let conf = (((w_trade + w_delta)) / (cfg.w_trade + cfg.w_delta).max(1e-9))
-        .clamp(0.0, 1.0);
+    // ---------- confidence ----------
+    // 1) activity: "are trade/delta weights actually active?"
+    let activity = clamp01((w_trade + w_delta) / (cfg.w_trade + cfg.w_delta).max(1e-9));
 
-    tracing::debug!(
-        trade_n,
-        delta_n,
-        trade_factor,
-        delta_abs,
-        delta_factor,
-        w_book = cfg.w_book,
-        w_trade,
-        w_delta,
-        w_sum,
-        book_ema = m.flow.book_imb_ema.value,
-        trade_ema = m.flow.trade_flow_ema.value,
-        delta_ema = m.flow.delta_flow_ema.value,
-        raw,
-        score_ema = m.flow.score_ema.value,
-        conf,
-        "combined_score breakdown"
-    );
+    // 2) agreement: do book/trade/delta mostly point the same way?
+    let s_book  = sign01(m.flow.book_imb_ema.value);
+    let s_trade = sign01(m.flow.trade_flow_ema.value);
+    let s_delta = sign01(m.flow.delta_flow_ema.value);
+
+    let consensus = clamp01((w_book * s_book + w_trade * s_trade + w_delta * s_delta).abs() / w_sum);
+
+    // 3) strength: don’t be “confident” when score is tiny
+    let strength = clamp01(m.flow.score_ema.value.abs() / cfg.score_full_conf_abs.max(1e-9));
+
+    let conf = clamp01(activity * (0.5 + 0.5 * consensus) * strength);
+
+    // tracing::debug!(
+    //     trade_n,
+    //     trade_abs,
+    //     trade_net,
+    //     trade_f_n,
+    //     trade_f_abs,
+    //     trade_coh,
+    //     trade_factor,
+
+    //     delta_n,
+    //     delta_abs,
+    //     delta_net,
+    //     delta_f_n,
+    //     delta_f_abs,
+    //     delta_coh,
+    //     delta_factor,
+
+    //     depth_now,
+    //     depth_mult,
+
+    //     w_book = cfg.w_book,
+    //     w_trade,
+    //     w_delta,
+    //     w_sum,
+
+    //     book_ema = m.flow.book_imb_ema.value,
+    //     trade_ema = m.flow.trade_flow_ema.value,
+    //     delta_ema = m.flow.delta_flow_ema.value,
+
+    //     raw,
+    //     score_ema = m.flow.score_ema.value,
+
+    //     activity,
+    //     consensus,
+    //     strength,
+    //     conf,
+
+    //     "combined_score breakdown"
+    // );
 
 
     (m.flow.score_ema.value.clamp(-1.0, 1.0), conf)

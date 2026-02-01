@@ -662,7 +662,7 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
 
     // Score is independent of time logic.
     let (score, conf) = signal::combined_score(cfg, m);
-    // println!("Score, Conf {:#?}, {:#?}", score, conf);
+    println!("Score, Conf {:#?}, {:#?}", score, conf);
 
     let desired_side = choose_working_side(cfg, m, t_rem, score, conf);
     m.last_desired_side = Some(desired_side);

@@ -62,6 +62,13 @@ pub struct FlowState {
 
     // (time, |delta|)
     pub delta_abs_events: VecDeque<(Instant, u32)>,
+
+    // Trade magnitude (abs and signed) in the rate window
+    pub trade_abs_events: VecDeque<(Instant, u32)>,
+    pub trade_net_events: VecDeque<(Instant, i64)>,
+
+    // Delta signed magnitude (pressure-signed, distance-weighted)
+    pub delta_net_events: VecDeque<(Instant, i64)>,
 }
 
 impl Default for FlowState {
@@ -81,7 +88,9 @@ impl Default for FlowState {
             delta_times: VecDeque::with_capacity(1024),
             delta_abs_events: VecDeque::with_capacity(1024),
 
-            
+            trade_abs_events: VecDeque::with_capacity(512),
+            trade_net_events: VecDeque::with_capacity(512),
+            delta_net_events: VecDeque::with_capacity(1024),
         }
     }
 }
@@ -104,6 +113,13 @@ impl FlowState {
         }
     }
 
+    fn prune_i64_events(events: &mut VecDeque<(Instant, i64)>, window: Duration, now: Instant) {
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        while matches!(events.front(), Some((t, _)) if *t < cutoff) {
+            events.pop_front();
+        }
+    }
+
     fn prune_abs_events(events: &mut VecDeque<(Instant, u32)>, window: Duration, now: Instant) {
         let cutoff = now.checked_sub(window).unwrap_or(now);
         while matches!(events.front(), Some((t, _)) if *t < cutoff) {
@@ -111,18 +127,18 @@ impl FlowState {
         }
     }
 
-    pub fn record_delta_abs(&mut self, cfg: &Config, now: Instant, abs_w: u32) {
-        let window = Duration::from_millis(cfg.rate_window_ms);
+    // pub fn record_delta_abs(&mut self, cfg: &Config, now: Instant, abs_w: u32) {
+    //     let window = Duration::from_millis(cfg.rate_window_ms);
 
-        // Count-based (keeps delta_count_recent working)
-        self.delta_times.push_back(now);
+    //     // Count-based (keeps delta_count_recent working)
+    //     self.delta_times.push_back(now);
 
-        // Magnitude-based (Lever 3 input, already distance-weighted)
-        self.delta_abs_events.push_back((now, abs_w));
+    //     // Magnitude-based (Lever 3 input, already distance-weighted)
+    //     self.delta_abs_events.push_back((now, abs_w));
 
-        Self::prune_times(&mut self.delta_times, window, now);
-        Self::prune_abs_events(&mut self.delta_abs_events, window, now);
-    }
+    //     Self::prune_times(&mut self.delta_times, window, now);
+    //     Self::prune_abs_events(&mut self.delta_abs_events, window, now);
+    // }
 
     pub fn trade_count_recent(&mut self, cfg: &Config, now: Instant) -> usize {
         let window = Duration::from_millis(cfg.rate_window_ms);
@@ -153,24 +169,61 @@ impl FlowState {
         self.last_book_at = Some(now);
     }
 
-    pub fn on_trade_flow(&mut self, cfg: &Config, raw_flow: f64, now: Instant) {
+    pub fn on_trade_flow(&mut self, cfg: &Config, raw_flow: f64, signed_qty: i64, now: Instant) {
         let tau = Duration::from_millis(cfg.tau_trade_ms);
         let dt = self
             .last_trade_at
             .map(|t| now.duration_since(t))
             .unwrap_or(Duration::from_millis(cfg.tick_ms));
-        self.trade_flow_ema.update(raw_flow.clamp(-1.0, 1.0), dt, tau);
+
+        let clamped = raw_flow.clamp(-1.0, 1.0);
+
+        // compute alpha EXACTLY like Ema::update does
+        // let dt_s  = dt.as_secs_f64().max(0.000_001);
+        // let tau_s = tau.as_secs_f64().max(0.000_001);
+        // let alpha = 1.0 - (-dt_s / tau_s).exp();
+
+        // let prev = self.trade_flow_ema.value;
+//         tracing::debug!(
+//     target: "kalshi_bot::state::flow",
+//     "trade_flow_ema: before update raw_flow={} x={} signed_qty={} dt_ms={} tau_ms={} alpha={} prev={} last_trade_at={:?}",
+//     raw_flow, clamped, signed_qty, dt.as_millis(), tau.as_millis(), alpha, prev, self.last_trade_at
+// );
+            
+        // tracing::debug!(
+        //     raw_flow,
+        //     clamped,
+        //     signed_qty,
+        //     dt_ms = dt.as_millis(),
+        //     tau_ms = tau.as_millis(),
+        //     alpha,
+        //     prev,
+        //     last_trade_at = ?self.last_trade_at,
+        //     "trade_flow_ema: before update"
+        // );
+
+        self.trade_flow_ema.update(clamped, dt, tau);
+        
+        // let next = self.trade_flow_ema.value;
+        // tracing::debug!(
+        //     target: "kalshi_bot::state::flow",
+        //     "trade_flow_ema: after update next={}",
+        //     next
+        // );
+
         self.last_trade_at = Some(now);
 
-        self.trade_times.push_back(now);
-        Self::prune_times(
-            &mut self.trade_times,
-            Duration::from_millis(cfg.rate_window_ms),
-            now,
-        );
+        self.record_trade_metrics(cfg, now, signed_qty);
+
+        // self.trade_times.push_back(now);
+        // Self::prune_times(
+        //     &mut self.trade_times,
+        //     Duration::from_millis(cfg.rate_window_ms),
+        //     now,
+        // );
     }
 
-    pub fn on_delta_flow(&mut self, cfg: &Config, raw_flow: f64, abs_w: u32, now: Instant) {
+    pub fn on_delta_flow(&mut self, cfg: &Config, raw_flow: f64, abs_w: u32, signed_w: i64, now: Instant) {
         let tau = Duration::from_millis(cfg.tau_delta_ms);
         let dt = self
             .last_delta_at
@@ -180,7 +233,7 @@ impl FlowState {
         self.delta_flow_ema.update(raw_flow.clamp(-1.0, 1.0), dt, tau);
         self.last_delta_at = Some(now);
 
-        self.record_delta_abs(cfg, now, abs_w);
+        self.record_delta_metrics(cfg, now, abs_w, signed_w);
     }
 
     /// Score EMA on top of the combined score.
@@ -192,5 +245,55 @@ impl FlowState {
             .unwrap_or(Duration::from_millis(cfg.tick_ms));
         self.score_ema.update(raw_score.clamp(-1.0, 1.0), dt, tau);
         self.last_score_at = Some(now);
+    }
+
+    pub fn record_trade_metrics(&mut self, cfg: &Config, now: Instant, signed_qty: i64) {
+        let window = Duration::from_millis(cfg.rate_window_ms);
+
+        // event count (already used)
+        self.trade_times.push_back(now);
+
+        // magnitude series
+        let abs_qty = signed_qty.unsigned_abs().min(u32::MAX as u64) as u32;
+        self.trade_abs_events.push_back((now, abs_qty));
+        self.trade_net_events.push_back((now, signed_qty));
+        
+        Self::prune_times(&mut self.trade_times, window, now);
+        Self::prune_abs_events(&mut self.trade_abs_events, window, now);
+        Self::prune_i64_events(&mut self.trade_net_events, window, now);
+    }
+
+    pub fn record_delta_metrics(&mut self, cfg: &Config, now: Instant, abs_w: u32, signed_w: i64) {
+        let window = Duration::from_millis(cfg.rate_window_ms);
+
+        // event count (already used)
+        self.delta_times.push_back(now);
+
+        // magnitude series
+        self.delta_abs_events.push_back((now, abs_w));
+        self.delta_net_events.push_back((now, signed_w));
+
+        Self::prune_times(&mut self.delta_times, window, now);
+        Self::prune_abs_events(&mut self.delta_abs_events, window, now);
+        Self::prune_i64_events(&mut self.delta_net_events, window, now);
+    }
+
+    
+    pub fn trade_abs_recent(&mut self, cfg: &Config, now: Instant) -> u64 {
+        let window = Duration::from_millis(cfg.rate_window_ms);
+        Self::prune_abs_events(&mut self.trade_abs_events, window, now);
+        self.trade_abs_events.iter().map(|(_, v)| *v as u64).sum()
+    }
+
+    pub fn trade_net_recent(&mut self, cfg: &Config, now: Instant) -> i64 {
+        let window = Duration::from_millis(cfg.rate_window_ms);
+        Self::prune_i64_events(&mut self.trade_net_events, window, now);
+        self.trade_net_events.iter().map(|(_, v)| *v).sum()
+    }
+
+    pub fn delta_net_recent(&mut self, cfg: &Config, now: Instant) -> i64 {
+        let window = Duration::from_millis(cfg.rate_window_ms);
+        Self::prune_i64_events(&mut self.delta_net_events, window, now);
+        self.delta_net_events.iter().map(|(_, v)| *v).sum()
     }
 }
