@@ -126,32 +126,34 @@ pub fn combined_score(cfg: &Config, m: &mut Market) -> (f64, f64) {
 
     let raw = (w_book * m.flow.book_imb_ema.value
         + w_trade * m.flow.trade_flow_ema.value
-        + w_delta * m.flow.delta_flow_ema.value);
+        + w_delta * m.flow.delta_flow_ema.value) / w_sum;
 
     // Smooth the final score too (prevents jittery side flips).
     m.flow.on_score(cfg, raw, now);
 
     // Confidence is “how much of our max weights are active right now”.
     // let conf = (w_sum / (cfg.w_book + cfg.w_trade + cfg.w_delta)).clamp(0.0, 1.0);
-    let conf = w_sum.clamp(0.0, 1.0);
-    // tracing::debug!(
-    //     trade_n,
-    //     delta_n,
-    //     trade_factor,
-    //     delta_abs,
-    //     delta_factor,
-    //     w_book = cfg.w_book,
-    //     w_trade,
-    //     w_delta,
-    //     w_sum,
-    //     book_ema = m.flow.book_imb_ema.value,
-    //     trade_ema = m.flow.trade_flow_ema.value,
-    //     delta_ema = m.flow.delta_flow_ema.value,
-    //     raw,
-    //     score_ema = m.flow.score_ema.value,
-    //     conf,
-    //     "combined_score breakdown"
-    // );
+    let conf = (((w_trade + w_delta)) / (cfg.w_trade + cfg.w_delta).max(1e-9))
+        .clamp(0.0, 1.0);
+
+    tracing::debug!(
+        trade_n,
+        delta_n,
+        trade_factor,
+        delta_abs,
+        delta_factor,
+        w_book = cfg.w_book,
+        w_trade,
+        w_delta,
+        w_sum,
+        book_ema = m.flow.book_imb_ema.value,
+        trade_ema = m.flow.trade_flow_ema.value,
+        delta_ema = m.flow.delta_flow_ema.value,
+        raw,
+        score_ema = m.flow.score_ema.value,
+        conf,
+        "combined_score breakdown"
+    );
 
 
     (m.flow.score_ema.value.clamp(-1.0, 1.0), conf)

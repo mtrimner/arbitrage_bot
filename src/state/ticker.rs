@@ -1,5 +1,5 @@
 use crate::state::{book::Book, flow::FlowState, orders::Orders, position::Position};
-use crate::types::{RestingHint, TradeLite};
+use crate::types::{RestingHint, TradeLite, Side};
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -37,6 +37,8 @@ pub struct Market {
     pub window_id: i64,
     pub momentum_used_extra: i64,
     pub mode: Mode,
+
+    pub last_desired_side: Option<Side>,
 }
 
 impl Market {
@@ -56,6 +58,7 @@ impl Market {
             window_id: -1,
             momentum_used_extra: 0,
             mode: Mode::Accumulate,
+            last_desired_side: None,
         }
     }
 

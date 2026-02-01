@@ -8,6 +8,10 @@ pub struct Config {
     // Even if your WS updates are fast, 20–50ms is usually plenty.
     pub tick_ms: u64,
 
+    pub side_exit_mult: f64, // e.g. 0.6 (exit < side)
+    pub min_conf_for_flow: f64,
+    pub min_conf_for_momentum: f64,
+
     // Which series you want to trade simultaneously.
     // One active market per series at a time.
     pub series_tickers: Vec<String>,
@@ -83,6 +87,10 @@ impl Default for Config {
         Self {
             tick_ms: 25,
 
+            side_exit_mult: 0.6,
+            min_conf_for_flow: 0.35,
+            min_conf_for_momentum: 0.5,
+
             window_s: 900,
             accumulate_s: 300,
             balance_s: 300,
@@ -119,9 +127,9 @@ impl Default for Config {
             tau_score_ms: 600,
 
             rate_window_ms: 10_000,
-            trade_full_weight_count: 15, // full confidence once ~25 trades in last 10s
+            trade_full_weight_count: 16, // full confidence once ~25 trades in last 10s
             delta_full_weight_count: 250, // deltas tend to be more frequent than trades
-            delta_full_weight_abs: 80000,
+            delta_full_weight_abs: 30000,
 
             w_book: 0.35,
             w_trade: 0.45,

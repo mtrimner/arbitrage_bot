@@ -182,21 +182,158 @@ fn cancel_stale_if_needed(cfg: &Config, ticker: &str, m: &mut Market, now: Insta
 /// - if we MUST balance => hedge side
 /// - else if flow score is strong and we’re not too imbalanced => flow side
 /// - else => hedge side
-fn choose_working_side(cfg: &Config, m: &Market, t_rem: i64, score: f64) -> Side {
+// fn choose_working_side(cfg: &Config, m: &Market, t_rem: i64, score: f64, conf: f64) -> Side {
+//     let imbalance_cap = allowed_imbalance(cfg, t_rem);
+//     let imbr = m.pos.imbalance_ratio();
+
+//     let hedge_side = hedge_side(m);
+//     let flow_side = momentum_side(score);
+
+//     let must_balance = m.mode == Mode::Balance || imbr > imbalance_cap;
+
+//     if must_balance {
+//         return hedge_side;
+//     } 
+
+//     let conf = conf.clamp(0.0, 1.0);
+
+//     // If confidence is too low, never follow flow.
+//     if conf < cfg.min_conf_for_flow {
+//         return hedge_side;
+//     }
+
+//     // Conf aware signal strength (0..1-ish)
+//     let strength = score.abs() * conf;
+
+//     // Enter at the usual threshold, exit at a lower threshold (hysteresis).
+//     let enter = cfg.momentum_score_threshold;
+//     let exit = cfg.momentum_score_threshold * cfg.side_exit_mult; // e.g. 0.6
+
+//     let prev = m.last_desired_side.unwrap_or(hedge_side);
+
+//     if strength >= enter {
+//         flow_side
+//     } else if strength <= exit {
+//         hedge_side
+//     } else  {
+//         // In the deadband:
+//         // keep prev only if it still matches the current flow direction,
+//         // otherwise fall back to hedge (safer than staying “stuck wrong”).
+//         if prev == flow_side { prev } else { hedge_side }
+//     }
+// }
+
+fn choose_working_side(cfg: &Config, m: &Market, t_rem: i64, score: f64, conf: f64) -> Side {
     let imbalance_cap = allowed_imbalance(cfg, t_rem);
     let imbr = m.pos.imbalance_ratio();
 
-    let hedge_side = if m.pos.yes_qty <= m.pos.no_qty { Side::Yes } else { Side::No };
-    let flow_side = momentum_side(score);
+    let hedge = hedge_side(m);
+    let flow  = if score >= 0.0 { Side::Yes } else { Side::No };
 
     let must_balance = m.mode == Mode::Balance || imbr > imbalance_cap;
 
-    if must_balance {
-        hedge_side
-    } else if score.abs() >= cfg.momentum_score_threshold {
-        flow_side
+    let conf01 = conf.clamp(0.0, 1.0);
+    let strength = score.abs() * conf01;
+    // println!("Choose Side Conf, Strngth {:#?}, {:#?}", conf, strength);
+    let enter = cfg.momentum_score_threshold;
+    // Keep hysteresis sane even if side_exit_mult is misconfigured.
+    let exit  = (enter * cfg.side_exit_mult).min(enter);
+
+    // Gate is about confidence/trust (only for entering / flipping into flow).
+    let gate_ok = conf >= cfg.min_conf_for_flow;
+
+    let prev = m.last_desired_side.unwrap_or(hedge);
+
+    // "Flow state" = we were last choosing the current flow side.
+    // (This matches what your logs show: in_flow_state=false when prev!=flow.)
+    let in_flow_state = prev == flow;
+
+    // Raw threshold hits (informational)
+    let enter_hit   = strength >= enter;
+    let exit_hit    = strength <= exit;
+    let in_deadband = strength > exit && strength < enter;
+
+    // Effective state transitions (actionable)
+    let enter_trigger = !in_flow_state && enter_hit && gate_ok;
+    let exit_trigger  =  in_flow_state && exit_hit;
+
+    let (chosen, reason) = if must_balance {
+        (hedge, "must_balance")
+    } else if enter_trigger {
+        (flow, "enter_flow")
+    } else if exit_trigger {
+        (hedge, "exit_to_hedge")
+    } else if in_flow_state {
+        // Once in flow, stay until exit threshold trips (conf gate does NOT kick you out).
+        if in_deadband {
+            (prev, "deadband_keep_flow")
+        } else {
+            (prev, "stay_flow")
+        }
     } else {
-        hedge_side
+        // Not in flow: stay on hedge side. (exit threshold is intentionally ignored here)
+        if enter_hit && !gate_ok {
+            (hedge, "enter_blocked_low_conf_stay_hedge")
+        } else if in_deadband {
+            (hedge, "deadband_stay_hedge")
+        } else {
+            (hedge, "stay_hedge")
+        }
+    };
+
+    // tracing::debug!(
+    //     mode = ?m.mode,
+    //     t_rem,
+    //     imbr,
+    //     imbalance_cap,
+    //     must_balance,
+    //     score,
+    //     conf,
+    //     conf01,
+    //     strength,
+    //     enter,
+    //     exit,
+    //     gate_ok,
+
+    //     // Raw thresholds
+    //     enter_hit,
+    //     exit_hit,
+    //     in_deadband,
+
+    //     // State + EFFECTIVE transitions
+    //     in_flow_state,
+    //     enter_trigger,
+    //     exit_trigger,
+
+    //     // Context
+    //     switched = (chosen != prev),
+    //     flow_eq_hedge = (flow == hedge),
+
+    //     prev = ?prev,
+    //     hedge = ?hedge,
+    //     flow = ?flow,
+    //     chosen = ?chosen,
+    //     reason,
+    //     "choose_working_side"
+    // );
+
+    chosen
+}
+
+
+fn hedge_side(m: &Market) -> Side {
+    if m.pos.yes_qty < m.pos.no_qty {
+        Side::Yes
+    } else if m.pos.no_qty < m.pos.yes_qty {
+        Side::No
+    } else {
+        // Flat/balanced: prefer cheaper ask (fallback to Yes if missing)
+        match (m.book.implied_ask(Side::Yes), m.book.implied_ask(Side::No)) {
+            (Some(ay), Some(an)) => if ay <= an { Side::Yes } else { Side::No },
+            (Some(_), None) => Side::Yes,
+            (None, Some(_)) => Side::No,
+            _ => Side::Yes,
+        }
     }
 }
 
@@ -209,12 +346,12 @@ fn maybe_opportunistic_taker(
     m: &mut Market,
     now: Instant,
     t_rem: i64,
-    score: f64,
+    desired_side: Side,
 ) -> Option<ExecCommand> {
     let imbalance_cap = allowed_imbalance(cfg, t_rem);
     let must_balance = m.mode == Mode::Balance || m.pos.imbalance_ratio() > imbalance_cap;
 
-    let desired = choose_working_side(cfg, m, t_rem, score);
+    // let desired = choose_working_side(cfg, m, t_rem, score);
 
     let mut best: Option<(Side, u8, i64)> = None;
 
@@ -249,7 +386,7 @@ fn maybe_opportunistic_taker(
                 best = Some((side, ask, new_pc));
             }
         } else {
-            if side == desired {
+            if side == desired_side {
                 best = Some((side, ask, 0));
             }
         }
@@ -295,8 +432,18 @@ fn maybe_momentum_taker(
     t_rem: i64,
     window_s: i64,   // <-- NEW: use actual window length for taper
     score: f64,
+    conf: f64,
 ) -> Option<ExecCommand> {
+    if conf < cfg.min_conf_for_momentum {
+        return None;
+    }
+
     if score.abs() < cfg.momentum_score_threshold {
+        return None;
+    }
+
+    let strength = score.abs() * conf.clamp(0.0, 1.0);
+    if strength < cfg.momentum_score_threshold {
         return None;
     }
 
@@ -372,9 +519,9 @@ fn maybe_maker_quote(
     m: &mut Market,
     now: Instant,
     t_rem: i64,
-    score: f64,
+    desired_side: Side,
 ) -> Option<ExecCommand> {
-    let desired_side = choose_working_side(cfg, m, t_rem, score);
+    // let desired_side = choose_working_side(cfg, m, t_rem, score);
 
     let other = desired_side.other();
     if let Some(h) = m.resting_hint(other).as_ref().cloned() {
@@ -506,6 +653,7 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     if is_new_window {
         m.window_id = wid;
         m.momentum_used_extra = 0;
+        m.last_desired_side = None;
     }
 
     // Mode uses actual window_s (not cfg.window_s).
@@ -514,24 +662,29 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
 
     // Score is independent of time logic.
     let (score, conf) = signal::combined_score(cfg, m);
-    println!("Score, Conf {:#?}, {:#?}", score, conf);
+    // println!("Score, Conf {:#?}, {:#?}", score, conf);
 
-    // log only when something meaningful changes
-    // if is_new_window || m.mode != prev_mode || score.abs() >= cfg.momentum_score_threshold {
-    //     tracing::info!(
-    //         ticker = %ticker,
-    //         wid = wid,
-    //         window_s = window_s,
-    //         t_rem = t_rem,
-    //         mode = ?m.mode,
-    //         book_ema = m.flow.book_imb_ema.value,
-    //         trade_ema = m.flow.trade_flow_ema.value,
-    //         delta_ema = m.flow.delta_flow_ema.value,
-    //         score = score,
-    //         conf = conf,
-    //         "decision inputs"
-    //     );
-    // }
+    let desired_side = choose_working_side(cfg, m, t_rem, score, conf);
+    m.last_desired_side = Some(desired_side);
+
+    let strength = score.abs() * conf.clamp(0.0, 1.0);
+
+    // tracing::debug!(
+    //     ticker = %ticker,
+    //     wid = wid,
+    //     mode = ?m.mode,
+    //     t_rem,
+    //     window_s,
+    //     score,
+    //     conf,
+    //     strength,
+    //     desired_side = ?desired_side,
+    //     imbr = m.pos.imbalance_ratio(),
+    //     yes = m.pos.yes_qty,
+    //     no = m.pos.no_qty,
+    //     "decision signal summary"
+    // );
+
 
     // 0) Cancel stale resting orders (but never churn fast).
     if let Some(cmd) = cancel_stale_if_needed(cfg, ticker, m, now) {
@@ -539,15 +692,15 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     }
 
     // 1) Opportunistic taker (cost-driven): if ask is cheap enough to improve/keep caps.
-    if let Some(cmd) = maybe_opportunistic_taker(cfg, ticker, m, now, t_rem, score) {
+    if let Some(cmd) = maybe_opportunistic_taker(cfg, ticker, m, now, t_rem, desired_side) {
         return Some(cmd);
     }
 
     // 2) Momentum taker (flow-driven): strong score, balanced inventory, within safe cap.
-    if let Some(cmd) = maybe_momentum_taker(cfg, ticker, m, now, t_rem, window_s, score) {
+    if let Some(cmd) = maybe_momentum_taker(cfg, ticker, m, now, t_rem, window_s, score, conf) {
         return Some(cmd);
     }
 
     // 3) Maker quoting (resting) with churn control.
-    maybe_maker_quote(cfg, ticker, m, now, t_rem, score)
+    maybe_maker_quote(cfg, ticker, m, now, t_rem, desired_side)
 }
