@@ -69,6 +69,9 @@ pub struct FlowState {
 
     // Delta signed magnitude (pressure-signed, distance-weighted)
     pub delta_net_events: VecDeque<(Instant, i64)>,
+
+    pub input_rev: u64,                 // increments on any new input
+    pub last_score_rev: u64,            // last rev used to step score
 }
 
 impl Default for FlowState {
@@ -91,6 +94,9 @@ impl Default for FlowState {
             trade_abs_events: VecDeque::with_capacity(512),
             trade_net_events: VecDeque::with_capacity(512),
             delta_net_events: VecDeque::with_capacity(1024),
+
+            input_rev: 0,
+            last_score_rev: 0
         }
     }
 }

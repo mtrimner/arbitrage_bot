@@ -14,7 +14,6 @@ pub async fn run_engine(cfg: Config, shared: Shared, tx: mpsc::Sender<ExecComman
             _ = interval.tick() => true,
             _ = shared.notify.notified() => false,
         };
-
         for item in shared.tickers.iter() {
             let ticker = item.key().clone();
             let ts = item.value().clone();

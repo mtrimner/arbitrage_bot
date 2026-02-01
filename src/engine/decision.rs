@@ -1,10 +1,51 @@
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use tracing::{debug, warn};
+
 use crate::config::Config;
 use crate::engine::signal;
 use crate::state::orders::{OrderRec, OrderStatus};
 use crate::state::ticker::{Market, Mode};
 use crate::types::{ExecCommand, RestingHint, Side, Tif, SAFE_PAIR_CC, TARGET_PAIR_CC};
+
+// ------------------- DEBUG STUFF -----------------
+fn clamp01(x: f64) -> f64 { x.clamp(0.0, 1.0) }
+
+fn sign01(x: f64) -> f64 {
+    if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
+}
+
+/// Top N (price, qty) bid levels for logging.
+fn top_levels(arr: &[i64; 101], n: usize) -> Vec<(u8, i64)> {
+    let mut out = Vec::with_capacity(n);
+    for p in (0..=100).rev() {
+        let q = arr[p];
+        if q > 0 {
+            out.push((p as u8, q));
+            if out.len() >= n { break; }
+        }
+    }
+    out
+}
+
+/// Matches the private helper in signal.rs (for logging depth_norm numbers).
+fn weighted_top_n_qty(arr: &[i64; 101], n: usize) -> f64 {
+    let mut acc = 0.0;
+    let mut found = 0usize;
+
+    for p in (0..=100).rev() {
+        let q = arr[p];
+        if q <= 0 { continue; }
+        let w = (1.0 - 0.2 * (found as f64)).max(0.2);
+        acc += (q as f64) * w;
+        found += 1;
+        if found >= n { break; }
+    }
+
+    acc
+}
+
+// ----------------------------------------------------------
 
 fn unix_now_s() -> i64 {
     SystemTime::now()
@@ -660,26 +701,171 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     m.mode = pick_mode(cfg, t_rem, window_s);
     // println!("Current Mode: {:#?}", m.mode);
 
-    // Score is independent of time logic.
-    let (score, conf) = signal::combined_score(cfg, m);
-    println!("Score, Conf {:#?}, {:#?}", score, conf);
-
-    // -------------------------------------
+    // ----------------------- DEBUG STUFF ------------------
+        // ----- snapshot useful “price picture” -----
     let yes_bid = m.book.best_bid(Side::Yes);
     let yes_ask = m.book.implied_ask(Side::Yes);
-
     let no_bid  = m.book.best_bid(Side::No);
     let no_ask  = m.book.implied_ask(Side::No);
 
-    // quantities at best bids (direct from your arrays)
+    // quantities at best bids
     let yes_bid_qty = yes_bid.map(|p| m.book.yes_bids[p as usize]).unwrap_or(0);
     let no_bid_qty  = no_bid .map(|p| m.book.no_bids [p as usize]).unwrap_or(0);
 
-    // in your model, YES ask comes from NO best bid (sell YES == buy NO), so use the opposite bid qty
+    // implied asks are on the opposite bid book
     let yes_ask_qty = no_bid_qty;
     let no_ask_qty  = yes_bid_qty;
-    println!("yes_bid: {:#?}, yes_ask: {:#?}, no_bid: {:#?}, no_ask: {:#?}, no_bid_qty: {:#?}, yes_bid_qty: {:#?}, no_ask_qty: {:#?}, yes_ask_qty: {:#?}", yes_bid, yes_ask, no_bid, no_ask, no_bid_qty, yes_bid_qty, no_ask_qty, yes_ask_qty);
-    // -------------------------------------
+
+    let yes_mid = match (yes_bid, yes_ask) {
+        (Some(b), Some(a)) => Some((b as f64 + a as f64) / 2.0),
+        _ => None,
+    };
+    let yes_spread = match (yes_bid, yes_ask) {
+        (Some(b), Some(a)) => Some((a as i16) - (b as i16)),
+        _ => None,
+    };
+
+    // Map “YES mid cents” into [-1,+1] just for comparison:
+    // -1 = 0c, 0 = 50c, +1 = 100c
+    let price_score = yes_mid.map(|mid| (mid / 50.0) - 1.0);
+
+    // Raw instantaneous book imbalance (depth-based, not price-based)
+    let book_raw_now = signal::raw_book_imbalance(cfg, &m.book);
+
+    // ----- compute score/conf (this mutates score_ema internally) -----
+    let score_prev = m.flow.score_ema.value;
+    let (score,raw_combined_step, conf) = signal::combined_score(cfg, m);
+    let last_seq = m.book.last_seq;
+    if m.flow.input_rev != m.flow.last_score_rev {
+       tracing::debug!(
+            ticker = %ticker,
+            last_seq,
+            raw_combined_step,
+            score_prev,
+            score_next = score,
+            conf,
+            "decide: ema_step"
+        );
+    }
+  
+ 
+            
+
+    // Values actually used by the scorer
+    let book_ema  = m.flow.book_imb_ema.value;
+    let trade_ema = m.flow.trade_flow_ema.value;
+    let delta_ema = m.flow.delta_flow_ema.value;
+
+    // ----- recompute combined_score internals for logging (close to exact) -----
+    let now2 = Instant::now();
+
+    let (depth_now, depth_mult) = if cfg.enable_depth_norm {
+        let n = cfg.depth_norm_levels.max(1);
+        let y = weighted_top_n_qty(&m.book.yes_bids, n);
+        let nqty = weighted_top_n_qty(&m.book.no_bids, n);
+        let depth = (y + nqty).max(1.0);
+
+        let mult = (cfg.depth_full_weight_qty.max(1.0) / depth)
+            .clamp(cfg.depth_norm_min_mult, cfg.depth_norm_max_mult);
+
+        (depth, mult)
+    } else {
+        (0.0, 1.0)
+    };
+
+    // Trade stats (rate window)
+    let trade_n = m.flow.trade_count_recent(cfg, now2);
+    let trade_abs = m.flow.trade_abs_recent(cfg, now2) as f64;
+    let trade_net = m.flow.trade_net_recent(cfg, now2) as f64;
+
+    let trade_f_n   = clamp01(trade_n as f64 / (cfg.trade_full_weight_count.max(1) as f64));
+    let trade_f_abs = clamp01((trade_abs * depth_mult) / (cfg.trade_full_weight_abs.max(1) as f64));
+    let trade_coh   = clamp01(trade_net.abs() / trade_abs.max(1e-9));
+    let trade_factor = (trade_f_n * trade_f_abs * trade_coh).powf(1.0 / 3.0);
+
+    // Delta stats (rate window)
+    let delta_n   = m.flow.delta_count_recent(cfg, now2) as f64;
+    let delta_abs = m.flow.delta_abs_recent(cfg, now2) as f64;
+    let delta_net = m.flow.delta_net_recent(cfg, now2) as f64;
+
+    let delta_f_n   = clamp01(delta_n / (cfg.delta_full_weight_count.max(1) as f64));
+    let delta_f_abs = clamp01((delta_abs * depth_mult) / (cfg.delta_full_weight_abs.max(1) as f64));
+    let delta_coh   = clamp01(delta_net.abs() / delta_abs.max(1e-9));
+    let delta_factor = (delta_f_n * delta_f_abs * delta_coh).powf(1.0 / 3.0);
+
+    let w_book  = cfg.w_book;
+    let w_trade = cfg.w_trade * trade_factor;
+    let w_delta = cfg.w_delta * delta_factor;
+    let w_sum   = (w_book + w_trade + w_delta).max(1e-9);
+
+    let raw_combined = (w_book * book_ema + w_trade * trade_ema + w_delta * delta_ema) / w_sum;
+
+    // Conf parts (match signal.rs)
+    let activity = clamp01((w_trade + w_delta) / (cfg.w_trade + cfg.w_delta).max(1e-9));
+    let consensus = clamp01(
+        (w_book * sign01(book_ema) + w_trade * sign01(trade_ema) + w_delta * sign01(delta_ema)).abs() / w_sum
+    );
+    let strength = clamp01(score.abs() / cfg.score_full_conf_abs.max(1e-9));
+    let conf_calc = clamp01(activity * (0.5 + 0.5 * consensus) * strength);
+
+    // ----- warn on “price direction” disagreement (often the thing you were eyeballing) -----
+    let mismatch_price_dir = match price_score {
+        Some(ps) => sign01(ps) != sign01(score) && ps.abs() > 0.15 && score.abs() > 0.15,
+        None => false,
+    };
+
+    if mismatch_price_dir {
+        warn!(
+            ticker = %ticker,
+            yes_bid = ?yes_bid, yes_ask = ?yes_ask, no_bid = ?no_bid, no_ask = ?no_ask,
+            yes_mid = ?yes_mid, price_score = ?price_score,
+            score, conf,
+            book_ema, trade_ema, delta_ema,
+            "score sign disagrees with top-of-book mid (note: score is pressure, not probability)"
+        );
+    }
+
+    // ----- main debug dump (keep it gated so it’s readable) -----
+    let verbose = mismatch_price_dir || is_new_window || prev_mode != m.mode || (conf > 0.35 && score.abs() > 0.15);
+
+    if verbose {
+        debug!(
+            ticker = %ticker,
+            last_seq = m.book.last_seq,
+            open_ts = ?m.open_ts, close_ts = ?m.close_ts,
+            wid, is_new_window,
+            window_s, t_rem,
+            prev_mode = ?prev_mode, mode = ?m.mode,
+            "decide: timing"
+        );
+
+        debug!(
+            ticker = %ticker,
+            yes_bid = ?yes_bid, yes_ask = ?yes_ask,
+            no_bid = ?no_bid,  no_ask  = ?no_ask,
+            yes_bid_qty, no_bid_qty, yes_ask_qty, no_ask_qty,
+            yes_mid = ?yes_mid, yes_spread = ?yes_spread, price_score = ?price_score,
+            "decide: top-of-book"
+        );
+
+        debug!(
+            ticker = %ticker,
+            book_raw_now,
+            book_ema, trade_ema, delta_ema,
+            raw_combined,
+            score, conf,
+            conf_calc,
+            activity, consensus, strength,
+            trade_n, trade_abs, trade_net, trade_factor,
+            delta_n, delta_abs, delta_net, delta_factor,
+            depth_now, depth_mult,
+            yes_top = ?top_levels(&m.book.yes_bids, 5),
+            no_top  = ?top_levels(&m.book.no_bids, 5),
+            "decide: score/conf breakdown"
+        );
+    }
+
+    // ----------------------------------------------------
     let desired_side = choose_working_side(cfg, m, t_rem, score, conf);
     m.last_desired_side = Some(desired_side);
 

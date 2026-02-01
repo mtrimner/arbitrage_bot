@@ -237,7 +237,7 @@ async fn handle_snapshot(cfg: &Config, shared: &Shared, snap: OrderbookSnapshot)
     //     book_imb_ema = g.flow.book_imb_ema.value,
     //     "snapshot -> book_imb EMA updated"
     // );
-
+    g.flow.input_rev = g.flow.input_rev.wrapping_add(1);
 
     ts.mark_dirty();
     shared.notify.notify_one();
@@ -274,6 +274,7 @@ async fn handle_delta(cfg: &Config, shared: &Shared, delta: OrderbookDelta) -> R
         // === EMA update: book imbalance (because the book changed) ===
         let raw_imb = crate::engine::signal::raw_book_imbalance(cfg, &g.book);
         g.flow.on_book_imbalance(cfg, raw_imb, now);
+        g.flow.input_rev = g.flow.input_rev.wrapping_add(1);
 
         // tracing::debug!(
         //     ticker = %ticker,
@@ -322,6 +323,7 @@ async fn handle_trade(cfg: &Config, shared: &Shared, tu: TradeUpdate) -> Result<
     };
 
     g.flow.on_trade_flow(cfg, raw_tf, signed_qty, now);
+    g.flow.input_rev = g.flow.input_rev.wrapping_add(1);
 
     // tracing::debug!(
     //     ticker = %ticker,

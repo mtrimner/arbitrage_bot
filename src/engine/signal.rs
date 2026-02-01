@@ -106,7 +106,7 @@ pub fn raw_delta_flow(side: Side, price: u8, delta: i64, book: &Book) -> (f64, u
 /// - delta_flow_ema: are bids being added/canceled (queue building / pulling)
 ///
 /// We also confidence-scale trade/delta weights if recent activity is low.
-pub fn combined_score(cfg: &Config, m: &mut Market) -> (f64, f64) {
+pub fn combined_score(cfg: &Config, m: &mut Market) -> (f64, f64, f64) {
     fn clamp01(x: f64) -> f64 { x.clamp(0.0, 1.0) }
     fn sign01(x: f64) -> f64 {
         if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
@@ -167,7 +167,10 @@ pub fn combined_score(cfg: &Config, m: &mut Market) -> (f64, f64) {
         + w_delta * m.flow.delta_flow_ema.value) / w_sum;
 
     // Smooth the final score too (prevents jittery side flips).
-    m.flow.on_score(cfg, raw, now);
+    if m.flow.last_score_rev != m.flow.input_rev {
+        m.flow.on_score(cfg, raw, now);
+        m.flow.last_score_rev = m.flow.input_rev;
+    }
 
     // ---------- confidence ----------
     // 1) activity: "are trade/delta weights actually active?"
@@ -226,5 +229,5 @@ pub fn combined_score(cfg: &Config, m: &mut Market) -> (f64, f64) {
     // );
 
 
-    (m.flow.score_ema.value.clamp(-1.0, 1.0), conf)
+    (m.flow.score_ema.value.clamp(-1.0, 1.0), raw, conf)
 }
