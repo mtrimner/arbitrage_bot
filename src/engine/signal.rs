@@ -28,17 +28,18 @@ fn weighted_top_n_qty(arr: &[i64; 101], n: usize) -> f64 {
     acc
 }
 
-/// Raw book imbalance in [-1, +1].
+/// Raw book imbalance in [-1, +1] using top of book queue imbalance (microprice equivalent).
 /// + => more YES bid depth near top
 /// - => more NO bid depth near top
 pub fn raw_book_imbalance(cfg: &Config, book: &Book) -> f64 {
-    // You can tune N; 5 is a decent default for thin books.
-    let n = 5;
-    let y = weighted_top_n_qty(&book.yes_bids, n);
-    let nqty = weighted_top_n_qty(&book.no_bids, n);
+    let Some(yes_bid) = book.best_bid(Side::Yes) else {return 0.0};
+    let Some(no_bid) = book.best_bid(Side::No) else {return 0.0};
 
-    let denom = (y + nqty).max(1.0);
-    ((y - nqty) / denom).clamp(-1.0, 1.0)
+    let bid_qty = book.yes_bids[yes_bid as usize].max(0) as f64;
+    let ask_qty = book.no_bids[no_bid as usize].max(0) as f64;
+
+    let denom = (bid_qty + ask_qty).max(1.0);
+    ((bid_qty - ask_qty) / denom).clamp(-1.0, 1.0)
 }
 
 /// Convert a trade update into a signed flow measurement in [-1, +1].

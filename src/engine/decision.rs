@@ -1,3 +1,4 @@
+use std::os::raw;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, warn};
@@ -471,7 +472,8 @@ fn maybe_momentum_taker(
     m: &mut Market,
     now: Instant,
     t_rem: i64,
-    window_s: i64,   // <-- NEW: use actual window length for taper
+    window_s: i64,
+    raw_score: f64,
     score: f64,
     conf: f64,
 ) -> Option<ExecCommand> {
@@ -502,7 +504,17 @@ fn maybe_momentum_taker(
         return None;
     }
 
+    let eps = 0.15;
+    if raw_score.abs() < eps {
+        return None; 
+    }
+
+    // Make sure signal isn't choppy
+    if raw_score.signum() != score.signum() {
+        return None;
+    }
     let side = momentum_side(score);
+
     let Some(ask) = m.book.implied_ask(side) else { return None; };
     if ask > cfg.max_buy_price_cents {
         return None;
@@ -732,24 +744,23 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     // Raw instantaneous book imbalance (depth-based, not price-based)
     let book_raw_now = signal::raw_book_imbalance(cfg, &m.book);
 
+    m.flow.decay_event_flows(cfg, now);
     // ----- compute score/conf (this mutates score_ema internally) -----
     let score_prev = m.flow.score_ema.value;
-    let (score,raw_combined_step, conf) = signal::combined_score(cfg, m);
+    let (score,raw_score, conf) = signal::combined_score(cfg, m);
     let last_seq = m.book.last_seq;
+
     if m.flow.input_rev != m.flow.last_score_rev {
        tracing::debug!(
             ticker = %ticker,
             last_seq,
-            raw_combined_step,
+            raw_score,
             score_prev,
             score_next = score,
             conf,
             "decide: ema_step"
         );
     }
-  
- 
-            
 
     // Values actually used by the scorer
     let book_ema  = m.flow.book_imb_ema.value;
@@ -807,26 +818,10 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     );
     let strength = clamp01(score.abs() / cfg.score_full_conf_abs.max(1e-9));
     let conf_calc = clamp01(activity * (0.5 + 0.5 * consensus) * strength);
-
-    // ----- warn on “price direction” disagreement (often the thing you were eyeballing) -----
-    let mismatch_price_dir = match price_score {
-        Some(ps) => sign01(ps) != sign01(score) && ps.abs() > 0.15 && score.abs() > 0.15,
-        None => false,
-    };
-
-    if mismatch_price_dir {
-        warn!(
-            ticker = %ticker,
-            yes_bid = ?yes_bid, yes_ask = ?yes_ask, no_bid = ?no_bid, no_ask = ?no_ask,
-            yes_mid = ?yes_mid, price_score = ?price_score,
-            score, conf,
-            book_ema, trade_ema, delta_ema,
-            "score sign disagrees with top-of-book mid (note: score is pressure, not probability)"
-        );
-    }
+ 
 
     // ----- main debug dump (keep it gated so it’s readable) -----
-    let verbose = mismatch_price_dir || is_new_window || prev_mode != m.mode || (conf > 0.35 && score.abs() > 0.15);
+    let verbose = is_new_window || prev_mode != m.mode || (conf > 0.1 && score.abs() > 0.1);
 
     if verbose {
         debug!(
@@ -899,7 +894,7 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     }
 
     // 2) Momentum taker (flow-driven): strong score, balanced inventory, within safe cap.
-    if let Some(cmd) = maybe_momentum_taker(cfg, ticker, m, now, t_rem, window_s, score, conf) {
+    if let Some(cmd) = maybe_momentum_taker(cfg, ticker, m, now, t_rem, window_s, raw_score, score, conf) {
         return Some(cmd);
     }
 

@@ -112,6 +112,51 @@ impl FlowState {
     //     }
     // }
 
+    /// Decay event-driven flows (trade/delta) toward 0 when there is no activity.
+    /// Call this once per engine tick before computing combined_score.
+    pub fn decay_event_flows(&mut self, cfg: &Config, now: Instant) {
+        let mut bumped = false;
+
+        // --- Trade flow decay ---
+        if self.trade_flow_ema.initialized {
+            if let Some(last) = self.last_trade_at {
+                let dt = now.saturating_duration_since(last);
+                if dt > Duration::ZERO {
+                    let prev = self.trade_flow_ema.value;
+                    let tau = Duration::from_millis(cfg.tau_trade_ms);
+                    self.trade_flow_ema.update(0.0, dt, tau);
+                    self.last_trade_at = Some(now);
+
+                    if (self.trade_flow_ema.value - prev).abs() > 1e-12 {
+                        bumped = true;
+                    }
+                }
+            }
+        }
+
+        // --- Delta flow decay ---
+        if self.delta_flow_ema.initialized {
+            if let Some(last) = self.last_delta_at {
+                let dt = now.saturating_duration_since(last);
+                if dt > Duration::ZERO {
+                    let prev = self.delta_flow_ema.value;
+                    let tau = Duration::from_millis(cfg.tau_delta_ms);
+                    self.delta_flow_ema.update(0.0, dt, tau);
+                    self.last_delta_at = Some(now);
+
+                    if (self.delta_flow_ema.value - prev).abs() > 1e-12 {
+                        bumped = true;
+                    }
+                }
+            }
+        }
+
+        // If decay moved either flow, treat it as a new input so score step runs
+        if bumped {
+            self.input_rev = self.input_rev.wrapping_add(1);
+        }
+    }
+
     fn prune_times(times: &mut VecDeque<Instant>, window: Duration, now: Instant) {
         let cutoff = now.checked_sub(window).unwrap_or(now);
         while matches!(times.front(), Some(t) if *t < cutoff) {
@@ -167,20 +212,29 @@ impl FlowState {
 
     pub fn on_book_imbalance(&mut self, cfg: &Config, raw_imb: f64, now: Instant) {
         let tau = Duration::from_millis(cfg.tau_book_ms);
-        let dt = self
+        let mut dt = self
             .last_book_at
-            .map(|t| now.duration_since(t))
+            .map(|t| now.saturating_duration_since(t))
             .unwrap_or(Duration::from_millis(cfg.tick_ms));
+
+        if dt.is_zero() {
+            dt = Duration::from_micros(1);
+        }
+
         self.book_imb_ema.update(raw_imb.clamp(-1.0, 1.0), dt, tau);
         self.last_book_at = Some(now);
     }
 
     pub fn on_trade_flow(&mut self, cfg: &Config, raw_flow: f64, signed_qty: i64, now: Instant) {
         let tau = Duration::from_millis(cfg.tau_trade_ms);
-        let dt = self
-            .last_trade_at
-            .map(|t| now.duration_since(t))
+        let mut dt = self
+            .last_book_at
+            .map(|t| now.saturating_duration_since(t))
             .unwrap_or(Duration::from_millis(cfg.tick_ms));
+
+        if dt.is_zero() {
+            dt = Duration::from_micros(1);
+        }
 
         let clamped = raw_flow.clamp(-1.0, 1.0);
 
@@ -231,10 +285,14 @@ impl FlowState {
 
     pub fn on_delta_flow(&mut self, cfg: &Config, raw_flow: f64, abs_w: u32, signed_w: i64, now: Instant) {
         let tau = Duration::from_millis(cfg.tau_delta_ms);
-        let dt = self
-            .last_delta_at
-            .map(|t| now.duration_since(t))
+        let mut dt = self
+            .last_book_at
+            .map(|t| now.saturating_duration_since(t))
             .unwrap_or(Duration::from_millis(cfg.tick_ms));
+
+        if dt.is_zero() {
+            dt = Duration::from_micros(1);
+        }
 
         self.delta_flow_ema.update(raw_flow.clamp(-1.0, 1.0), dt, tau);
         self.last_delta_at = Some(now);
@@ -245,10 +303,15 @@ impl FlowState {
     /// Score EMA on top of the combined score.
     pub fn on_score(&mut self, cfg: &Config, raw_score: f64, now: Instant) {
         let tau = Duration::from_millis(cfg.tau_score_ms);
-        let dt = self
-            .last_score_at
-            .map(|t| now.duration_since(t))
+        let mut dt = self
+            .last_book_at
+            .map(|t| now.saturating_duration_since(t))
             .unwrap_or(Duration::from_millis(cfg.tick_ms));
+
+        if dt.is_zero() {
+            dt = Duration::from_micros(1);
+        }
+        
         self.score_ema.update(raw_score.clamp(-1.0, 1.0), dt, tau);
         self.last_score_at = Some(now);
     }
