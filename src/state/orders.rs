@@ -26,6 +26,8 @@ pub struct OrderRec {
 
     pub status: OrderStatus,
     pub created_at: Instant,
+
+    pub filled_qty: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -35,6 +37,58 @@ pub struct Orders {
 }
 
 impl Orders {
+    pub fn link_order_id_if_missing(&mut self, client_id: uuid::Uuid, order_id: &str) {
+        // If we don't know this client_id do nothing
+        let Some(rec) = self.by_client.get_mut(&client_id) else { return; };
+
+        // If order_id is missing, set it.
+        if rec.order_id.as_deref() == Some(order_id) {
+            rec.order_id = Some(order_id.to_string());
+        }
+
+        // Always ensure reverse map.
+        self.by_order.insert(order_id.to_string(), client_id);
+    }
+
+    /// Apply a fill using client_id (best path because UserFill gives client_order_id).
+    /// Returns:
+    /// - Some(true)  => now fully filled
+    /// - Some(false) => partial fill
+    /// - None        => unknown client_id
+    pub fn on_fill_by_client(&mut self, client_id: uuid::Uuid, fill_qty: u64) -> Option<bool> {
+        let rec = self.by_client.get_mut(&client_id)?;
+
+        rec.filled_qty = rec.filled_qty.saturating_add(fill_qty);
+
+        if rec.filled_qty >= rec.qty {
+            rec.status = OrderStatus::Filled;
+            Some(true)
+        } else {
+            Some(false)
+        }
+    }
+
+    /// Apply a fill by exchange order_id (fallback path).
+    pub fn on_fill_by_order(&mut self, order_id: &str, fill_qty: u64) -> Option<bool> {
+        let client_id = *self.by_order.get(order_id)?;
+        self.on_fill_by_client(client_id, fill_qty)
+    }
+
+    pub fn on_fill (&mut self, order_id: &str, fill_qty: u64) -> Option<bool> {
+        let client_id = *self.by_order.get(order_id)?;
+        let rec = self.by_client.get_mut(&client_id)?;
+
+        rec.filled_qty = rec.filled_qty.saturating_add(fill_qty);
+
+        if rec.filled_qty >= rec.qty {
+            rec.status = OrderStatus::Filled;
+            Some(true)
+        } else {
+            // Leave status as Resting/PendingAck; Add PartialFilled status later if needed
+            Some(false)
+        }
+    }
+
     pub fn insert_pending(&mut self, rec: OrderRec) {
         self.by_client.insert(rec.client_order_id, rec);
     }

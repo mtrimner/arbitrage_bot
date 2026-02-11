@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -347,7 +348,9 @@ async fn handle_fill(shared: &Shared, uf: UserFill) -> Result<()> {
     let ticker = m.market_ticker.clone();
 
     let Some(purchased) = parse_side(&m.purchased_side) else { return Ok(()); };
-    let qty = m.count.max(0) as i64;
+    
+    let fill_qty = m.count.max(0) as i64;
+    if fill_qty == 0 { return Ok(()); }
 
     let price = match purchased {
         Side::Yes => m.yes_price,
@@ -356,7 +359,36 @@ async fn handle_fill(shared: &Shared, uf: UserFill) -> Result<()> {
 
     if let Some(ts) = shared.tickers.get(&ticker) {
         let mut g = ts.mkt.write().await;
-        g.pos.apply_fill(purchased, price, qty);
+
+        // Update position.
+        g.pos.apply_fill(purchased, price, fill_qty);
+
+        if let Ok(client_id) = Uuid::parse_str(&m.client_order_id) {
+            // Make sure order_id mapping exists even if Rest ack is late
+            g.orders.link_order_id_if_missing(client_id, &m.order_id);
+
+            let fully_filled = g.orders.on_fill(&m.order_id, fill_qty as u64);
+            
+            if matches!(fully_filled, Some(true)) {
+                if let Some(h) = g.resting_hint(purchased).as_ref() {
+                    if h.order_id.as_deref() == Some(&m.order_id.as_str()) {
+                        *g.resting_hint_mut(purchased) = None;
+                    }
+                }
+            }
+        } else {
+            // Fallback: apply by order_id (works only if by_order mapping exists)
+            let fully_filled = g.orders.on_fill_by_order(&m.order_id.as_str(), fill_qty as u64);
+            
+            if matches!(fully_filled, Some(true)) {
+                if let Some(h) = g.resting_hint(purchased).as_ref() {
+                    if h.order_id.as_deref() == Some(m.order_id.as_str()) {
+                        *g.resting_hint_mut(purchased) = None;
+                    }
+                }
+            }            
+        }
+
         ts.mark_dirty();
         shared.notify.notify_one();
     }

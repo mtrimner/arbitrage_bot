@@ -7,13 +7,27 @@ use crate::config::Config;
 use crate::engine::signal;
 use crate::state::orders::{OrderRec, OrderStatus};
 use crate::state::ticker::{Market, Mode};
-use crate::types::{ExecCommand, RestingHint, Side, Tif, SAFE_PAIR_CC, TARGET_PAIR_CC};
+use crate::types::{ExecCommand, RestingHint, Side, Tif, CC_PER_CENT, SAFE_PAIR_CC, TARGET_PAIR_CC};
 
 // ------------------- DEBUG STUFF -----------------
 fn clamp01(x: f64) -> f64 { x.clamp(0.0, 1.0) }
 
 fn sign01(x: f64) -> f64 {
     if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
+}
+
+fn need_hedge(cfg: &Config, m: &Market, t_rem: i64) -> bool {
+    let cap = allowed_imbalance(cfg, t_rem);
+    !m.pos.is_balanced() && (m.mode == Mode::Balance || m.pos.imbalance_ratio() > cap)
+}
+
+// Don’t add to a side if the OTHER side is still zero.
+// Example: YES>0 and NO==0 => block more YES; only buy NO until you have at least 1.
+fn one_sided_block(m: &Market, side: Side) -> bool {
+    match side {
+        Side::Yes => m.pos.yes_qty > 0 && m.pos.no_qty == 0,
+        Side::No  => m.pos.no_qty  > 0 && m.pos.yes_qty == 0,
+    }
 }
 
 /// Top N (price, qty) bid levels for logging.
@@ -189,6 +203,44 @@ fn best_price_under_pair_cap(
 
     None
 }
+
+fn cancel_wrong_side_if_needed(
+    cfg: &Config,
+    ticker: &str,
+    m: &mut Market,
+    now: Instant,
+    t_rem: i64,
+) -> Option<ExecCommand> {
+    if !need_hedge(cfg, m, t_rem) {
+        return None;
+    }
+
+    let wrong = hedge_side(m).other();
+    let Some(h) = m.resting_hint(wrong).as_ref().cloned() else { return None; };
+    let Some(order_id) = h.order_id.clone() else { return None; };
+
+    let age_ms = now.duration_since(h.created_at).as_millis() as u64;
+    if age_ms < cfg.min_resting_life_ms {
+        return None;
+    }
+
+    if let Some(t0) = h.cancel_requested_at {
+        let since = now.duration_since(t0).as_millis() as u64;
+        if since < cfg.cancel_retry_ms {
+            return None;
+        }
+    }
+
+    if let Some(hm) = m.resting_hint_mut(wrong).as_mut() {
+        hm.cancel_requested_at = Some(now);
+    }
+
+    Some(ExecCommand::CancelOrder {
+        ticker: ticker.to_string(),
+        order_id,
+    })
+}
+
 
 /// If we have a resting hint and it’s too old, cancel it.
 /// We do NOT cancel constantly; this is only for “stale” orders.
@@ -448,6 +500,7 @@ fn maybe_opportunistic_taker(
         client_order_id,
         status: OrderStatus::PendingAck,
         created_at: now,
+        filled_qty: 0,
     });
 
     set_last_taker(m, side, now);
@@ -549,6 +602,7 @@ fn maybe_momentum_taker(
         client_order_id,
         status: OrderStatus::PendingAck,
         created_at: now,
+        filled_qty: 0,
     });
 
     set_last_taker(m, side, now);
@@ -657,6 +711,7 @@ fn maybe_maker_quote(
         client_order_id,
         status: OrderStatus::PendingAck,
         created_at: now,
+        filled_qty: 0,
     });
 
     *m.resting_hint_mut(desired_side) = Some(RestingHint {
@@ -818,47 +873,50 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     );
     let strength = clamp01(score.abs() / cfg.score_full_conf_abs.max(1e-9));
     let conf_calc = clamp01(activity * (0.5 + 0.5 * consensus) * strength);
- 
+    
+    if let (Some(no_bid), Some(no_ask), Some(yes_bid), Some(yes_ask)) = (no_bid, no_ask, yes_bid, yes_ask) {
+    println!("Yes_bid: {}, Yes_ask: {}, No_bid: {}, No_ask: {}", yes_bid, yes_ask, no_bid, no_ask);
+    }
 
     // ----- main debug dump (keep it gated so it’s readable) -----
-    let verbose = is_new_window || prev_mode != m.mode || (conf > 0.1 && score.abs() > 0.1);
+    // let verbose = is_new_window || prev_mode != m.mode || (conf > 0.1 && score.abs() > 0.1);
 
-    if verbose {
-        debug!(
-            ticker = %ticker,
-            last_seq = m.book.last_seq,
-            open_ts = ?m.open_ts, close_ts = ?m.close_ts,
-            wid, is_new_window,
-            window_s, t_rem,
-            prev_mode = ?prev_mode, mode = ?m.mode,
-            "decide: timing"
-        );
+    // if verbose {
+    //     debug!(
+    //         ticker = %ticker,
+    //         last_seq = m.book.last_seq,
+    //         open_ts = ?m.open_ts, close_ts = ?m.close_ts,
+    //         wid, is_new_window,
+    //         window_s, t_rem,
+    //         prev_mode = ?prev_mode, mode = ?m.mode,
+    //         "decide: timing"
+    //     );
 
-        debug!(
-            ticker = %ticker,
-            yes_bid = ?yes_bid, yes_ask = ?yes_ask,
-            no_bid = ?no_bid,  no_ask  = ?no_ask,
-            yes_bid_qty, no_bid_qty, yes_ask_qty, no_ask_qty,
-            yes_mid = ?yes_mid, yes_spread = ?yes_spread, price_score = ?price_score,
-            "decide: top-of-book"
-        );
+    //     debug!(
+    //         ticker = %ticker,
+    //         yes_bid = ?yes_bid, yes_ask = ?yes_ask,
+    //         no_bid = ?no_bid,  no_ask  = ?no_ask,
+    //         yes_bid_qty, no_bid_qty, yes_ask_qty, no_ask_qty,
+    //         yes_mid = ?yes_mid, yes_spread = ?yes_spread, price_score = ?price_score,
+    //         "decide: top-of-book"
+    //     );
 
-        debug!(
-            ticker = %ticker,
-            book_raw_now,
-            book_ema, trade_ema, delta_ema,
-            raw_combined,
-            score, conf,
-            conf_calc,
-            activity, consensus, strength,
-            trade_n, trade_abs, trade_net, trade_factor,
-            delta_n, delta_abs, delta_net, delta_factor,
-            depth_now, depth_mult,
-            yes_top = ?top_levels(&m.book.yes_bids, 5),
-            no_top  = ?top_levels(&m.book.no_bids, 5),
-            "decide: score/conf breakdown"
-        );
-    }
+    //     debug!(
+    //         ticker = %ticker,
+    //         book_raw_now,
+    //         book_ema, trade_ema, delta_ema,
+    //         raw_combined,
+    //         score, conf,
+    //         conf_calc,
+    //         activity, consensus, strength,
+    //         trade_n, trade_abs, trade_net, trade_factor,
+    //         delta_n, delta_abs, delta_net, delta_factor,
+    //         depth_now, depth_mult,
+    //         yes_top = ?top_levels(&m.book.yes_bids, 5),
+    //         no_top  = ?top_levels(&m.book.no_bids, 5),
+    //         "decide: score/conf breakdown"
+    //     );
+    // }
 
     // ----------------------------------------------------
     let desired_side = choose_working_side(cfg, m, t_rem, score, conf);
