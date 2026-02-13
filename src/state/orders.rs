@@ -42,7 +42,7 @@ impl Orders {
         let Some(rec) = self.by_client.get_mut(&client_id) else { return; };
 
         // If order_id is missing, set it.
-        if rec.order_id.as_deref() == Some(order_id) {
+        if rec.order_id.as_deref() != Some(order_id) {
             rec.order_id = Some(order_id.to_string());
         }
 

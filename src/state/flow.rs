@@ -228,7 +228,7 @@ impl FlowState {
     pub fn on_trade_flow(&mut self, cfg: &Config, raw_flow: f64, signed_qty: i64, now: Instant) {
         let tau = Duration::from_millis(cfg.tau_trade_ms);
         let mut dt = self
-            .last_book_at
+            .last_trade_at
             .map(|t| now.saturating_duration_since(t))
             .unwrap_or(Duration::from_millis(cfg.tick_ms));
 
@@ -286,7 +286,7 @@ impl FlowState {
     pub fn on_delta_flow(&mut self, cfg: &Config, raw_flow: f64, abs_w: u32, signed_w: i64, now: Instant) {
         let tau = Duration::from_millis(cfg.tau_delta_ms);
         let mut dt = self
-            .last_book_at
+            .last_delta_at
             .map(|t| now.saturating_duration_since(t))
             .unwrap_or(Duration::from_millis(cfg.tick_ms));
 
@@ -304,14 +304,14 @@ impl FlowState {
     pub fn on_score(&mut self, cfg: &Config, raw_score: f64, now: Instant) {
         let tau = Duration::from_millis(cfg.tau_score_ms);
         let mut dt = self
-            .last_book_at
+            .last_score_at
             .map(|t| now.saturating_duration_since(t))
             .unwrap_or(Duration::from_millis(cfg.tick_ms));
 
         if dt.is_zero() {
             dt = Duration::from_micros(1);
         }
-        
+
         self.score_ema.update(raw_score.clamp(-1.0, 1.0), dt, tau);
         self.last_score_at = Some(now);
     }

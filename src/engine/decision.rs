@@ -9,6 +9,7 @@ use crate::state::orders::{OrderRec, OrderStatus};
 use crate::state::ticker::{Market, Mode};
 use crate::types::{ExecCommand, RestingHint, Side, Tif, CC_PER_CENT, SAFE_PAIR_CC, TARGET_PAIR_CC};
 
+const DOLLAR_CC: i64 = 100 * CC_PER_CENT; // 10000
 // ------------------- DEBUG STUFF -----------------
 fn clamp01(x: f64) -> f64 { x.clamp(0.0, 1.0) }
 
@@ -68,6 +69,110 @@ fn unix_now_s() -> i64 {
         .unwrap()
         .as_secs() as i64
 }
+
+fn has_pair(m: &Market) -> bool {
+    m.pos.yes_qty > 0 && m.pos.no_qty > 0
+}
+
+fn qty_for(m: &Market, side: Side) -> i64 {
+    match side {
+        Side::Yes => m.pos.yes_qty,
+        Side::No => m.pos.no_qty,
+    }
+}
+
+fn avg_cc_for(m: &Market, side: Side) -> Option<i64> {
+    match side {
+        Side::Yes => m.pos.avg_yes_cc(),
+        Side::No => m.pos.avg_no_cc(),
+    }
+}
+
+fn max_missing_price_cents(cfg: &Config, m: &Market, existing_avg_cc: i64) -> u8 {
+    // Use a looser cap late-window so you can finish hedged.
+    let cap_cc = if m.mode == Mode::Balance {
+        cfg.balance_pair_cc.max(DOLLAR_CC)
+    } else {
+        cfg.bootstrap_pair_cc
+    };
+
+    let max_cc = cap_cc - existing_avg_cc;
+    if max_cc <= 0 {
+        return 0;
+    }
+    (max_cc / CC_PER_CENT).clamp(0, cfg.max_buy_price_cents as i64) as u8
+}
+
+fn can_rescue_existing(cfg: &Config, m: &Market, existing: Side) -> Option<(u8, i64)> {
+    let existing_avg_cc = avg_cc_for(m, existing)?;
+    let existing_avg_cents = (existing_avg_cc / CC_PER_CENT).clamp(0, 100) as u8;
+
+    let p = top_maker_price(cfg, m, existing)?;
+    if p >= existing_avg_cents {
+        return None; // would not reduce avg
+    }
+
+    let sim = m.pos.simulate_buy(existing, p, 1);
+    let new_avg_cc = match existing {
+        Side::Yes => sim.avg_yes_cc()?,
+        Side::No => sim.avg_no_cc()?,
+    };
+
+    let improve_cc = existing_avg_cc - new_avg_cc;
+    if improve_cc < cfg.bootstrap_rescue_min_improve_cc {
+        return None;
+    }
+
+    Some((p, improve_cc))
+}
+
+fn choose_bootstrap_side(cfg: &Config, m: &Market, score: f64, conf: f64) -> Side {
+    // Flat: optionally follow flow, otherwise pick cheaper ask (hedge_side does that)
+    if m.pos.yes_qty == 0 && m.pos.no_qty == 0 {
+        let hedge = hedge_side(m);
+        let flow = momentum_side(score);
+        let strength = score.abs() * conf.clamp(0.0, 1.0);
+        if conf >= cfg.min_conf_for_flow && strength >= cfg.momentum_score_threshold {
+            flow
+        } else {
+            hedge
+        }
+    } else {
+        // One-sided: decide whether to work missing or do a rescue buy
+        let existing = if m.pos.yes_qty > 0 {
+            Side::Yes
+        } else {
+            Side::No
+        };
+        let missing = existing.other();
+
+        if m.mode == Mode::Balance {
+            return missing; // force hedge late window
+        }
+
+        let existing_avg_cc = avg_cc_for(m, existing).unwrap_or(0);
+        let max_missing = max_missing_price_cents(cfg, m, existing_avg_cc);
+        let ask_missing = m.book.implied_ask(missing);
+
+        // If we can hedge under our cap at current market, do it.
+        if ask_missing.map(|a| a <= max_missing).unwrap_or(false) {
+            return missing;
+        }
+
+        // otherwise, only rescue-buy if:
+        // - we haven't exceeded max one-sided qty
+        // - and the top maker price meaningfully improves our avg
+        if qty_for(m, existing) < cfg.bootstrap_max_one_side_qty {
+            if can_rescue_existing(cfg, m, existing).is_some() {
+                return existing;
+            }
+        }
+            // Park a bid on missing at/under cap and wait for a swing.
+            missing
+    }
+}
+
+
 
 /// Fallback “window id” when we don’t have open_ts.
 /// (For BTC15M this usually still matches because starts align to 15m boundaries in UTC.)
@@ -442,14 +547,98 @@ fn maybe_opportunistic_taker(
     t_rem: i64,
     desired_side: Side,
 ) -> Option<ExecCommand> {
+    // ---------------BOOTSTRAP TAKER-----------------
+    // Until we have both sides, only taker in tight spreads
+    // or when we're forcing balance late window.
+    if !has_pair(m) {
+        let side = desired_side;
+        let Some(ask) = m.book.implied_ask(side) else {return None; };
+        if ask > cfg.max_buy_price_cents {
+            return None;
+        }
+
+        if let Some(last) = last_taker(m, side) {
+            if (now.duration_since(last).as_millis() as u64) < cfg.taker_cooldown_ms {
+                return None; 
+            }
+        }
+
+        // One-sided: only taker the MISSING side and only if within cap
+        if m.pos.yes_qty > 0 || m.pos.no_qty > 0 {
+            let existing = if m.pos.yes_qty > 0 {
+                Side::Yes
+            } else {
+                Side::No
+            };
+            let missing = existing.other();
+            if side != missing {
+                return None; // never taker rescue, maker only
+            }
+
+            let existing_avg_cc = avg_cc_for(m, existing)?;
+            let max_missing = max_missing_price_cents(cfg, m, existing_avg_cc);
+            if ask > max_missing {
+                return None;
+            }
+
+            // If not Balance mode, require a tight spread to cross
+            if m.mode != Mode::Balance {
+                let best = m.book.best_bid(side)?;
+                if ask > best.saturating_add(cfg.aggressive_tick) {
+                    return None;
+                }
+            }
+        } else {
+            // Flat: only take if tight spread (otherwise maker quote)
+            if m.mode != Mode::Balance {
+                let best = m.book.best_bid(side)?;
+                if ask > best.saturating_add(cfg.aggressive_tick) {
+                    return None;
+                }
+            }
+        }
+
+        let client_order_id = uuid::Uuid::new_v4();
+        m.orders.insert_pending(OrderRec {
+            ticker: ticker.to_string(),
+            side,
+            price_cents: ask,
+            qty: 1,
+            tif: Tif::Ioc,
+            post_only: false,
+            order_id: None,
+            client_order_id,
+            status: OrderStatus::PendingAck,
+            created_at: now,
+            filled_qty: 0,
+        });
+
+        set_last_taker(m, side, now);
+
+        return Some(ExecCommand::PlaceOrder {
+            ticker: ticker.to_string(),
+            side,
+            price_cents: ask,
+            qty: 1,
+            tif: Tif::Ioc,
+            post_only: false,
+            client_order_id,
+        });
+    }
+
     let imbalance_cap = allowed_imbalance(cfg, t_rem);
     let must_balance = m.mode == Mode::Balance || m.pos.imbalance_ratio() > imbalance_cap;
+    let hedge = hedge_side(m);
 
-    // let desired = choose_working_side(cfg, m, t_rem, score);
-
+    let cap_target = cfg.target_pair_cc.max(TARGET_PAIR_CC);
+    let cap_balance = cfg.balance_pair_cc.max(DOLLAR_CC);
     let mut best: Option<(Side, u8, i64)> = None;
 
     for side in [Side::Yes, Side::No] {
+        if must_balance && side != hedge {
+            continue; // in balance mode only buy the hedge side
+        }
+
         if !must_balance {
             let would = m.pos.simulate_buy(side, 0, 1); // price doesn't matter for imbalance_ratio
             if would.imbalance_ratio() > imbalance_cap {
@@ -470,14 +659,33 @@ fn maybe_opportunistic_taker(
             let sim = m.pos.simulate_buy(side, ask, 1);
             let Some(new_pc) = sim.pair_cost_cc() else { continue; };
 
-            if new_pc <= cfg.target_pair_cc.max(TARGET_PAIR_CC) {
-                best = Some((side, ask, new_pc));
+            // If we MUST balance, allow up to balance cap even if it doesn't "improve"
+            if must_balance && new_pc <= cap_balance {
+                match best {
+                    None => best = Some((side, ask, new_pc)),
+                    Some((_, _, bp)) if new_pc < bp => best = Some((side, ask, new_pc)),
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Normal objective: get under target if possible
+            if new_pc <= cap_target {
+                match best {
+                    None => best = Some((side, ask, new_pc)),
+                    Some((_, _, bp)) if new_pc < bp => best = Some((side, ask, new_pc)),
+                    _ => {}
+                }
                 continue;
             }
 
             let improve = old_pc - new_pc;
             if improve >= cfg.min_taker_improve_cc {
-                best = Some((side, ask, new_pc));
+                match best {
+                    None => best = Some((side, ask, new_pc)),
+                    Some((_, _, bp)) if new_pc < bp => best = Some((side, ask, new_pc)),
+                    _ => {}
+                }  
             }
         } else {
             if side == desired_side {
@@ -652,16 +860,58 @@ fn maybe_maker_quote(
 
     let cap_target = cfg.target_pair_cc.max(TARGET_PAIR_CC);
     let cap_safe = cfg.safe_pair_cc.max(SAFE_PAIR_CC);
+    let cap_balance = cfg.balance_pair_cc.max(DOLLAR_CC);
 
     let top = top_maker_price(cfg, m, desired_side)?;
     let min_price = top.saturating_sub(cfg.maker_max_edge_cents);
 
-    let p = if let Some(p1) = best_price_under_pair_cap(m, desired_side, top, min_price, cap_target, true) {
-        p1
-    } else if m.mode != Mode::Balance {
-        best_price_under_pair_cap(m, desired_side, top, min_price, cap_safe, false)?
+    // ----------BOOTSTRAP MAKER QUOTE------------
+    if !has_pair(m) {
+        // Flat: just quote near top maker price on desired_side.
+        if m.pos.yes_qty == 0 && m.pos.no_qty == 0 {
+            return place_or_manage_resting(cfg, ticker, m, now, desired_side, top);
+        }
+
+        // one-sided bootstrap:
+        let existing = if m.pos.yes_qty > 0 {
+            Side::Yes
+        } else {
+            Side::No
+        };
+
+        let missing = existing.other();
+
+        if desired_side == missing {
+            let existing_avg_cc = avg_cc_for(m, existing)?;
+            let max_missing = max_missing_price_cents(cfg, m, existing_avg_cc);
+            if max_missing == 0 {
+                return None;
+            }
+            // Allow "deep" quotes in bootstrap (do NOT enforce maker_max_edge here)
+            let p = top.min(max_missing);
+            return place_or_manage_resting(cfg, ticker, m,  now, desired_side, p);
+        } else {
+            // Rescue-buy side: only if it improves avg and we haven't exceeded max one sided qty
+            if qty_for(m, existing) >= cfg.bootstrap_max_one_side_qty {
+                return None;
+            }
+            let (p, _improve) = can_rescue_existing(cfg, m, existing)?;
+            return place_or_manage_resting(cfg, ticker, m, now, desired_side, p);
+        }
+    }
+
+    // --------------NORMAL (PAIRED) MAKER QUOTE--------
+    let old_pc = m.pos.pair_cost_cc().unwrap_or(cap_safe);
+
+    let p = if m.mode == Mode::Balance {
+        // In Balance mode, prioritize hedging: allow up to balance cap.
+        best_price_under_pair_cap(m, desired_side, top, min_price, cap_balance, false)?
+    } else if old_pc <= cap_target {
+        // Already under target: don't worsen, keep under target
+        best_price_under_pair_cap(m, desired_side, top, min_price, cap_target, true)?
     } else {
-        return None;
+        // Above target: allow any improvement (new_pc <= old_pc), even if still above target/safe
+        best_price_under_pair_cap(m, desired_side, top, min_price, old_pc, true)?
     };
 
     if let Some(existing) = m.resting_hint(desired_side).as_ref().cloned() {
@@ -726,6 +976,83 @@ fn maybe_maker_quote(
     Some(ExecCommand::PlaceOrder {
         ticker: ticker.to_string(),
         side: desired_side,
+        price_cents: p,
+        qty: 1,
+        tif: Tif::Gtc,
+        post_only: true,
+        client_order_id,
+    })
+}
+
+// Small helper to reuse your existing "one resting order per side"
+fn place_or_manage_resting(
+    cfg: &Config,
+    ticker: &str,
+    m: &mut Market,
+    now: Instant,
+    side: Side,
+    p: u8,
+) -> Option<ExecCommand> {
+    if let Some(existing) = m.resting_hint(side).as_ref().cloned() {
+        if existing.price_cents == p {
+            return None;
+        }
+
+        let age_ms = now.duration_since(existing.created_at).as_millis() as u64;
+        if age_ms < cfg.min_resting_life_ms {
+            return None;
+        }
+
+        if let Some(t0) = existing.cancel_requested_at {
+            let since = now.duration_since(t0).as_millis() as u64;
+            if since < cfg.cancel_retry_ms {
+                return None;
+            }
+        }
+
+        let drift = existing.price_cents.abs_diff(p);
+        if drift >= cfg.cancel_drift_cents {
+            let Some(order_id) = existing.order_id.clone() else {
+                return None;
+            };
+            if let Some(hm) = m.resting_hint_mut(side).as_mut() {
+                hm.cancel_requested_at = Some(now);
+            }
+            return Some(ExecCommand::CancelOrder {
+                ticker: ticker.to_string(),
+                order_id,
+            });
+        }
+    return None;
+    }
+
+    let client_order_id = uuid::Uuid::new_v4();
+    m.orders.insert_pending(OrderRec {
+        ticker: ticker.to_string(),
+        side,
+        price_cents: p,
+        qty: 1,
+        tif: Tif::Gtc,
+        post_only: true,
+        order_id: None,
+        client_order_id,
+        status: OrderStatus::PendingAck,
+        created_at: now,
+        filled_qty: 0,
+    });
+
+    *m.resting_hint_mut(side) = Some(RestingHint {
+        side,
+        price_cents: p,
+        created_at: now,
+        cancel_requested_at: None,
+        client_order_id,
+        order_id: None,
+    });
+
+    Some(ExecCommand::PlaceOrder {
+        ticker: ticker.to_string(),
+        side,
         price_cents: p,
         qty: 1,
         tif: Tif::Gtc,
@@ -919,7 +1246,11 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     // }
 
     // ----------------------------------------------------
-    let desired_side = choose_working_side(cfg, m, t_rem, score, conf);
+    let desired_side = if has_pair(m) {
+        choose_working_side(cfg, m, t_rem, score, conf)
+    } else {
+        choose_bootstrap_side(cfg, m, score, conf)
+    };
     m.last_desired_side = Some(desired_side);
 
     let strength = score.abs() * conf.clamp(0.0, 1.0);

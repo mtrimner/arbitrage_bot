@@ -39,6 +39,18 @@ pub struct Config {
     pub safe_pair_cc: i64,   // “never exceed” (looser) cap
     pub target_pair_cc: i64, // “goal” cap
 
+    // Bootstrapping / balancing caps:
+    // - bootstrap_pair_cc: allowed avg_yes+avg_no while trying to establish the FIRST pair
+    // - balance_pair_cc: allowed avg_yes+avg_no when forcing balance near the end
+    pub bootstrap_pair_cc: i64,
+    pub balance_pair_cc: i64,
+
+    // One-sided “rescue” behavior:
+    // - max unhedged qty allowed while waiting for the other side
+    // - minimum improvement in avg (cent-cents) required to add more to the same side
+    pub bootstrap_max_one_side_qty: i64,
+    pub bootstrap_rescue_min_improve_cc: i64,
+
     // Inventory imbalance limits (ratio of |yes-no| / (yes+no)).
     pub early_imbalance_cap: f64,
     pub late_imbalance_cap: f64,
@@ -123,6 +135,12 @@ impl Default for Config {
 
             safe_pair_cc: 9850,
             target_pair_cc: 9825,
+
+            bootstrap_pair_cc: 10100, // $1.01
+            balance_pair_cc: 9900, // $0.99
+ 
+            bootstrap_max_one_side_qty: 5,
+            bootstrap_rescue_min_improve_cc: 500,
 
             early_imbalance_cap: 0.20,
             late_imbalance_cap: 0.05,

@@ -220,7 +220,9 @@ async fn handle_snapshot(cfg: &Config, shared: &Shared, snap: OrderbookSnapshot)
     let yes = m.yes.unwrap_or_default();
     let no = m.no.unwrap_or_default();
 
-    let ts = shared.ensure_ticker(&ticker);
+    let Some(ts) = shared.tickers.get(&ticker) else {
+        return Ok(());
+    };
     let mut g = ts.mkt.write().await;
     g.book.reset(seq, &yes, &no);
 
