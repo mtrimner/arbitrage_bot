@@ -80,6 +80,9 @@ pub struct RestingHint {
 
     // Filled in by executor once HTTP create_order returns the exchange order id.
     pub order_id: Option<String>,
+
+    // PAPER_SIM: qty that was already resting at this price when we joined.
+    pub queue_ahead: i64,
 }
 
 /// Commands sent from MarketManager -> WS task

@@ -1026,6 +1026,10 @@ fn maybe_maker_quote(
         filled_qty: 0,
     });
 
+    let queue_ahead = match desired_side {
+        Side::Yes => m.book.yes_bids[p as usize],
+        Side::No => m.book.no_bids[p as usize],
+    };
     *m.resting_hint_mut(desired_side) = Some(RestingHint {
         side: desired_side,
         price_cents: p,
@@ -1033,6 +1037,8 @@ fn maybe_maker_quote(
         cancel_requested_at: None,
         client_order_id,
         order_id: None,
+        // PAPER TRADING
+        queue_ahead,
     });
 
     Some(ExecCommand::PlaceOrder {
@@ -1103,6 +1109,10 @@ fn place_or_manage_resting(
         filled_qty: 0,
     });
 
+    let queue_ahead = match side {
+    Side::Yes => m.book.yes_bids[p as usize],
+    Side::No => m.book.no_bids[p as usize],
+    };
     *m.resting_hint_mut(side) = Some(RestingHint {
         side,
         price_cents: p,
@@ -1110,6 +1120,8 @@ fn place_or_manage_resting(
         cancel_requested_at: None,
         client_order_id,
         order_id: None,
+        // PAPER TRADING
+        queue_ahead,
     });
 
     Some(ExecCommand::PlaceOrder {
@@ -1317,21 +1329,21 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
 
     let strength = score.abs() * conf.clamp(0.0, 1.0);
 
-    tracing::debug!(
-        ticker = %ticker,
-        wid = wid,
-        mode = ?m.mode,
-        t_rem,
-        window_s,
-        score,
-        conf,
-        strength,
-        desired_side = ?desired_side,
-        imbr = m.pos.imbalance_ratio(),
-        yes = m.pos.yes_qty,
-        no = m.pos.no_qty,
-        "decision signal summary"
-    );
+    // tracing::debug!(
+    //     ticker = %ticker,
+    //     wid = wid,
+    //     mode = ?m.mode,
+    //     t_rem,
+    //     window_s,
+    //     score,
+    //     conf,
+    //     strength,
+    //     desired_side = ?desired_side,
+    //     imbr = m.pos.imbalance_ratio(),
+    //     yes = m.pos.yes_qty,
+    //     no = m.pos.no_qty,
+    //     "decision signal summary"
+    // );
 
 
     // 0) Cancel stale resting orders (but never churn fast).

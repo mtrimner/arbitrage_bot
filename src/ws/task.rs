@@ -279,6 +279,10 @@ async fn handle_delta(cfg: &Config, shared: &Shared, delta: OrderbookDelta) -> R
         g.flow.on_book_imbalance(cfg, raw_imb, now);
         g.flow.input_rev = g.flow.input_rev.wrapping_add(1);
 
+        if cfg.exec_mode.is_paper() {
+            crate::exec::paper::paper_on_delta_queue(&mut g, side, m.price, m.delta);
+        }
+
         // tracing::debug!(
         //     ticker = %ticker,
         //     seq = seq,
@@ -328,6 +332,10 @@ async fn handle_trade(cfg: &Config, shared: &Shared, tu: TradeUpdate) -> Result<
     g.flow.on_trade_flow(cfg, raw_tf, signed_qty, now);
     g.flow.input_rev = g.flow.input_rev.wrapping_add(1);
 
+    if cfg.exec_mode.is_paper() {
+        crate::exec::paper::paper_on_trade_fill(&mut g, taker_side, m.yes_price, m.no_price, m.count);
+    }
+
     // tracing::debug!(
     //     ticker = %ticker,
     //     taker_side = ?taker_side,
@@ -364,7 +372,7 @@ async fn handle_fill(shared: &Shared, uf: UserFill) -> Result<()> {
 
         // Update position.
         g.pos.apply_fill(purchased, price, fill_qty);
-
+        // crate::report::log_position(&ticker, &g.pos);
         if let Ok(client_id) = Uuid::parse_str(&m.client_order_id) {
             // Make sure order_id mapping exists even if Rest ack is late
             g.orders.link_order_id_if_missing(client_id, &m.order_id);

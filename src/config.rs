@@ -1,9 +1,20 @@
-/// Strategy + microstructure tuning parameters.
-///
-/// IMPORTANT: you will absolutely need to tune these live.
-/// Defaults here are “reasonable starter values” for a 15-minute market.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecMode {
+    Live,
+    Paper,
+}
+
+impl ExecMode {
+    pub fn is_paper(self) -> bool {
+        matches!(self, ExecMode::Paper)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub exec_mode: ExecMode,
+    // (optional) realism knobs:
+    pub paper_reject_postonly_cross: bool,
     // How often the engine runs.
     // Even if your WS updates are fast, 20–50ms is usually plenty.
     pub tick_ms: u64,
@@ -112,6 +123,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            exec_mode: ExecMode::Live,
+            paper_reject_postonly_cross: true,
+
             tick_ms: 25,
 
             side_exit_mult: 0.6,
@@ -142,8 +156,8 @@ impl Default for Config {
             bootstrap_max_one_side_qty: 5,
             bootstrap_rescue_min_improve_cc: 500,
 
-            early_imbalance_cap: 0.20,
-            late_imbalance_cap: 0.05,
+            early_imbalance_cap: 1.00,
+            late_imbalance_cap: 0.50,
 
             cancel_stale_ms: 5000,
             min_resting_life_ms: 250,

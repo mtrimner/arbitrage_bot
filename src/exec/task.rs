@@ -6,12 +6,14 @@ use std::sync::Arc;
 
 use kalshi_rs::KalshiClient;
 
-use crate::exec::http;
+use crate::exec::{http, paper};
 use crate::state::orders::OrderStatus;
 use crate::state::Shared;
 use crate::types::{ExecCommand, Side, Tif};
+use crate::config::{Config, ExecMode};
 
 pub async fn run_exec(
+    cfg: Config,
     client: Arc<KalshiClient>,
     shared: Shared,
     mut rx: mpsc::Receiver<ExecCommand>,
@@ -27,6 +29,15 @@ pub async fn run_exec(
                 post_only,
                 client_order_id,
             } => {
+
+                if cfg.exec_mode.is_paper() {
+                    paper::paper_place(
+                        &shared, &ticker, side, price_cents, qty, tif, post_only,
+                        client_order_id, cfg.paper_reject_postonly_cross
+                    ).await;
+                    continue;
+                }
+
                 let res = http::place(
                     &client,
                     &ticker,
@@ -101,6 +112,11 @@ pub async fn run_exec(
             }
 
             ExecCommand::CancelOrder { ticker, order_id } => {
+                if cfg.exec_mode.is_paper() {
+                    paper::paper_cancel(&shared, &ticker, &order_id).await;
+                    continue;
+                }
+
                 let res = http::cancel(&client, &order_id).await;
                 match res {
                     Ok(_) => {
