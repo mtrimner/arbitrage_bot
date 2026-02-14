@@ -1,4 +1,3 @@
-use std::os::raw;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, warn};
@@ -42,6 +41,15 @@ fn top_levels(arr: &[i64; 101], n: usize) -> Vec<(u8, i64)> {
         }
     }
     out
+}
+
+fn best_maker_pc_for_side(cfg: &Config, m: &Market, side: Side, cap_cc: i64) -> Option<(u8, i64)> {
+    let top = top_maker_price(cfg, m, side)?;
+    let min_price = top.saturating_sub(cfg.maker_max_edge_cents);
+    let p = best_price_under_pair_cap(m, side, top, min_price, cap_cc, true)?;
+    let sim = m.pos.simulate_buy(side, p, 1);
+    let pc = sim.pair_cost_cc()?;
+    Some((p, pc))
 }
 
 /// Matches the private helper in signal.rs (for logging depth_norm numbers).
@@ -170,6 +178,40 @@ fn choose_bootstrap_side(cfg: &Config, m: &Market, score: f64, conf: f64) -> Sid
             // Park a bid on missing at/under cap and wait for a swing.
             missing
     }
+}
+
+fn choose_bootstrap_side_simple(cfg: &Config, m: &Market) -> Side {
+    // Flat: just pick cheaper ask (hedge_side already does that)
+    if m.pos.yes_qty == 0 && m.pos.no_qty == 0 {
+        return hedge_side(m);
+    }
+
+    // One-sided: decide whether to work missing or do a rescue buy
+    let existing = if m.pos.yes_qty > 0 { Side::Yes } else { Side::No };
+    let missing = existing.other();
+
+    if m.mode == Mode::Balance {
+        return missing; // force hedge late window
+    }
+
+    let existing_avg_cc = avg_cc_for(m, existing).unwrap_or(0);
+    let max_missing = max_missing_price_cents(cfg, m, existing_avg_cc);
+    let ask_missing = m.book.implied_ask(missing);
+
+    // If we can hedge under our cap at current market, do it.
+    if ask_missing.map(|a| a <= max_missing).unwrap_or(false) {
+        return missing;
+    }
+
+    // otherwise rescue-buy if it meaningfully improves avg and within one-sided limit
+    if qty_for(m, existing) < cfg.bootstrap_max_one_side_qty {
+        if can_rescue_existing(cfg, m, existing).is_some() {
+            return existing;
+        }
+    }
+
+    // Park bid on missing and wait for a swing
+    missing
 }
 
 
@@ -377,50 +419,89 @@ fn cancel_stale_if_needed(cfg: &Config, ticker: &str, m: &mut Market, now: Insta
     None
 }
 
-/// Decide which side we “prefer” to work right now:
-/// - if we MUST balance => hedge side
-/// - else if flow score is strong and we’re not too imbalanced => flow side
-/// - else => hedge side
-// fn choose_working_side(cfg: &Config, m: &Market, t_rem: i64, score: f64, conf: f64) -> Side {
-//     let imbalance_cap = allowed_imbalance(cfg, t_rem);
-//     let imbr = m.pos.imbalance_ratio();
+/// Signal-free working side selection, but "pair-cost smart".
+/// Chooses the side that would most reduce avg_yes+avg_no if a 1-lot maker fill happens.
+///
+/// Priority:
+/// 1) If forced balance (late window / too imbalanced): hedge side
+/// 2) If one-sided: buy missing side
+/// 3) If both sides exist: pick the side with best simulated pair-cost improvement
+fn choose_working_side_simple(cfg: &Config, m: &Market, t_rem: i64) -> Side {
+    let imbalance_cap = allowed_imbalance(cfg, t_rem);
 
-//     let hedge_side = hedge_side(m);
-//     let flow_side = momentum_side(score);
+    // If we're forced to balance, always hedge.
+    if m.mode == Mode::Balance || m.pos.imbalance_ratio() > imbalance_cap {
+        return hedge_side(m);
+    }
 
-//     let must_balance = m.mode == Mode::Balance || imbr > imbalance_cap;
+    // If we're one-sided, prioritize getting the missing side first.
+    if m.pos.yes_qty > 0 && m.pos.no_qty == 0 {
+        return Side::No;
+    }
+    if m.pos.no_qty > 0 && m.pos.yes_qty == 0 {
+        return Side::Yes;
+    }
 
-//     if must_balance {
-//         return hedge_side;
-//     } 
+    // Flat: prefer cheaper implied as (hedge_side already does this)
+    if m.pos.yes_qty == 0 && m.pos.no_qty == 0 {
+        return hedge_side(m);
+    }
 
-//     let conf = conf.clamp(0.0, 1.0);
+    // Both sides exist: choose side that yields best (lowest) simulated pair cost
+    // from a 1-lot maker fill at our best quote.
+    let old_pc = m.pos.pair_cost_cc().unwrap_or(i64::MAX);
+    let cap_target = cfg.target_pair_cc.max(TARGET_PAIR_CC);
 
-//     // If confidence is too low, never follow flow.
-//     if conf < cfg.min_conf_for_flow {
-//         return hedge_side;
-//     }
+    // If we're already under target, stay under target and don't worsen.
+    // If we're above target, allow any improvement (new_pc <= old_pc).
+    let cap_cc = if old_pc <= cap_target {
+        cap_target
+    } else {
+        old_pc
+    };
 
-//     // Conf aware signal strength (0..1-ish)
-//     let strength = score.abs() * conf;
+    let mut best: Option<(Side, i64, u8, u8)> = None;
 
-//     // Enter at the usual threshold, exit at a lower threshold (hysteresis).
-//     let enter = cfg.momentum_score_threshold;
-//     let exit = cfg.momentum_score_threshold * cfg.side_exit_mult; // e.g. 0.6
+    for side in [Side::Yes, Side::No] {
+        // Respect imbalance cap (don't choose side that would push beyond allowed imbalance)
+        let would = m.pos.simulate_buy(side, 0, 1);
+        if would.imbalance_ratio() > imbalance_cap {
+            continue;
+        }
 
-//     let prev = m.last_desired_side.unwrap_or(hedge_side);
+        // Candidate maker quote band
+        let Some(top) = top_maker_price(cfg, m, side) else {
+            continue;
+        };
+        let min_price = top.saturating_sub(cfg.maker_max_edge_cents);
 
-//     if strength >= enter {
-//         flow_side
-//     } else if strength <= exit {
-//         hedge_side
-//     } else  {
-//         // In the deadband:
-//         // keep prev only if it still matches the current flow direction,
-//         // otherwise fall back to hedge (safer than staying “stuck wrong”).
-//         if prev == flow_side { prev } else { hedge_side }
-//     }
-// }
+        // Find a price in [min_price..top] that keeps us under cap_cc and (otionally doesn't worsen)
+        let Some(p) = best_price_under_pair_cap(m, side, top, min_price, cap_cc, true) else {
+            continue;
+        };
+
+        // Simulate a 1-lot fill at p and evaluate new pair cost
+        let sim = m.pos.simulate_buy(side, p, 1);
+        let Some(new_pc) = sim.pair_cost_cc() else {
+            continue;
+        };
+
+        // Tie-break by tighter spread (more likely to fill /more efficient quoting)
+        let bid = m.book.best_bid(side).unwrap_or(0);
+        let ask = m.book.implied_ask(side).unwrap_or(100);
+        let spread = ask.saturating_sub(bid);
+
+        match best {
+            None => best = Some((side, new_pc, p, spread)),
+            Some((_, best_pc, _, best_spread)) => {
+                if new_pc < best_pc || (new_pc == best_pc && spread < best_spread) {
+                    best = Some((side, new_pc, p, spread));
+                }
+            }
+        }
+    }
+    best.map(|(s, _, _, _)| s).unwrap_or_else(|| hedge_side(m))
+}
 
 fn choose_working_side(cfg: &Config, m: &Market, t_rem: i64, score: f64, conf: f64) -> Side {
     let imbalance_cap = allowed_imbalance(cfg, t_rem);
@@ -479,42 +560,6 @@ fn choose_working_side(cfg: &Config, m: &Market, t_rem: i64, score: f64, conf: f
             (hedge, "stay_hedge")
         }
     };
-
-    // tracing::debug!(
-    //     mode = ?m.mode,
-    //     t_rem,
-    //     imbr,
-    //     imbalance_cap,
-    //     must_balance,
-    //     score,
-    //     conf,
-    //     conf01,
-    //     strength,
-    //     enter,
-    //     exit,
-    //     gate_ok,
-
-    //     // Raw thresholds
-    //     enter_hit,
-    //     exit_hit,
-    //     in_deadband,
-
-    //     // State + EFFECTIVE transitions
-    //     in_flow_state,
-    //     enter_trigger,
-    //     exit_trigger,
-
-    //     // Context
-    //     switched = (chosen != prev),
-    //     flow_eq_hedge = (flow == hedge),
-
-    //     prev = ?prev,
-    //     hedge = ?hedge,
-    //     flow = ?flow,
-    //     chosen = ?chosen,
-    //     reason,
-    //     "choose_working_side"
-    // );
 
     chosen
 }
@@ -632,6 +677,15 @@ fn maybe_opportunistic_taker(
 
     let cap_target = cfg.target_pair_cc.max(TARGET_PAIR_CC);
     let cap_balance = cfg.balance_pair_cc.max(DOLLAR_CC);
+    let old_pc = m.pos.pair_cost_cc().unwrap_or(i64::MAX);
+
+    // Same "improvement-mode" cap as maker quoting to somparison is fair
+    let cap_for_maker = if old_pc <= cap_target {
+        cap_target
+    } else {
+        old_pc
+    };
+
     let mut best: Option<(Side, u8, i64)> = None;
 
     for side in [Side::Yes, Side::No] {
@@ -655,41 +709,48 @@ fn maybe_opportunistic_taker(
             }
         }
 
-        if let Some(old_pc) = m.pos.pair_cost_cc() {
-            let sim = m.pos.simulate_buy(side, ask, 1);
-            let Some(new_pc) = sim.pair_cost_cc() else { continue; };
+        let sim = m.pos.simulate_buy(side, ask, 1);
+        let Some(new_pc) = sim.pair_cost_cc() else {
+            continue;
+        };
 
-            // If we MUST balance, allow up to balance cap even if it doesn't "improve"
-            if must_balance && new_pc <= cap_balance {
-                match best {
-                    None => best = Some((side, ask, new_pc)),
-                    Some((_, _, bp)) if new_pc < bp => best = Some((side, ask, new_pc)),
-                    _ => {}
-                }
-                continue;
+        // If we MUST balance, allow up to balance cap even if it doesn't "improve"
+        if must_balance && new_pc <= cap_balance {
+            match best {
+                None => best = Some((side, ask, new_pc)),
+                Some((_, _, bp)) if new_pc < bp => best = Some((side, ask, new_pc)),
+                _ => {}
             }
+            continue;
+        }
 
-            // Normal objective: get under target if possible
-            if new_pc <= cap_target {
-                match best {
-                    None => best = Some((side, ask, new_pc)),
-                    Some((_, _, bp)) if new_pc < bp => best = Some((side, ask, new_pc)),
-                    _ => {}
-                }
-                continue;
-            }
+        // --------- NEW: taker vs maker gate ----------
+        let maker_pc = best_maker_pc_for_side(cfg, m, side, cap_for_maker)
+            .map(|(_p, pc)| pc)
+            .unwrap_or(i64::MAX);
 
-            let improve = old_pc - new_pc;
-            if improve >= cfg.min_taker_improve_cc {
-                match best {
-                    None => best = Some((side, ask, new_pc)),
-                    Some((_, _, bp)) if new_pc < bp => best = Some((side, ask, new_pc)),
-                    _ => {}
-                }  
+        let bid = m.book.best_bid(side).unwrap_or(0);
+        let tight = ask <= bid.saturating_add(cfg.aggressive_tick);
+
+        // If spread isn't tight, only cross if taker is at least as good as maker on pair-cost.
+        let taker_beats_maker = new_pc <= maker_pc;
+
+        // Target hit is great, but still don't cross wide if maker is better.
+        if new_pc <= cap_target && (tight || taker_beats_maker) {
+            match best {
+                None => best = Some((side, ask, new_pc)),
+                Some((_, _, bp)) if new_pc < bp => best = Some((side, ask, new_pc)),
+                _ => {}
             }
-        } else {
-            if side == desired_side {
-                best = Some((side, ask, 0));
+            continue;
+        }
+
+        let improve = old_pc - new_pc;
+        if improve >= cfg.min_taker_improve_cc && (tight || taker_beats_maker) {
+            match best {
+                None => best = Some((side, ask, new_pc)),
+                Some((_, _, bp)) if new_pc < bp => best = Some((side, ask, new_pc)),
+                _ => {}
             }
         }
     }
@@ -727,6 +788,7 @@ fn maybe_opportunistic_taker(
 /// Momentum taker:
 /// If score is strong and we’re allowed extra “flow-follow” buys, take at ask,
 /// but do not violate safe_pair_cc.
+#[allow(dead_code)]
 fn maybe_momentum_taker(
     cfg: &Config,
     ticker: &str,
@@ -1201,9 +1263,9 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     let strength = clamp01(score.abs() / cfg.score_full_conf_abs.max(1e-9));
     let conf_calc = clamp01(activity * (0.5 + 0.5 * consensus) * strength);
     
-    if let (Some(no_bid), Some(no_ask), Some(yes_bid), Some(yes_ask)) = (no_bid, no_ask, yes_bid, yes_ask) {
-    println!("Yes_bid: {}, Yes_ask: {}, No_bid: {}, No_ask: {}", yes_bid, yes_ask, no_bid, no_ask);
-    }
+    // if let (Some(no_bid), Some(no_ask), Some(yes_bid), Some(yes_ask)) = (no_bid, no_ask, yes_bid, yes_ask) {
+    // println!("Yes_bid: {}, Yes_ask: {}, No_bid: {}, No_ask: {}", yes_bid, yes_ask, no_bid, no_ask);
+    // }
 
     // ----- main debug dump (keep it gated so it’s readable) -----
     // let verbose = is_new_window || prev_mode != m.mode || (conf > 0.1 && score.abs() > 0.1);
@@ -1247,29 +1309,29 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
 
     // ----------------------------------------------------
     let desired_side = if has_pair(m) {
-        choose_working_side(cfg, m, t_rem, score, conf)
+        choose_working_side_simple(cfg, m, t_rem)
     } else {
-        choose_bootstrap_side(cfg, m, score, conf)
+        choose_bootstrap_side_simple(cfg, m)
     };
     m.last_desired_side = Some(desired_side);
 
     let strength = score.abs() * conf.clamp(0.0, 1.0);
 
-    // tracing::debug!(
-    //     ticker = %ticker,
-    //     wid = wid,
-    //     mode = ?m.mode,
-    //     t_rem,
-    //     window_s,
-    //     score,
-    //     conf,
-    //     strength,
-    //     desired_side = ?desired_side,
-    //     imbr = m.pos.imbalance_ratio(),
-    //     yes = m.pos.yes_qty,
-    //     no = m.pos.no_qty,
-    //     "decision signal summary"
-    // );
+    tracing::debug!(
+        ticker = %ticker,
+        wid = wid,
+        mode = ?m.mode,
+        t_rem,
+        window_s,
+        score,
+        conf,
+        strength,
+        desired_side = ?desired_side,
+        imbr = m.pos.imbalance_ratio(),
+        yes = m.pos.yes_qty,
+        no = m.pos.no_qty,
+        "decision signal summary"
+    );
 
 
     // 0) Cancel stale resting orders (but never churn fast).
@@ -1283,9 +1345,9 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     }
 
     // 2) Momentum taker (flow-driven): strong score, balanced inventory, within safe cap.
-    if let Some(cmd) = maybe_momentum_taker(cfg, ticker, m, now, t_rem, window_s, raw_score, score, conf) {
-        return Some(cmd);
-    }
+    // if let Some(cmd) = maybe_momentum_taker(cfg, ticker, m, now, t_rem, window_s, raw_score, score, conf) {
+    //     return Some(cmd);
+    // }
 
     // 3) Maker quoting (resting) with churn control.
     maybe_maker_quote(cfg, ticker, m, now, t_rem, desired_side)
