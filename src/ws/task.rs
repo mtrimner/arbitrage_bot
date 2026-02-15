@@ -333,7 +333,7 @@ async fn handle_trade(cfg: &Config, shared: &Shared, tu: TradeUpdate) -> Result<
     g.flow.input_rev = g.flow.input_rev.wrapping_add(1);
 
     if cfg.exec_mode.is_paper() {
-        crate::exec::paper::paper_on_trade_fill(&mut g, taker_side, m.yes_price, m.no_price, m.count);
+        crate::exec::paper::paper_on_trade_fill(&ticker, &mut g, taker_side, m.yes_price, m.no_price, m.count);
     }
 
     // tracing::debug!(

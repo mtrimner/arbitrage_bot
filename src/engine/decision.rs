@@ -1206,18 +1206,6 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     let (score,raw_score, conf) = signal::combined_score(cfg, m);
     let last_seq = m.book.last_seq;
 
-    if m.flow.input_rev != m.flow.last_score_rev {
-       tracing::debug!(
-            ticker = %ticker,
-            last_seq,
-            raw_score,
-            score_prev,
-            score_next = score,
-            conf,
-            "decide: ema_step"
-        );
-    }
-
     // Values actually used by the scorer
     let book_ema  = m.flow.book_imb_ema.value;
     let trade_ema = m.flow.trade_flow_ema.value;

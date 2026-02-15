@@ -18,7 +18,7 @@ pub fn paper_on_delta_queue(m: &mut Market, side: Side, price: u8, delta: i64) {
     }
 }
 
-pub fn paper_on_trade_fill(m: &mut Market, taker_side: Side, yes_price: u8, no_price: u8, count: i64) {
+pub fn paper_on_trade_fill(ticker: &str, m: &mut Market, taker_side: Side, yes_price: u8, no_price: u8, count: i64) {
     let fillable = count.max(0) as u64;
     if fillable == 0 { return; }
 
@@ -55,9 +55,8 @@ pub fn paper_on_trade_fill(m: &mut Market, taker_side: Side, yes_price: u8, no_p
 
     info!(?maker_side, maker_price, fill_qty, "PAPER maker filled");
     m.pos.apply_fill(maker_side, maker_price, fill_qty as i64);
+     crate::report::log_position(ticker, &m.pos);
     let fully = m.orders.on_fill_by_client(client_id, fill_qty);
-    let pc = m.pos.pair_cost_cc();
-    info!(yes=m.pos.yes_qty, no=m.pos.no_qty, pair_cost_cc=?pc, "PAPER position");
 
     if matches!(fully, Some(true)) {
         // clear resting hint when fully filled
@@ -117,6 +116,7 @@ pub async fn paper_place(
                 info!(ticker, ?side, limit=price_cents, fill_price=ask, fill_qty, "PAPER ioc filled");
                 g.pos.apply_fill(side, ask, fill_qty as i64);
                 let _ = g.orders.on_fill_by_client(client_order_id, fill_qty);
+                crate::report::log_position(ticker, &g.pos);
             } else {
                 info!(ticker, ?side, limit=price_cents, ask, "PAPER ioc not-filled reject");
                 g.orders.set_status_by_client(client_order_id, OrderStatus::Rejected);

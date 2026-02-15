@@ -145,7 +145,7 @@ impl Default for Config {
 
             aggressive_tick: 1,
             maker_improve_tick: 0,
-            max_buy_price_cents: 90,
+            max_buy_price_cents: 98,
 
             safe_pair_cc: 9850,
             target_pair_cc: 9825,
@@ -156,13 +156,13 @@ impl Default for Config {
             bootstrap_max_one_side_qty: 5,
             bootstrap_rescue_min_improve_cc: 500,
 
-            early_imbalance_cap: 1.00,
-            late_imbalance_cap: 0.50,
+            early_imbalance_cap: 0.90,
+            late_imbalance_cap: 0.10,
 
             cancel_stale_ms: 5000,
             min_resting_life_ms: 250,
             cancel_retry_ms: 800,
-            cancel_drift_cents: 2,
+            cancel_drift_cents: 1,
             maker_max_edge_cents: 8,
 
             taker_cooldown_ms: 400,
