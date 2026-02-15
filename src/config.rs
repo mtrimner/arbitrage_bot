@@ -66,6 +66,12 @@ pub struct Config {
     pub early_imbalance_cap: f64,
     pub late_imbalance_cap: f64,
 
+    // Dynamic sizing (catch-up)
+    pub max_order_qty: u64,            // hard safety cap
+    pub catchup_aggressiveness: f64,   // 0.0..1.0 how fast to catch up
+    pub catchup_balance_boost: f64,    // multiplier in Balance mode
+
+
     // Resting order management
     pub cancel_stale_ms: u64,        // cancel resting orders older than this
     pub min_resting_life_ms: u64,    // DO NOT churn/cancel before this age
@@ -158,6 +164,10 @@ impl Default for Config {
 
             early_imbalance_cap: 0.90,
             late_imbalance_cap: 0.10,
+
+            max_order_qty: 25,
+            catchup_aggressiveness: 0.35,
+            catchup_balance_boost: 1.0,
 
             cancel_stale_ms: 5000,
             min_resting_life_ms: 250,

@@ -43,6 +43,43 @@ fn top_levels(arr: &[i64; 101], n: usize) -> Vec<(u8, i64)> {
     out
 }
 
+fn desired_buy_qty(cfg: &Config, m: &Market, side: Side, t_rem: i64, window_s: i64) -> u64 {
+    let yes = m.pos.yes_qty.max(0) as i64;
+    let no  = m.pos.no_qty.max(0) as i64;
+
+    let (my, other) = match side {
+        Side::Yes => (yes, no),
+        Side::No  => (no, yes),
+    };
+
+    // Only scale up if we're buying the side that's behind
+    let gap = (other - my).max(0);
+    if gap <= 0 {
+        return 1;
+    }
+
+    // Taper: early more patient, late more urgent (0..1)
+    let tf = taper_factor(t_rem, window_s);         // 1 early -> 0 late
+    let urgency = (1.0 - tf).clamp(0.0, 1.0);       // 0 early -> 1 late
+
+    // Base catch-up fraction; increases as we approach the end
+    let mut frac = cfg.catchup_aggressiveness * (0.35 + 0.65 * urgency);
+
+    // In Balance mode, allow more aggressive catch-up
+    if m.mode == Mode::Balance {
+        frac *= (1.0 + cfg.catchup_balance_boost);
+    }
+
+    // Convert gap -> desired qty chunk
+    let q = ((gap as f64) * frac).ceil() as i64;
+
+    // Always at least 1, never above cap, never more than full gap
+    let q = q.clamp(1, gap).min(cfg.max_order_qty as i64);
+
+    q as u64
+}
+
+
 fn best_maker_pc_for_side(cfg: &Config, m: &Market, side: Side, cap_cc: i64) -> Option<(u8, i64)> {
     let top = top_maker_price(cfg, m, side)?;
     let min_price = top.saturating_sub(cfg.maker_max_edge_cents);
@@ -315,6 +352,36 @@ fn top_maker_price(cfg: &Config, m: &Market, side: Side) -> Option<u8> {
     }
     Some(p)
 }
+
+fn best_price_under_pair_cap_qty(
+    m: &Market,
+    side: Side,
+    max_price: u8,
+    min_price: u8,
+    cap_cc: i64,
+    require_noworse: bool,
+    qty: i64,
+) -> Option<u8> {
+    let old_pair = m.pos.pair_cost_cc();
+    if min_price > max_price { return None; }
+
+    for p in (min_price..=max_price).rev() {
+        let sim = m.pos.simulate_buy(side, p, qty);
+        let Some(new_pc) = sim.pair_cost_cc() else { continue; };
+
+        if new_pc > cap_cc { continue; }
+
+        if require_noworse {
+            if let Some(old_pc) = old_pair {
+                if new_pc > old_pc { continue; }
+            }
+        }
+
+        return Some(p);
+    }
+    None
+}
+
 
 /// Search downward for a price that satisfies pair-cost constraints.
 /// cap_cc is in cent-cents.
@@ -590,6 +657,7 @@ fn maybe_opportunistic_taker(
     m: &mut Market,
     now: Instant,
     t_rem: i64,
+    window_s: i64,
     desired_side: Side,
 ) -> Option<ExecCommand> {
     // ---------------BOOTSTRAP TAKER-----------------
@@ -643,12 +711,13 @@ fn maybe_opportunistic_taker(
             }
         }
 
+        let qty = desired_buy_qty(cfg, m, side, t_rem, window_s);
         let client_order_id = uuid::Uuid::new_v4();
         m.orders.insert_pending(OrderRec {
             ticker: ticker.to_string(),
             side,
             price_cents: ask,
-            qty: 1,
+            qty: qty,
             tif: Tif::Ioc,
             post_only: false,
             order_id: None,
@@ -664,7 +733,7 @@ fn maybe_opportunistic_taker(
             ticker: ticker.to_string(),
             side,
             price_cents: ask,
-            qty: 1,
+            qty: qty,
             tif: Tif::Ioc,
             post_only: false,
             client_order_id,
@@ -675,8 +744,8 @@ fn maybe_opportunistic_taker(
     let must_balance = m.mode == Mode::Balance || m.pos.imbalance_ratio() > imbalance_cap;
     let hedge = hedge_side(m);
 
-    let cap_target = cfg.target_pair_cc.max(TARGET_PAIR_CC);
-    let cap_balance = cfg.balance_pair_cc.max(DOLLAR_CC);
+    let cap_target = cfg.target_pair_cc;
+    let cap_balance = cfg.balance_pair_cc.clamp(0,DOLLAR_CC);
     let old_pc = m.pos.pair_cost_cc().unwrap_or(i64::MAX);
 
     // Same "improvement-mode" cap as maker quoting to somparison is fair
@@ -686,18 +755,11 @@ fn maybe_opportunistic_taker(
         old_pc
     };
 
-    let mut best: Option<(Side, u8, i64)> = None;
+    let mut best: Option<(Side, u8, i64, u64)> = None;
 
     for side in [Side::Yes, Side::No] {
         if must_balance && side != hedge {
             continue; // in balance mode only buy the hedge side
-        }
-
-        if !must_balance {
-            let would = m.pos.simulate_buy(side, 0, 1); // price doesn't matter for imbalance_ratio
-            if would.imbalance_ratio() > imbalance_cap {
-                continue;
-            }
         }
 
         let Some(ask) = m.book.implied_ask(side) else { continue; };
@@ -709,22 +771,37 @@ fn maybe_opportunistic_taker(
             }
         }
 
-        let sim = m.pos.simulate_buy(side, ask, 1);
+        let qty = desired_buy_qty(cfg, m, side, t_rem, window_s);
+
+        if !must_balance {
+            let would = m.pos.simulate_buy(side, 0, qty as i64); // price doesn't matter for imbalance_ratio
+            if would.imbalance_ratio() > imbalance_cap {
+                continue;
+            }
+        }
+
+        let sim = m.pos.simulate_buy(side, ask, qty as i64);
         let Some(new_pc) = sim.pair_cost_cc() else {
             continue;
         };
 
+        let cap_when_balancing = if old_pc <= cap_target {
+            cap_target // once under target, never exceed target
+        } else {
+            cap_balance // above target, allow balance cap behavior
+        };
+
         // If we MUST balance, allow up to balance cap even if it doesn't "improve"
-        if must_balance && new_pc <= cap_balance {
+        if must_balance && new_pc <= cap_when_balancing {
             match best {
-                None => best = Some((side, ask, new_pc)),
-                Some((_, _, bp)) if new_pc < bp => best = Some((side, ask, new_pc)),
+                None => best = Some((side, ask, new_pc, qty)),
+                Some((_, _, bp, _)) if new_pc < bp => best = Some((side, ask, new_pc, qty)),
                 _ => {}
             }
             continue;
         }
 
-        // --------- NEW: taker vs maker gate ----------
+        // --------- taker vs maker gate ----------
         let maker_pc = best_maker_pc_for_side(cfg, m, side, cap_for_maker)
             .map(|(_p, pc)| pc)
             .unwrap_or(i64::MAX);
@@ -738,8 +815,8 @@ fn maybe_opportunistic_taker(
         // Target hit is great, but still don't cross wide if maker is better.
         if new_pc <= cap_target && (tight || taker_beats_maker) {
             match best {
-                None => best = Some((side, ask, new_pc)),
-                Some((_, _, bp)) if new_pc < bp => best = Some((side, ask, new_pc)),
+                None => best = Some((side, ask, new_pc, qty)),
+                Some((_, _, bp, _)) if new_pc < bp => best = Some((side, ask, new_pc, qty)),
                 _ => {}
             }
             continue;
@@ -748,21 +825,21 @@ fn maybe_opportunistic_taker(
         let improve = old_pc - new_pc;
         if improve >= cfg.min_taker_improve_cc && (tight || taker_beats_maker) {
             match best {
-                None => best = Some((side, ask, new_pc)),
-                Some((_, _, bp)) if new_pc < bp => best = Some((side, ask, new_pc)),
+                None => best = Some((side, ask, new_pc, qty)),
+                Some((_, _, bp, _)) if new_pc < bp => best = Some((side, ask, new_pc, qty)),
                 _ => {}
             }
         }
     }
 
-    let (side, ask, _new_pc) = best?;
+    let (side, ask, _new_pc, qty) = best?;
 
     let client_order_id = uuid::Uuid::new_v4();
     m.orders.insert_pending(OrderRec {
         ticker: ticker.to_string(),
         side,
         price_cents: ask,
-        qty: 1,
+        qty: qty,
         tif: Tif::Ioc,
         post_only: false,
         order_id: None,
@@ -778,7 +855,7 @@ fn maybe_opportunistic_taker(
         ticker: ticker.to_string(),
         side,
         price_cents: ask,
-        qty: 1,
+        qty: qty,
         tif: Tif::Ioc,
         post_only: false,
         client_order_id,
@@ -896,6 +973,7 @@ fn maybe_maker_quote(
     m: &mut Market,
     now: Instant,
     t_rem: i64,
+    window_s: i64,
     desired_side: Side,
 ) -> Option<ExecCommand> {
     // let desired_side = choose_working_side(cfg, m, t_rem, score);
@@ -920,9 +998,9 @@ fn maybe_maker_quote(
         }
     }
 
-    let cap_target = cfg.target_pair_cc.max(TARGET_PAIR_CC);
+    let cap_target = cfg.target_pair_cc;
     let cap_safe = cfg.safe_pair_cc.max(SAFE_PAIR_CC);
-    let cap_balance = cfg.balance_pair_cc.max(DOLLAR_CC);
+    let cap_balance = cfg.balance_pair_cc.clamp(0,DOLLAR_CC);
 
     let top = top_maker_price(cfg, m, desired_side)?;
     let min_price = top.saturating_sub(cfg.maker_max_edge_cents);
@@ -963,21 +1041,69 @@ fn maybe_maker_quote(
     }
 
     // --------------NORMAL (PAIRED) MAKER QUOTE--------
+    // 1) Decide desired qty first (so price selection is qty-aware)
+    let mut qty: u64 = desired_buy_qty(cfg, m, desired_side, t_rem, window_s);
+    if qty == 0 { qty = 1; } // defensive
+
     let old_pc = m.pos.pair_cost_cc().unwrap_or(cap_safe);
 
-    let p = if m.mode == Mode::Balance {
-        // In Balance mode, prioritize hedging: allow up to balance cap.
-        best_price_under_pair_cap(m, desired_side, top, min_price, cap_balance, false)?
-    } else if old_pc <= cap_target {
-        // Already under target: don't worsen, keep under target
-        best_price_under_pair_cap(m, desired_side, top, min_price, cap_target, true)?
+    // Balance-mode ratchet:
+    // - if we're already under target, NEVER allow maker fills to push us above target
+    // - otherwise, use the looser balance cap
+    let cap_when_balancing = if old_pc <= cap_target {
+        cap_target
     } else {
-        // Above target: allow any improvement (new_pc <= old_pc), even if still above target/safe
-        best_price_under_pair_cap(m, desired_side, top, min_price, old_pc, true)?
+        cap_balance
     };
 
+    // 2) Choose which cap rules apply
+    let (cap_cc, require_noworse) = if m.mode == Mode::Balance {
+        (cap_when_balancing, false)
+    } else if old_pc <= cap_target {
+        (cap_target, true)
+    } else {
+        (old_pc, true)
+    };
+
+        // 3) Find a price using qty-aware simulation.
+    // If qty is too large to fit caps, fall back by shrinking qty.
+    let mut p_opt = best_price_under_pair_cap_qty(
+        m,
+        desired_side,
+        top,
+        min_price,
+        cap_cc,
+        require_noworse,
+        qty as i64,
+    );
+
+    while p_opt.is_none() && qty > 1 {
+    qty = (qty / 2).max(1);
+    p_opt = best_price_under_pair_cap_qty(
+        m,
+        desired_side,
+        top,
+        min_price,
+        cap_cc,
+        require_noworse,
+        qty as i64,
+    );
+    }
+
+    let p = p_opt?;
+    // 4) If we already have a resting order on this side, manage it.
     if let Some(existing) = m.resting_hint(desired_side).as_ref().cloned() {
-        if existing.price_cents == p {
+        // Look up existing order qty from Orders (no need to store qty in RestingHint)
+        let existing_remaining = m.orders.by_client
+            .get(&existing.client_order_id)
+            .map(|r| r.qty.saturating_sub(r.filled_qty))
+            .unwrap_or(1);
+
+        // Only force a resize if we want MORE (avoids churn when gap shrinks)
+        let want_upsize = qty > existing_remaining;
+
+        // If price is identical and we don't need to upsize, leave it alone.
+        if existing.price_cents == p && !want_upsize {
             return None;
         }
 
@@ -994,7 +1120,9 @@ fn maybe_maker_quote(
         }
 
         let drift = existing.price_cents.abs_diff(p);
-        if drift >= cfg.cancel_drift_cents {
+        let should_cancel = drift >= cfg.cancel_drift_cents || want_upsize;
+
+        if should_cancel {
             let Some(order_id) = existing.order_id.clone() else { return None; };
 
             if let Some(hm) = m.resting_hint_mut(desired_side).as_mut() {
@@ -1010,13 +1138,14 @@ fn maybe_maker_quote(
         return None;
     }
 
+    // 5) Place new resting order with qty
     let client_order_id = uuid::Uuid::new_v4();
 
     m.orders.insert_pending(OrderRec {
         ticker: ticker.to_string(),
         side: desired_side,
         price_cents: p,
-        qty: 1,
+        qty,
         tif: Tif::Gtc,
         post_only: true,
         order_id: None,
@@ -1028,8 +1157,9 @@ fn maybe_maker_quote(
 
     let queue_ahead = match desired_side {
         Side::Yes => m.book.yes_bids[p as usize],
-        Side::No => m.book.no_bids[p as usize],
+        Side::No  => m.book.no_bids[p as usize],
     };
+
     *m.resting_hint_mut(desired_side) = Some(RestingHint {
         side: desired_side,
         price_cents: p,
@@ -1037,7 +1167,7 @@ fn maybe_maker_quote(
         cancel_requested_at: None,
         client_order_id,
         order_id: None,
-        // PAPER TRADING
+        // Paper trading
         queue_ahead,
     });
 
@@ -1045,7 +1175,7 @@ fn maybe_maker_quote(
         ticker: ticker.to_string(),
         side: desired_side,
         price_cents: p,
-        qty: 1,
+        qty,
         tif: Tif::Gtc,
         post_only: true,
         client_order_id,
@@ -1340,7 +1470,7 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     }
 
     // 1) Opportunistic taker (cost-driven): if ask is cheap enough to improve/keep caps.
-    if let Some(cmd) = maybe_opportunistic_taker(cfg, ticker, m, now, t_rem, desired_side) {
+    if let Some(cmd) = maybe_opportunistic_taker(cfg, ticker, m, now, t_rem, window_s, desired_side) {
         return Some(cmd);
     }
 
@@ -1350,5 +1480,5 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     // }
 
     // 3) Maker quoting (resting) with churn control.
-    maybe_maker_quote(cfg, ticker, m, now, t_rem, desired_side)
+    maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, desired_side)
 }
