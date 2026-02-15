@@ -144,8 +144,8 @@ impl Default for Config {
             min_conf_for_momentum: 0.5,
 
             window_s: 900,
-            accumulate_s: 300,
-            balance_s: 300,
+            accumulate_s: 150,
+            balance_s: 500,
 
             series_tickers: vec!["KXBTC15M".to_string()],
             market_refresh_ms: 5000,
@@ -168,17 +168,17 @@ impl Default for Config {
             bootstrap_max_one_side_qty: 5,
             bootstrap_rescue_min_improve_cc: 500,
 
-            early_imbalance_cap: 0.90,
-            late_imbalance_cap: 0.10,
+            early_imbalance_cap: 0.20,
+            late_imbalance_cap: 0.05,
 
             max_order_qty: 25,
             catchup_aggressiveness: 0.35,
             catchup_balance_boost: 1.0,
 
-            cancel_stale_ms: 5000,
-            min_resting_life_ms: 250,
+            cancel_stale_ms: 15000,
+            min_resting_life_ms: 1000,
             cancel_retry_ms: 800,
-            cancel_drift_cents: 1,
+            cancel_drift_cents: 3,
             maker_max_edge_cents: 8,
 
             taker_cooldown_ms: 500,

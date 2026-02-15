@@ -1087,8 +1087,19 @@ fn maybe_maker_quote(
     };
 
     // 2) Choose which cap rules apply
+    // let (cap_cc, require_noworse) = if m.mode == Mode::Balance {
+    //     (cap_when_balancing, false)
+    // } else if old_pc <= cap_target {
+    //     (cap_target, true)
+    // } else {
+    //     (old_pc, true)
+    // };
+    let unbalanced = !m.pos.is_balanced();
     let (cap_cc, require_noworse) = if m.mode == Mode::Balance {
         (cap_when_balancing, false)
+    } else if unbalanced {
+        // allow hedging even if it worsens pair-cost, but keep it <= target
+        (cap_target, false)
     } else if old_pc <= cap_target {
         (cap_target, true)
     } else {
