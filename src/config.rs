@@ -44,6 +44,7 @@ pub struct Config {
     // Maker/taker price constraints.
     pub aggressive_tick: u8,     // used for “slightly more aggressive” logic
     pub maker_improve_tick: u8,  // how much we improve best bid when quoting (often 0 or 1)
+    pub maker_improve_tick_balance: u8, // in balance mode, basically forces maker to ask-1
     pub max_buy_price_cents: u8, // never pay above this
 
     // Pair cost goal (in cent-cents, see CC_PER_CENT in types.rs)
@@ -82,6 +83,10 @@ pub struct Config {
     // Opportunistic taker behavior
     pub taker_cooldown_ms: u64, // don’t fire takers on same side more often than this
     pub min_taker_improve_cc: i64, // require at least this much pair-cost improvement (cent-cents) for opportunistic taker (unless balancing)
+
+    pub maker_first_ms: u64,      // wait this long for a resting maker to work
+    pub taker_desperate_s: i64,   // only force IOC in last N seconds of Balance
+    pub taker_big_improve_cc: i64, // allow IOC early only for huge improvements
 
     // Feature smoothing / signal model
     //
@@ -150,7 +155,8 @@ impl Default for Config {
             momentum_score_threshold: 0.12,
 
             aggressive_tick: 1,
-            maker_improve_tick: 0,
+            maker_improve_tick: 1,
+            maker_improve_tick_balance: 99,
             max_buy_price_cents: 98,
 
             safe_pair_cc: 9850,
@@ -175,8 +181,12 @@ impl Default for Config {
             cancel_drift_cents: 1,
             maker_max_edge_cents: 8,
 
-            taker_cooldown_ms: 400,
-            min_taker_improve_cc: 5, // 0.05 cents improvement in pair-cost
+            taker_cooldown_ms: 500,
+            min_taker_improve_cc: 20, // 0.2 cents improvement in pair-cost
+
+            maker_first_ms: 1500,      // 1.5s
+            taker_desperate_s: 30,     // last 30s
+            taker_big_improve_cc: 100, // 1.00 cent improvement in pair-cost
 
             tau_book_ms: 300,
             tau_trade_ms: 3000,

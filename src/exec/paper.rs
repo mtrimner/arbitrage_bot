@@ -29,33 +29,58 @@ pub fn paper_on_trade_fill(ticker: &str, m: &mut Market, taker_side: Side, yes_p
         Side::No  => no_price,
     };
 
-    let Some(h) = m.resting_hint_mut(maker_side).as_mut() else { return; };
-    if h.order_id.is_none() { return; }            // not acked yet
-    if h.price_cents != maker_price { return; }    // only fill when market trades at our level
+    let (client_id, posted_price, remaining_after_queue_u64) = {
+        let Some(h) = m.resting_hint_mut(maker_side).as_mut() else { return; };
+        if h.order_id.is_none() { return; }            // not acked yet
 
-    // Consume queue ahead first
-    let mut remaining = fillable as i64;
+                // --------- IMPORTANT CHANGE ----------
+        // If the market traded at/through our posted maker price, we should be fill-eligible.
+        //
+        // For a resting BUY at h.price_cents:
+        // - maker_price > h.price_cents  => trade happened above our bid; cannot have hit us
+        // - maker_price == h.price_cents => traded exactly at our level
+        // - maker_price < h.price_cents  => traded through our level (gap/skip); assume we were crossed
+        if maker_price > h.price_cents {
+            return;
+        }
 
-    if h.queue_ahead > 0 {
-        let consume = h.queue_ahead.min(remaining);
-        h.queue_ahead -= consume;
-        remaining -= consume;
-    }
+        // If the tape traded below our price, assume our level was swept through;
+        // don't let stale "queue_ahead at our exact price" prevent fills.
+        if maker_price < h.price_cents {
+            h.queue_ahead = 0;
+        }
+        // ------------------------------------
 
-    if remaining <= 0 { return; }
+        // Consume queue ahead first
+        let mut remaining = fillable as i64;
 
-    // Now we are eligible to be filled (shadow)
-    let client_id = h.client_order_id;
-    let Some(rec) = m.orders.by_client.get(&client_id) else { return; };
-    let order_remaining = rec.qty.saturating_sub(rec.filled_qty);
+        if h.queue_ahead > 0 {
+            let consume = h.queue_ahead.min(remaining);
+            h.queue_ahead -= consume;
+            remaining -= consume;
+        }
+
+        if remaining <= 0 { return; }
+
+        (h.client_order_id, h.price_cents, remaining as u64)
+    };
+        let order_remaining = match m.orders.by_client.get(&client_id) {
+        Some(rec) => rec.qty.saturating_sub(rec.filled_qty),
+        None => return,
+    };
+    
     if order_remaining == 0 { return; }
 
-    let fill_qty = order_remaining.min(remaining as u64);
+    let fill_qty = order_remaining.min(remaining_after_queue_u64);
     if fill_qty == 0 { return; }
 
-    info!(?maker_side, maker_price, fill_qty, "PAPER maker filled");
-    m.pos.apply_fill(maker_side, maker_price, fill_qty as i64);
-     crate::report::log_position(ticker, &m.pos);
+    // Option A: fill at OUR posted maker price (conservative)
+    let fill_price = posted_price;
+
+    info!(?maker_side, maker_price, fill_price, fill_qty, "PAPER maker filled");
+    m.pos.apply_fill(maker_side, fill_price, fill_qty as i64);
+    crate::report::log_position(ticker, &m.pos);
+
     let fully = m.orders.on_fill_by_client(client_id, fill_qty);
 
     if matches!(fully, Some(true)) {

@@ -343,7 +343,13 @@ fn set_last_taker(m: &mut Market, side: Side, t: Instant) {
 /// - bounded by post-only constraint (must be strictly below implied ask)
 fn top_maker_price(cfg: &Config, m: &Market, side: Side) -> Option<u8> {
     let best = m.book.best_bid(side)?;
-    let mut p = best.saturating_add(cfg.maker_improve_tick).min(cfg.max_buy_price_cents);
+    let improve = if m.mode == Mode::Balance {
+        cfg.maker_improve_tick_balance
+    } else {
+        cfg.maker_improve_tick
+    };
+
+    let mut p = best.saturating_add(improve).min(cfg.max_buy_price_cents);
 
     // Post-only: must not cross the implied ask.
     if let Some(ask) = m.book.implied_ask(side) {
@@ -743,6 +749,7 @@ fn maybe_opportunistic_taker(
     let imbalance_cap = allowed_imbalance(cfg, t_rem);
     let must_balance = m.mode == Mode::Balance || m.pos.imbalance_ratio() > imbalance_cap;
     let hedge = hedge_side(m);
+    let desperate = must_balance && t_rem <= cfg.taker_desperate_s;
 
     let cap_target = cfg.target_pair_cc;
     let cap_balance = cfg.balance_pair_cc.clamp(0,DOLLAR_CC);
@@ -758,6 +765,16 @@ fn maybe_opportunistic_taker(
     let mut best: Option<(Side, u8, i64, u64)> = None;
 
     for side in [Side::Yes, Side::No] {
+        // If we already have a maker resting on this side, give it time before paying taker fees.
+        if !desperate {
+            if let Some(h) = m.resting_hint(side).as_ref() {
+                let age_ms = now.duration_since(h.created_at).as_millis() as u64;
+                if age_ms < cfg.maker_first_ms {
+                    continue;
+                }
+            }
+        }
+
         if must_balance && side != hedge {
             continue; // in balance mode only buy the hedge side
         }
@@ -792,11 +809,19 @@ fn maybe_opportunistic_taker(
         };
 
         // If we MUST balance, allow up to balance cap even if it doesn't "improve"
-        if must_balance && new_pc <= cap_when_balancing {
-            match best {
-                None => best = Some((side, ask, new_pc, qty)),
-                Some((_, _, bp, _)) if new_pc < bp => best = Some((side, ask, new_pc, qty)),
-                _ => {}
+        if must_balance {
+            // Balance mode: prefer maker until the final 'desperate' window.
+            if !desperate {
+                continue;
+            }
+
+            if new_pc <= cap_when_balancing {
+                // keep your "pick best" logic
+                match best {
+                    None => best = Some((side, ask, new_pc, qty)),
+                    Some((_, _, bp, _)) if new_pc < bp => best = Some((side, ask, new_pc, qty)),
+                    _ => {}
+                }
             }
             continue;
         }
@@ -809,26 +834,31 @@ fn maybe_opportunistic_taker(
         let bid = m.book.best_bid(side).unwrap_or(0);
         let tight = ask <= bid.saturating_add(cfg.aggressive_tick);
 
-        // If spread isn't tight, only cross if taker is at least as good as maker on pair-cost.
-        let taker_beats_maker = new_pc <= maker_pc;
-
-        // Target hit is great, but still don't cross wide if maker is better.
-        if new_pc <= cap_target && (tight || taker_beats_maker) {
-            match best {
-                None => best = Some((side, ask, new_pc, qty)),
-                Some((_, _, bp, _)) if new_pc < bp => best = Some((side, ask, new_pc, qty)),
-                _ => {}
-            }
-            continue;
+        let improve = old_pc - new_pc; // positive = better
+        if improve <= 0 {
+            continue; // never pay taker fee to be worse or equal
         }
 
-        let improve = old_pc - new_pc;
-        if improve >= cfg.min_taker_improve_cc && (tight || taker_beats_maker) {
-            match best {
-                None => best = Some((side, ask, new_pc, qty)),
-                Some((_, _, bp, _)) if new_pc < bp => best = Some((side, ask, new_pc, qty)),
-                _ => {}
+        // Tight-spread crossings: only when it's a BIG improvement (worth fee)
+        if tight {
+            if improve < cfg.taker_big_improve_cc {
+                continue;
             }
+        } else {
+            // Wide spread: require meaningful improvement AND taker must be at least as good as maker
+            if improve < cfg.min_taker_improve_cc {
+                continue;
+            }
+            if new_pc > maker_pc {
+                continue; // maker is better, so don't pay taker fee
+            }
+        }
+
+        // If we get here, taker is allowed
+        match best {
+            None => best = Some((side, ask, new_pc, qty)),
+            Some((_, _, bp, _)) if new_pc < bp => best = Some((side, ask, new_pc, qty)),
+            _ => {}
         }
     }
 
