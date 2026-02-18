@@ -19,10 +19,6 @@ pub struct Config {
     // Even if your WS updates are fast, 20–50ms is usually plenty.
     pub tick_ms: u64,
 
-    pub side_exit_mult: f64, // e.g. 0.6 (exit < side)
-    pub min_conf_for_flow: f64,
-    pub min_conf_for_momentum: f64,
-
     // Which series you want to trade simultaneously.
     // One active market per series at a time.
     pub series_tickers: Vec<String>,
@@ -34,12 +30,6 @@ pub struct Config {
     pub window_s: i64,
     pub accumulate_s: i64, // “early” phase length
     pub balance_s: i64,    // “late” phase length (force balancing)
-
-    // Momentum usage: how many “extra” buys you allow in direction of flow
-    // when you are otherwise balanced.
-    pub momentum_base_extra: i64,
-    pub momentum_min_extra: i64,
-    pub momentum_score_threshold: f64,
 
     // Maker/taker price constraints.
     pub aggressive_tick: u8,     // used for “slightly more aggressive” logic
@@ -87,48 +77,6 @@ pub struct Config {
     pub maker_first_ms: u64,      // wait this long for a resting maker to work
     pub taker_desperate_s: i64,   // only force IOC in last N seconds of Balance
     pub taker_big_improve_cc: i64, // allow IOC early only for huge improvements
-
-    // Feature smoothing / signal model
-    //
-    // We use EMA smoothing: value(t) = value(t-Δt) + α(Δt)*(x - value(t-Δt))
-    // where α(Δt) = 1 - exp(-Δt / τ)
-    //
-    // τ (tau) is the “time constant”: bigger τ => smoother / slower response.
-    pub tau_book_ms: u64,
-    pub tau_trade_ms: u64,
-    pub tau_delta_ms: u64,
-    pub tau_score_ms: u64,
-
-    // How we down-weight trade/delta features when activity is low:
-    // count events in last rate_window_ms; full weight after *full_weight_count* events.
-    pub rate_window_ms: u64,
-    pub trade_full_weight_count: usize,
-    pub delta_full_weight_count: usize,
-
-    // How much absolute delta (sum of |delta| in the rate window)
-    // should correspond to "full confidence" for delta weighting.
-    pub delta_full_weight_abs: u32,
-    // Trade magnitude in the rate window that corresponds to "full confidence"
-    // for trade weighting (sum of trade counts in the window).
-    pub trade_full_weight_abs: u32,
-
-    // Confidence should not be high when the signal itself is tiny.
-    // When |score_ema| >= this, strength factor ~= 1.0.
-    pub score_full_conf_abs: f64,
-
-    // Optional: normalize trade/delta magnitude by current top-of-book depth.
-    // This makes the same activity "mean more" in thin books.
-    pub enable_depth_norm: bool,
-    pub depth_norm_levels: usize,     // how many top bid levels per side
-    pub depth_full_weight_qty: f64,   // reference depth; smaller depth => boost
-    pub depth_norm_min_mult: f64,     // clamp boost
-    pub depth_norm_max_mult: f64,
-
-    // Base weights for combining features into one “pressure score”
-    // (positive => YES pressure; negative => NO pressure)
-    pub w_book: f64,
-    pub w_trade: f64,
-    pub w_delta: f64,
 }
 
 impl Default for Config {
@@ -139,20 +87,12 @@ impl Default for Config {
 
             tick_ms: 25,
 
-            side_exit_mult: 0.6,
-            min_conf_for_flow: 0.35,
-            min_conf_for_momentum: 0.5,
-
             window_s: 900,
             accumulate_s: 150,
             balance_s: 500,
 
             series_tickers: vec!["KXBTC15M".to_string()],
             market_refresh_ms: 5000,
-
-            momentum_base_extra: 3,
-            momentum_min_extra: 0,
-            momentum_score_threshold: 0.12,
 
             aggressive_tick: 1,
             maker_improve_tick: 1,
@@ -187,28 +127,6 @@ impl Default for Config {
             maker_first_ms: 1500,      // 1.5s
             taker_desperate_s: 30,     // last 30s
             taker_big_improve_cc: 100, // 1.00 cent improvement in pair-cost
-
-            tau_book_ms: 300,
-            tau_trade_ms: 3000,
-            tau_delta_ms: 350,
-            tau_score_ms: 400,
-
-            rate_window_ms: 10_000,
-            trade_full_weight_count: 10,
-            delta_full_weight_count: 200, // deltas tend to be more frequent than trades
-            delta_full_weight_abs: 6000,
-            trade_full_weight_abs: 120,
-            score_full_conf_abs: 0.35,
-
-            enable_depth_norm: true,
-            depth_norm_levels: 3,
-            depth_full_weight_qty: 100.0,
-            depth_norm_min_mult: 0.7,
-            depth_norm_max_mult: 1.6,
-
-            w_book: 0.35,
-            w_trade: 0.45,
-            w_delta: 0.20,
         }
     }
 }

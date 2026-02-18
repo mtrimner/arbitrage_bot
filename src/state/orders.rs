@@ -112,7 +112,4 @@ impl Orders {
         }
     }
 
-    pub fn client_for_order(&self, order_id: &str) -> Option<uuid::Uuid> {
-        self.by_order.get(order_id).copied()
-    }
 }

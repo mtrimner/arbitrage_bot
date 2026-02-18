@@ -2,11 +2,6 @@ use std::time::Instant;
 
 pub const CC_PER_CENT: i64 = 100;
 
-// Pair-cost caps in “cent-cents”.
-// Example: 98.25 cents => 9825 (because 98.25 * 100).
-pub const SAFE_PAIR_CC: i64 = 9850;
-pub const TARGET_PAIR_CC: i64 = 9825;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Yes,
@@ -29,14 +24,14 @@ impl Side {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct TradeLite {
-    pub ts: i64,
-    pub taker_side: Side,
-    pub count: i64,
-    pub yes_price: u8,
-    pub no_price: u8,
-}
+// #[derive(Debug, Clone)]
+// pub struct TradeLite {
+//     pub ts: i64,
+//     pub taker_side: Side,
+//     pub count: i64,
+//     pub yes_price: u8,
+//     pub no_price: u8,
+// }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tif {

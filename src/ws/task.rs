@@ -5,7 +5,6 @@ use uuid::Uuid;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
 
 use tokio::sync::mpsc;
 
@@ -16,9 +15,8 @@ use kalshi_rs::websocket::models::{
 };
 
 use crate::config::Config;
-use crate::engine::signal::raw_trade_flow;
 use crate::state::Shared;
-use crate::types::{Side, TradeLite, WsMarketCommand};
+use crate::types::{Side, WsMarketCommand};
 
 fn parse_side(s: &str) -> Option<Side> {
     match s.to_ascii_lowercase().as_str() {
@@ -29,7 +27,7 @@ fn parse_side(s: &str) -> Option<Side> {
 }
 
 pub async fn run_ws(
-    mut ws: KalshiWebsocketClient,
+    ws: KalshiWebsocketClient,
     _http: Arc<KalshiClient>,
     cfg: Config,
     shared: Shared,
@@ -108,7 +106,7 @@ pub async fn run_ws(
                         }
 
                         KalshiSocketMessage::OrderbookSnapshot(snap) => {
-                            handle_snapshot(&cfg, &shared, snap).await?;
+                            handle_snapshot(&shared, snap).await?;
                         }
                         KalshiSocketMessage::OrderbookDelta(delta) => {
                             let ok = handle_delta(&cfg, &shared, delta).await?;
@@ -213,7 +211,7 @@ async fn apply_update_subscription(
 
 // --- your existing handlers below (unchanged except signature tweaks if needed) ---
 
-async fn handle_snapshot(cfg: &Config, shared: &Shared, snap: OrderbookSnapshot) -> Result<()> {
+async fn handle_snapshot(shared: &Shared, snap: OrderbookSnapshot) -> Result<()> {
     let seq = snap.seq;
     let m = snap.msg;
     let ticker = m.market_ticker.clone();
@@ -225,22 +223,6 @@ async fn handle_snapshot(cfg: &Config, shared: &Shared, snap: OrderbookSnapshot)
     };
     let mut g = ts.mkt.write().await;
     g.book.reset(seq, &yes, &no);
-
-    // === EMA update: book imbalance ===
-    let now  = Instant::now();
-    let raw_imb = crate::engine::signal::raw_book_imbalance(cfg, &g.book);
-    g.flow.on_book_imbalance(cfg, raw_imb, now);
-
-    // tracing::debug!(
-    //     ticker = %ticker,
-    //     seq = seq,
-    //     best_yes = ?g.book.best_bid(Side::Yes),
-    //     best_no  = ?g.book.best_bid(Side::No),
-    //     raw_imb = raw_imb,
-    //     book_imb_ema = g.flow.book_imb_ema.value,
-    //     "snapshot -> book_imb EMA updated"
-    // );
-    g.flow.input_rev = g.flow.input_rev.wrapping_add(1);
 
     ts.mark_dirty();
     shared.notify.notify_one();
@@ -257,47 +239,9 @@ async fn handle_delta(cfg: &Config, shared: &Shared, delta: OrderbookDelta) -> R
     let mut g = ts.mkt.write().await;
     let ok = g.book.apply_delta(seq, side, m.price, m.delta);
     if ok {
-        let now = Instant::now();
-
-        // === EMA update: delta flow ===
-        let (raw_df, abs_w) = crate::engine::signal::raw_delta_flow(side, m.price, m.delta, &g.book);
-
-        // Pressure sign matches raw_delta_flow:
-        // YES add => +, YES remove => -, NO add => -, NO remove => +
-        let side_sign: i64 = match side {
-            Side::Yes => 1,
-            Side::No => -1,
-        };
-        let dir_sign: i64 = if m.delta > 0 {1} else {-1};
-
-        let signed_w = side_sign * dir_sign * (abs_w as i64);
-
-        g.flow.on_delta_flow(cfg, raw_df, abs_w, signed_w, now);
-
-        // === EMA update: book imbalance (because the book changed) ===
-        let raw_imb = crate::engine::signal::raw_book_imbalance(cfg, &g.book);
-        g.flow.on_book_imbalance(cfg, raw_imb, now);
-        g.flow.input_rev = g.flow.input_rev.wrapping_add(1);
-
         if cfg.exec_mode.is_paper() {
             crate::exec::paper::paper_on_delta_queue(&mut g, side, m.price, m.delta);
         }
-
-        // tracing::debug!(
-        //     ticker = %ticker,
-        //     seq = seq,
-        //     side = ?side,
-        //     price = m.price,
-        //     delta = m.delta,
-        //     best_yes = ?g.book.best_bid(Side::Yes),
-        //     best_no  = ?g.book.best_bid(Side::No),
-        //     raw_df = raw_df,
-        //     delta_ema = g.flow.delta_flow_ema.value,
-        //     raw_imb = raw_imb,
-        //     book_imb_ema = g.flow.book_imb_ema.value,
-        //     "delta -> delta_flow + book_imb EMAs updated"
-        // );
-
     }
     ts.mark_dirty();
     shared.notify.notify_one();
@@ -311,42 +255,10 @@ async fn handle_trade(cfg: &Config, shared: &Shared, tu: TradeUpdate) -> Result<
 
     let ts = shared.ensure_ticker(&ticker);
     let mut g = ts.mkt.write().await;
-    g.push_trade(TradeLite {
-        ts: m.ts,
-        taker_side,
-        count: m.count,
-        yes_price: m.yes_price,
-        no_price: m.no_price,
-    });
-
-    // === EMA update: trade flow ===
-    let now = Instant::now();
-    let raw_tf = crate::engine::signal::raw_trade_flow(taker_side, m.count);
-    
-    // YES taker => +qty, NO taker => -qty
-    let signed_qty = match taker_side {
-        Side::Yes => m.count,
-        Side::No => -m.count,
-    };
-
-    g.flow.on_trade_flow(cfg, raw_tf, signed_qty, now);
-    g.flow.input_rev = g.flow.input_rev.wrapping_add(1);
 
     if cfg.exec_mode.is_paper() {
         crate::exec::paper::paper_on_trade_fill(&ticker, &mut g, taker_side, m.yes_price, m.no_price, m.count);
     }
-
-    // tracing::debug!(
-    //     ticker = %ticker,
-    //     taker_side = ?taker_side,
-    //     count = m.count,
-    //     yes_px = m.yes_price,
-    //     no_px  = m.no_price,
-    //     raw_tf = raw_tf,
-    //     trade_ema = g.flow.trade_flow_ema.value,
-    //     "trade -> trade_flow EMA updated"
-    // );
-
 
     ts.mark_dirty();
     shared.notify.notify_one();

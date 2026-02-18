@@ -7,7 +7,7 @@ mod exec;
 mod market_manager;
 mod report;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
@@ -20,7 +20,6 @@ use config::{Config, ExecMode};
 
 use kalshi_rs::{KalshiClient, KalshiWebsocketClient};
 use kalshi_rs::auth::Account;
-use kalshi_rs::markets::models::MarketsQuery;
 
 
 #[tokio::main]
@@ -48,11 +47,11 @@ async fn main() -> Result<()> {
 
     // Bootstrap: one active market per series
     let active = market_manager::bootstrap_active_markets(&http, &cfg.series_tickers).await?;
-    // println!("Active Tickers: {:#?}", active);
+
     // Create Shared with all current active tickers (so engine/ws start correct)
     let tickers: Vec<String> = active.iter().map(|m| m.market_ticker.clone()).collect();
     let shared = Shared::new(tickers.clone());
-    // println!("Tickers: {:#?}", tickers);
+
     // Seed close_ts/open_ts into Market state for each ticker
     market_manager::seed_shared_times(&shared, &active).await?;
 
@@ -105,7 +104,6 @@ async fn main() -> Result<()> {
 
     // Engine runs on the main task
     engine::task::run_engine(cfg, shared, exec_tx).await?;
-    // ws::task::run_ws(ws_client, http, cfg, shared, tickers, ws_ctl_rx).await?;
 
     Ok(())
 }

@@ -1,7 +1,6 @@
-use crate::state::{book::Book, flow::FlowState, orders::Orders, position::Position};
-use crate::types::{RestingHint, TradeLite, Side};
+use crate::state::{book::Book, orders::Orders, position::Position};
+use crate::types::RestingHint;
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::sync::RwLock;
 
@@ -19,10 +18,6 @@ pub struct Market {
     pub close_ts: Option<i64>,
 
     pub book: Book,
-    pub flow: FlowState,
-
-    // Keep a small recent trade buffer for debugging (signals use EMAs).
-    pub trades: VecDeque<TradeLite>,
 
     pub pos: Position,
     pub orders: Orders,
@@ -34,11 +29,7 @@ pub struct Market {
     pub last_taker_yes: Option<std::time::Instant>,
     pub last_taker_no: Option<std::time::Instant>,
 
-    pub window_id: i64,
-    pub momentum_used_extra: i64,
     pub mode: Mode,
-
-    pub last_desired_side: Option<Side>,
 }
 
 impl Market {
@@ -47,26 +38,14 @@ impl Market {
             open_ts: None,
             close_ts: None,
             book: Book::default(),
-            flow: FlowState::default(),
-            trades: VecDeque::with_capacity(256),
             pos: Position::default(),
             orders: Orders::default(),
             resting_yes: None,
             resting_no: None,
             last_taker_yes: None,
             last_taker_no: None,
-            window_id: -1,
-            momentum_used_extra: 0,
             mode: Mode::Accumulate,
-            last_desired_side: None,
         }
-    }
-
-    pub fn push_trade(&mut self, t: TradeLite) {
-        if self.trades.len() >= 256 {
-            self.trades.pop_front();
-        }
-        self.trades.push_back(t);
     }
 
     pub fn resting_hint_mut(&mut self, side: crate::types::Side) -> &mut Option<RestingHint> {

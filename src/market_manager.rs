@@ -20,7 +20,7 @@ use kalshi_rs::markets::models::MarketsQuery;
 
 use crate::config::Config;
 use crate::state::Shared;
-use crate::types::{ExecCommand, Side, WsMarketCommand};
+use crate::types::{ExecCommand, WsMarketCommand};
 
 
 #[derive(Debug, Clone)]

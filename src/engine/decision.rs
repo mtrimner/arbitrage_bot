@@ -3,45 +3,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 use crate::config::Config;
-use crate::engine::signal;
 use crate::state::orders::{OrderRec, OrderStatus};
 use crate::state::ticker::{Market, Mode};
-use crate::types::{ExecCommand, RestingHint, Side, Tif, CC_PER_CENT, SAFE_PAIR_CC, TARGET_PAIR_CC};
+use crate::types::{ExecCommand, RestingHint, Side, Tif, CC_PER_CENT};
 
 const DOLLAR_CC: i64 = 100 * CC_PER_CENT; // 10000
-// ------------------- DEBUG STUFF -----------------
-fn clamp01(x: f64) -> f64 { x.clamp(0.0, 1.0) }
-
-fn sign01(x: f64) -> f64 {
-    if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
-}
-
-fn need_hedge(cfg: &Config, m: &Market, t_rem: i64) -> bool {
-    let cap = allowed_imbalance(cfg, t_rem);
-    !m.pos.is_balanced() && (m.mode == Mode::Balance || m.pos.imbalance_ratio() > cap)
-}
-
-// Don’t add to a side if the OTHER side is still zero.
-// Example: YES>0 and NO==0 => block more YES; only buy NO until you have at least 1.
-fn one_sided_block(m: &Market, side: Side) -> bool {
-    match side {
-        Side::Yes => m.pos.yes_qty > 0 && m.pos.no_qty == 0,
-        Side::No  => m.pos.no_qty  > 0 && m.pos.yes_qty == 0,
-    }
-}
-
-/// Top N (price, qty) bid levels for logging.
-fn top_levels(arr: &[i64; 101], n: usize) -> Vec<(u8, i64)> {
-    let mut out = Vec::with_capacity(n);
-    for p in (0..=100).rev() {
-        let q = arr[p];
-        if q > 0 {
-            out.push((p as u8, q));
-            if out.len() >= n { break; }
-        }
-    }
-    out
-}
 
 fn desired_buy_qty(cfg: &Config, m: &Market, side: Side, t_rem: i64, window_s: i64) -> u64 {
     let yes = m.pos.yes_qty.max(0) as i64;
@@ -88,25 +54,6 @@ fn best_maker_pc_for_side(cfg: &Config, m: &Market, side: Side, cap_cc: i64) -> 
     let pc = sim.pair_cost_cc()?;
     Some((p, pc))
 }
-
-/// Matches the private helper in signal.rs (for logging depth_norm numbers).
-fn weighted_top_n_qty(arr: &[i64; 101], n: usize) -> f64 {
-    let mut acc = 0.0;
-    let mut found = 0usize;
-
-    for p in (0..=100).rev() {
-        let q = arr[p];
-        if q <= 0 { continue; }
-        let w = (1.0 - 0.2 * (found as f64)).max(0.2);
-        acc += (q as f64) * w;
-        found += 1;
-        if found >= n { break; }
-    }
-
-    acc
-}
-
-// ----------------------------------------------------------
 
 fn unix_now_s() -> i64 {
     SystemTime::now()
@@ -171,52 +118,6 @@ fn can_rescue_existing(cfg: &Config, m: &Market, existing: Side) -> Option<(u8, 
     Some((p, improve_cc))
 }
 
-fn choose_bootstrap_side(cfg: &Config, m: &Market, score: f64, conf: f64) -> Side {
-    // Flat: optionally follow flow, otherwise pick cheaper ask (hedge_side does that)
-    if m.pos.yes_qty == 0 && m.pos.no_qty == 0 {
-        let hedge = hedge_side(m);
-        let flow = momentum_side(score);
-        let strength = score.abs() * conf.clamp(0.0, 1.0);
-        if conf >= cfg.min_conf_for_flow && strength >= cfg.momentum_score_threshold {
-            flow
-        } else {
-            hedge
-        }
-    } else {
-        // One-sided: decide whether to work missing or do a rescue buy
-        let existing = if m.pos.yes_qty > 0 {
-            Side::Yes
-        } else {
-            Side::No
-        };
-        let missing = existing.other();
-
-        if m.mode == Mode::Balance {
-            return missing; // force hedge late window
-        }
-
-        let existing_avg_cc = avg_cc_for(m, existing).unwrap_or(0);
-        let max_missing = max_missing_price_cents(cfg, m, existing_avg_cc);
-        let ask_missing = m.book.implied_ask(missing);
-
-        // If we can hedge under our cap at current market, do it.
-        if ask_missing.map(|a| a <= max_missing).unwrap_or(false) {
-            return missing;
-        }
-
-        // otherwise, only rescue-buy if:
-        // - we haven't exceeded max one-sided qty
-        // - and the top maker price meaningfully improves our avg
-        if qty_for(m, existing) < cfg.bootstrap_max_one_side_qty {
-            if can_rescue_existing(cfg, m, existing).is_some() {
-                return existing;
-            }
-        }
-            // Park a bid on missing at/under cap and wait for a swing.
-            missing
-    }
-}
-
 fn choose_bootstrap_side_simple(cfg: &Config, m: &Market) -> Side {
     // Flat: just pick cheaper ask (hedge_side already does that)
     if m.pos.yes_qty == 0 && m.pos.no_qty == 0 {
@@ -249,14 +150,6 @@ fn choose_bootstrap_side_simple(cfg: &Config, m: &Market) -> Side {
 
     // Park bid on missing and wait for a swing
     missing
-}
-
-
-
-/// Fallback “window id” when we don’t have open_ts.
-/// (For BTC15M this usually still matches because starts align to 15m boundaries in UTC.)
-fn window_id(now_s: i64, window_s: i64) -> i64 {
-    now_s / window_s.max(1)
 }
 
 /// Fallback time remaining if we don’t have close_ts/open_ts.
@@ -318,10 +211,6 @@ fn pick_mode(cfg: &Config, t_rem: i64, window_s: i64) -> Mode {
         // println!("Hedge Mode: TRem: {:#?}", t_rem);
         Mode::Hedge
     }
-}
-
-fn momentum_side(score: f64) -> Side {
-    if score >= 0.0 { Side::Yes } else { Side::No }
 }
 
 fn last_taker(m: &Market, side: Side) -> Option<Instant> {
@@ -424,44 +313,6 @@ fn best_price_under_pair_cap(
     None
 }
 
-fn cancel_wrong_side_if_needed(
-    cfg: &Config,
-    ticker: &str,
-    m: &mut Market,
-    now: Instant,
-    t_rem: i64,
-) -> Option<ExecCommand> {
-    if !need_hedge(cfg, m, t_rem) {
-        return None;
-    }
-
-    let wrong = hedge_side(m).other();
-    let Some(h) = m.resting_hint(wrong).as_ref().cloned() else { return None; };
-    let Some(order_id) = h.order_id.clone() else { return None; };
-
-    let age_ms = now.duration_since(h.created_at).as_millis() as u64;
-    if age_ms < cfg.min_resting_life_ms {
-        return None;
-    }
-
-    if let Some(t0) = h.cancel_requested_at {
-        let since = now.duration_since(t0).as_millis() as u64;
-        if since < cfg.cancel_retry_ms {
-            return None;
-        }
-    }
-
-    if let Some(hm) = m.resting_hint_mut(wrong).as_mut() {
-        hm.cancel_requested_at = Some(now);
-    }
-
-    Some(ExecCommand::CancelOrder {
-        ticker: ticker.to_string(),
-        order_id,
-    })
-}
-
-
 /// If we have a resting hint and it’s too old, cancel it.
 /// We do NOT cancel constantly; this is only for “stale” orders.
 fn cancel_stale_if_needed(cfg: &Config, ticker: &str, m: &mut Market, now: Instant) -> Option<ExecCommand> {
@@ -523,7 +374,7 @@ fn choose_working_side_simple(cfg: &Config, m: &Market, t_rem: i64) -> Side {
     // Both sides exist: choose side that yields best (lowest) simulated pair cost
     // from a 1-lot maker fill at our best quote.
     let old_pc = m.pos.pair_cost_cc().unwrap_or(i64::MAX);
-    let cap_target = cfg.target_pair_cc.max(TARGET_PAIR_CC);
+    let cap_target = cfg.target_pair_cc;
 
     // If we're already under target, stay under target and don't worsen.
     // If we're above target, allow any improvement (new_pc <= old_pc).
@@ -575,68 +426,6 @@ fn choose_working_side_simple(cfg: &Config, m: &Market, t_rem: i64) -> Side {
     }
     best.map(|(s, _, _, _)| s).unwrap_or_else(|| hedge_side(m))
 }
-
-fn choose_working_side(cfg: &Config, m: &Market, t_rem: i64, score: f64, conf: f64) -> Side {
-    let imbalance_cap = allowed_imbalance(cfg, t_rem);
-    let imbr = m.pos.imbalance_ratio();
-
-    let hedge = hedge_side(m);
-    let flow  = if score >= 0.0 { Side::Yes } else { Side::No };
-
-    let must_balance = m.mode == Mode::Balance || imbr > imbalance_cap;
-
-    let conf01 = conf.clamp(0.0, 1.0);
-    let strength = score.abs() * conf01;
-    // println!("Choose Side Conf, Strngth {:#?}, {:#?}", conf, strength);
-    let enter = cfg.momentum_score_threshold;
-    // Keep hysteresis sane even if side_exit_mult is misconfigured.
-    let exit  = (enter * cfg.side_exit_mult).min(enter);
-
-    // Gate is about confidence/trust (only for entering / flipping into flow).
-    let gate_ok = conf >= cfg.min_conf_for_flow;
-
-    let prev = m.last_desired_side.unwrap_or(hedge);
-
-    // "Flow state" = we were last choosing the current flow side.
-    // (This matches what your logs show: in_flow_state=false when prev!=flow.)
-    let in_flow_state = prev == flow;
-
-    // Raw threshold hits (informational)
-    let enter_hit   = strength >= enter;
-    let exit_hit    = strength <= exit;
-    let in_deadband = strength > exit && strength < enter;
-
-    // Effective state transitions (actionable)
-    let enter_trigger = !in_flow_state && enter_hit && gate_ok;
-    let exit_trigger  =  in_flow_state && exit_hit;
-
-    let (chosen, reason) = if must_balance {
-        (hedge, "must_balance")
-    } else if enter_trigger {
-        (flow, "enter_flow")
-    } else if exit_trigger {
-        (hedge, "exit_to_hedge")
-    } else if in_flow_state {
-        // Once in flow, stay until exit threshold trips (conf gate does NOT kick you out).
-        if in_deadband {
-            (prev, "deadband_keep_flow")
-        } else {
-            (prev, "stay_flow")
-        }
-    } else {
-        // Not in flow: stay on hedge side. (exit threshold is intentionally ignored here)
-        if enter_hit && !gate_ok {
-            (hedge, "enter_blocked_low_conf_stay_hedge")
-        } else if in_deadband {
-            (hedge, "deadband_stay_hedge")
-        } else {
-            (hedge, "stay_hedge")
-        }
-    };
-
-    chosen
-}
-
 
 fn hedge_side(m: &Market) -> Side {
     if m.pos.yes_qty < m.pos.no_qty {
@@ -892,109 +681,6 @@ fn maybe_opportunistic_taker(
     })
 }
 
-/// Momentum taker:
-/// If score is strong and we’re allowed extra “flow-follow” buys, take at ask,
-/// but do not violate safe_pair_cc.
-#[allow(dead_code)]
-fn maybe_momentum_taker(
-    cfg: &Config,
-    ticker: &str,
-    m: &mut Market,
-    now: Instant,
-    t_rem: i64,
-    window_s: i64,
-    raw_score: f64,
-    score: f64,
-    conf: f64,
-) -> Option<ExecCommand> {
-    if conf < cfg.min_conf_for_momentum {
-        return None;
-    }
-
-    if score.abs() < cfg.momentum_score_threshold {
-        return None;
-    }
-
-    let strength = score.abs() * conf.clamp(0.0, 1.0);
-    if strength < cfg.momentum_score_threshold {
-        return None;
-    }
-
-    if m.mode == Mode::Balance || !m.pos.is_balanced() {
-        return None;
-    }
-
-    // Use actual window_s so taper behaves correctly even if window length differs.
-    let tf = taper_factor(t_rem, window_s);
-    let max_extra = (cfg.momentum_min_extra as f64
-        + (cfg.momentum_base_extra - cfg.momentum_min_extra) as f64 * tf)
-        .round() as i64;
-
-    if m.momentum_used_extra >= max_extra {
-        return None;
-    }
-
-    let eps = 0.15;
-    if raw_score.abs() < eps {
-        return None; 
-    }
-
-    // Make sure signal isn't choppy
-    if raw_score.signum() != score.signum() {
-        return None;
-    }
-    let side = momentum_side(score);
-
-    let Some(ask) = m.book.implied_ask(side) else { return None; };
-    if ask > cfg.max_buy_price_cents {
-        return None;
-    }
-
-    if let Some(last) = last_taker(m, side) {
-        if (now.duration_since(last).as_millis() as u64) < cfg.taker_cooldown_ms {
-            return None;
-        }
-    }
-
-    if let Some(_old_pc) = m.pos.pair_cost_cc() {
-        let sim = m.pos.simulate_buy(side, ask, 1);
-        if let Some(new_pc) = sim.pair_cost_cc() {
-            if new_pc > cfg.safe_pair_cc.max(SAFE_PAIR_CC) {
-                return None;
-            }
-        }
-    }
-
-    m.momentum_used_extra += 1;
-
-    let client_order_id = uuid::Uuid::new_v4();
-    m.orders.insert_pending(OrderRec {
-        ticker: ticker.to_string(),
-        side,
-        price_cents: ask,
-        qty: 1,
-        tif: Tif::Ioc,
-        post_only: false,
-        order_id: None,
-        client_order_id,
-        status: OrderStatus::PendingAck,
-        created_at: now,
-        filled_qty: 0,
-    });
-
-    set_last_taker(m, side, now);
-
-    Some(ExecCommand::PlaceOrder {
-        ticker: ticker.to_string(),
-        side,
-        price_cents: ask,
-        qty: 1,
-        tif: Tif::Ioc,
-        post_only: false,
-        client_order_id,
-    })
-}
-
 /// Maker quote logic:
 /// Maintain at most one resting order, don’t churn, and keep prices within pair-cost constraints.
 fn maybe_maker_quote(
@@ -1029,7 +715,7 @@ fn maybe_maker_quote(
     }
 
     let cap_target = cfg.target_pair_cc;
-    let cap_safe = cfg.safe_pair_cc.max(SAFE_PAIR_CC);
+    let cap_safe = cfg.safe_pair_cc;
     let cap_balance = cfg.balance_pair_cc.clamp(0,DOLLAR_CC);
 
     let top = top_maker_price(cfg, m, desired_side)?;
@@ -1321,189 +1007,15 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     let window_s = effective_window_s(cfg, m);
     let t_rem = effective_time_remaining_s(cfg, m, now_s, window_s);
 
-    // Use a stable per-market "window id":
-    // - best is open_ts (unique per 15m market)
-    // - fallback uses epoch-bucket id
-    let wid = m.open_ts.unwrap_or_else(|| window_id(now_s, window_s));
-
-    let prev_mode = m.mode;
-    let is_new_window = m.window_id != wid;
-
-    // Reset per-window counters.
-    if is_new_window {
-        m.window_id = wid;
-        m.momentum_used_extra = 0;
-        m.last_desired_side = None;
-    }
-
     // Mode uses actual window_s (not cfg.window_s).
     m.mode = pick_mode(cfg, t_rem, window_s);
     // println!("Current Mode: {:#?}", m.mode);
 
-    // ----------------------- DEBUG STUFF ------------------
-        // ----- snapshot useful “price picture” -----
-    let yes_bid = m.book.best_bid(Side::Yes);
-    let yes_ask = m.book.implied_ask(Side::Yes);
-    let no_bid  = m.book.best_bid(Side::No);
-    let no_ask  = m.book.implied_ask(Side::No);
-
-    // quantities at best bids
-    let yes_bid_qty = yes_bid.map(|p| m.book.yes_bids[p as usize]).unwrap_or(0);
-    let no_bid_qty  = no_bid .map(|p| m.book.no_bids [p as usize]).unwrap_or(0);
-
-    // implied asks are on the opposite bid book
-    let yes_ask_qty = no_bid_qty;
-    let no_ask_qty  = yes_bid_qty;
-
-    let yes_mid = match (yes_bid, yes_ask) {
-        (Some(b), Some(a)) => Some((b as f64 + a as f64) / 2.0),
-        _ => None,
-    };
-    let yes_spread = match (yes_bid, yes_ask) {
-        (Some(b), Some(a)) => Some((a as i16) - (b as i16)),
-        _ => None,
-    };
-
-    // Map “YES mid cents” into [-1,+1] just for comparison:
-    // -1 = 0c, 0 = 50c, +1 = 100c
-    let price_score = yes_mid.map(|mid| (mid / 50.0) - 1.0);
-
-    // Raw instantaneous book imbalance (depth-based, not price-based)
-    let book_raw_now = signal::raw_book_imbalance(cfg, &m.book);
-
-    m.flow.decay_event_flows(cfg, now);
-    // ----- compute score/conf (this mutates score_ema internally) -----
-    let score_prev = m.flow.score_ema.value;
-    let (score,raw_score, conf) = signal::combined_score(cfg, m);
-    let last_seq = m.book.last_seq;
-
-    // Values actually used by the scorer
-    let book_ema  = m.flow.book_imb_ema.value;
-    let trade_ema = m.flow.trade_flow_ema.value;
-    let delta_ema = m.flow.delta_flow_ema.value;
-
-    // ----- recompute combined_score internals for logging (close to exact) -----
-    let now2 = Instant::now();
-
-    let (depth_now, depth_mult) = if cfg.enable_depth_norm {
-        let n = cfg.depth_norm_levels.max(1);
-        let y = weighted_top_n_qty(&m.book.yes_bids, n);
-        let nqty = weighted_top_n_qty(&m.book.no_bids, n);
-        let depth = (y + nqty).max(1.0);
-
-        let mult = (cfg.depth_full_weight_qty.max(1.0) / depth)
-            .clamp(cfg.depth_norm_min_mult, cfg.depth_norm_max_mult);
-
-        (depth, mult)
-    } else {
-        (0.0, 1.0)
-    };
-
-    // Trade stats (rate window)
-    let trade_n = m.flow.trade_count_recent(cfg, now2);
-    let trade_abs = m.flow.trade_abs_recent(cfg, now2) as f64;
-    let trade_net = m.flow.trade_net_recent(cfg, now2) as f64;
-
-    let trade_f_n   = clamp01(trade_n as f64 / (cfg.trade_full_weight_count.max(1) as f64));
-    let trade_f_abs = clamp01((trade_abs * depth_mult) / (cfg.trade_full_weight_abs.max(1) as f64));
-    let trade_coh   = clamp01(trade_net.abs() / trade_abs.max(1e-9));
-    let trade_factor = (trade_f_n * trade_f_abs * trade_coh).powf(1.0 / 3.0);
-
-    // Delta stats (rate window)
-    let delta_n   = m.flow.delta_count_recent(cfg, now2) as f64;
-    let delta_abs = m.flow.delta_abs_recent(cfg, now2) as f64;
-    let delta_net = m.flow.delta_net_recent(cfg, now2) as f64;
-
-    let delta_f_n   = clamp01(delta_n / (cfg.delta_full_weight_count.max(1) as f64));
-    let delta_f_abs = clamp01((delta_abs * depth_mult) / (cfg.delta_full_weight_abs.max(1) as f64));
-    let delta_coh   = clamp01(delta_net.abs() / delta_abs.max(1e-9));
-    let delta_factor = (delta_f_n * delta_f_abs * delta_coh).powf(1.0 / 3.0);
-
-    let w_book  = cfg.w_book;
-    let w_trade = cfg.w_trade * trade_factor;
-    let w_delta = cfg.w_delta * delta_factor;
-    let w_sum   = (w_book + w_trade + w_delta).max(1e-9);
-
-    let raw_combined = (w_book * book_ema + w_trade * trade_ema + w_delta * delta_ema) / w_sum;
-
-    // Conf parts (match signal.rs)
-    let activity = clamp01((w_trade + w_delta) / (cfg.w_trade + cfg.w_delta).max(1e-9));
-    let consensus = clamp01(
-        (w_book * sign01(book_ema) + w_trade * sign01(trade_ema) + w_delta * sign01(delta_ema)).abs() / w_sum
-    );
-    let strength = clamp01(score.abs() / cfg.score_full_conf_abs.max(1e-9));
-    let conf_calc = clamp01(activity * (0.5 + 0.5 * consensus) * strength);
-    
-    // if let (Some(no_bid), Some(no_ask), Some(yes_bid), Some(yes_ask)) = (no_bid, no_ask, yes_bid, yes_ask) {
-    // println!("Yes_bid: {}, Yes_ask: {}, No_bid: {}, No_ask: {}", yes_bid, yes_ask, no_bid, no_ask);
-    // }
-
-    // ----- main debug dump (keep it gated so it’s readable) -----
-    // let verbose = is_new_window || prev_mode != m.mode || (conf > 0.1 && score.abs() > 0.1);
-
-    // if verbose {
-    //     debug!(
-    //         ticker = %ticker,
-    //         last_seq = m.book.last_seq,
-    //         open_ts = ?m.open_ts, close_ts = ?m.close_ts,
-    //         wid, is_new_window,
-    //         window_s, t_rem,
-    //         prev_mode = ?prev_mode, mode = ?m.mode,
-    //         "decide: timing"
-    //     );
-
-    //     debug!(
-    //         ticker = %ticker,
-    //         yes_bid = ?yes_bid, yes_ask = ?yes_ask,
-    //         no_bid = ?no_bid,  no_ask  = ?no_ask,
-    //         yes_bid_qty, no_bid_qty, yes_ask_qty, no_ask_qty,
-    //         yes_mid = ?yes_mid, yes_spread = ?yes_spread, price_score = ?price_score,
-    //         "decide: top-of-book"
-    //     );
-
-    //     debug!(
-    //         ticker = %ticker,
-    //         book_raw_now,
-    //         book_ema, trade_ema, delta_ema,
-    //         raw_combined,
-    //         score, conf,
-    //         conf_calc,
-    //         activity, consensus, strength,
-    //         trade_n, trade_abs, trade_net, trade_factor,
-    //         delta_n, delta_abs, delta_net, delta_factor,
-    //         depth_now, depth_mult,
-    //         yes_top = ?top_levels(&m.book.yes_bids, 5),
-    //         no_top  = ?top_levels(&m.book.no_bids, 5),
-    //         "decide: score/conf breakdown"
-    //     );
-    // }
-
-    // ----------------------------------------------------
     let desired_side = if has_pair(m) {
         choose_working_side_simple(cfg, m, t_rem)
     } else {
         choose_bootstrap_side_simple(cfg, m)
     };
-    m.last_desired_side = Some(desired_side);
-
-    let strength = score.abs() * conf.clamp(0.0, 1.0);
-
-    // tracing::debug!(
-    //     ticker = %ticker,
-    //     wid = wid,
-    //     mode = ?m.mode,
-    //     t_rem,
-    //     window_s,
-    //     score,
-    //     conf,
-    //     strength,
-    //     desired_side = ?desired_side,
-    //     imbr = m.pos.imbalance_ratio(),
-    //     yes = m.pos.yes_qty,
-    //     no = m.pos.no_qty,
-    //     "decision signal summary"
-    // );
-
 
     // 0) Cancel stale resting orders (but never churn fast).
     if let Some(cmd) = cancel_stale_if_needed(cfg, ticker, m, now) {
@@ -1515,11 +1027,6 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
         return Some(cmd);
     }
 
-    // 2) Momentum taker (flow-driven): strong score, balanced inventory, within safe cap.
-    // if let Some(cmd) = maybe_momentum_taker(cfg, ticker, m, now, t_rem, window_s, raw_score, score, conf) {
-    //     return Some(cmd);
-    // }
-
-    // 3) Maker quoting (resting) with churn control.
+    // 2) Maker quoting (resting) with churn control.
     maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, desired_side)
 }
