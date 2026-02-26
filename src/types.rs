@@ -1,14 +1,17 @@
 use std::time::Instant;
+use std::{fmt, str::FromStr};
 
 pub const CC_PER_CENT: i64 = 100;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
     Yes,
     No,
 }
 
 impl Side {
+    pub const ALL: [Side; 2] = [Side::Yes, Side::No];
+
     pub fn other(self) -> Side {
         match self {
             Side::Yes => Side::No,
@@ -24,14 +27,23 @@ impl Side {
     }
 }
 
-// #[derive(Debug, Clone)]
-// pub struct TradeLite {
-//     pub ts: i64,
-//     pub taker_side: Side,
-//     pub count: i64,
-//     pub yes_price: u8,
-//     pub no_price: u8,
-// }
+impl FromStr for Side {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "yes" => Ok(Side::Yes),
+            "no" => Ok(Side::No),
+            _ => Err(()),
+        }
+    }
+}
+
+impl fmt::Display for Side {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tif {

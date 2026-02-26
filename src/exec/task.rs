@@ -87,8 +87,7 @@ pub async fn run_exec(
 
                             // If it was IOC, we don’t keep any resting hint.
                             // Fills will come through websocket (fill channel).
-                            ts.mark_dirty();
-                            shared.notify.notify_one();
+                            ts.touch(&shared);
                         }
                     }
                     Err(e) => {
@@ -104,8 +103,7 @@ pub async fn run_exec(
                                 }
                             }
 
-                            ts.mark_dirty();
-                            shared.notify.notify_one();
+                            ts.touch(&shared);
                         }
                     }
                 }
@@ -136,8 +134,7 @@ pub async fn run_exec(
                                 }
                             }
 
-                            ts.mark_dirty();
-                            shared.notify.notify_one();
+                            ts.touch(&shared);
                         }
                     }
                     Err(e) => {

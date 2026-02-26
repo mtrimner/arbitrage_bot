@@ -123,8 +123,7 @@ pub async fn seed_shared_times(shared: &Shared, markets: &[ActiveMarketMeta]) ->
             g.close_ts = Some(m.close_ts);
         }
 
-        ts.mark_dirty();
-        shared.notify.notify_one();
+        ts.touch(&shared);
     }
     Ok(())
 }

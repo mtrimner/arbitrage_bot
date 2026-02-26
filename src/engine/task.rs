@@ -17,14 +17,11 @@ pub async fn run_engine(cfg: Config, shared: Shared, tx: mpsc::Sender<ExecComman
         for item in shared.tickers.iter() {
             let ticker = item.key().clone();
             let ts = item.value().clone();
-
+            let dirty = ts.take_dirty();
             // If interval ticked, run “housekeeping” even if no new data.
             // If notified, we can skip when not dirty.
-            if !interval_fired && !ts.take_dirty() {
+            if !interval_fired && !dirty {
                 continue;
-            } else {
-                // if interval fired, clear dirty anyway so we don’t keep re-running
-                ts.take_dirty();
             }
 
             let cmd = {

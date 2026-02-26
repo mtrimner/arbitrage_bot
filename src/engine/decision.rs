@@ -9,6 +9,45 @@ use crate::types::{ExecCommand, RestingHint, Side, Tif, CC_PER_CENT};
 
 const DOLLAR_CC: i64 = 100 * CC_PER_CENT; // 10000
 
+fn stage_place_order(
+    ticker: &str,
+    m: &mut Market,
+    now: Instant,
+    side: Side,
+    price_cents: u8,
+    qty: u64,
+    tif: Tif,
+    post_only: bool,
+) -> (uuid::Uuid, ExecCommand) {
+    let client_order_id = uuid::Uuid::new_v4();
+
+    m.orders.insert_pending(OrderRec {
+        ticker: ticker.to_string(),
+        side,
+        price_cents,
+        qty,
+        tif,
+        post_only,
+        order_id: None,
+        client_order_id,
+        status: OrderStatus::PendingAck,
+        created_at: now,
+        filled_qty: 0,
+    });
+
+    let cmd = ExecCommand::PlaceOrder {
+        ticker: ticker.to_string(),
+        side,
+        price_cents,
+        qty,
+        tif,
+        post_only,
+        client_order_id,
+    };
+
+    (client_order_id, cmd)
+}
+
 fn desired_buy_qty(cfg: &Config, m: &Market, side: Side, t_rem: i64, window_s: i64) -> u64 {
     let yes = m.pos.yes_qty.max(0) as i64;
     let no  = m.pos.no_qty.max(0) as i64;
@@ -507,32 +546,38 @@ fn maybe_opportunistic_taker(
         }
 
         let qty = desired_buy_qty(cfg, m, side, t_rem, window_s);
-        let client_order_id = uuid::Uuid::new_v4();
-        m.orders.insert_pending(OrderRec {
-            ticker: ticker.to_string(),
-            side,
-            price_cents: ask,
-            qty: qty,
-            tif: Tif::Ioc,
-            post_only: false,
-            order_id: None,
-            client_order_id,
-            status: OrderStatus::PendingAck,
-            created_at: now,
-            filled_qty: 0,
-        });
+        let (_client_order_id, cmd) = stage_place_order(
+            ticker, m, now, side, ask, qty, Tif::Ioc, false
+        );
+        // let client_order_id = uuid::Uuid::new_v4();
+        // m.orders.insert_pending(OrderRec {
+        //     ticker: ticker.to_string(),
+        //     side,
+        //     price_cents: ask,
+        //     qty: qty,
+        //     tif: Tif::Ioc,
+        //     post_only: false,
+        //     order_id: None,
+        //     client_order_id,
+        //     status: OrderStatus::PendingAck,
+        //     created_at: now,
+        //     filled_qty: 0,
+        // });
+
+        // set_last_taker(m, side, now);
+
+        // return Some(ExecCommand::PlaceOrder {
+        //     ticker: ticker.to_string(),
+        //     side,
+        //     price_cents: ask,
+        //     qty: qty,
+        //     tif: Tif::Ioc,
+        //     post_only: false,
+        //     client_order_id,
+        // });
 
         set_last_taker(m, side, now);
-
-        return Some(ExecCommand::PlaceOrder {
-            ticker: ticker.to_string(),
-            side,
-            price_cents: ask,
-            qty: qty,
-            tif: Tif::Ioc,
-            post_only: false,
-            client_order_id,
-        });
+        return Some(cmd);
     }
 
     let imbalance_cap = allowed_imbalance(cfg, t_rem);
@@ -653,32 +698,38 @@ fn maybe_opportunistic_taker(
 
     let (side, ask, _new_pc, qty) = best?;
 
-    let client_order_id = uuid::Uuid::new_v4();
-    m.orders.insert_pending(OrderRec {
-        ticker: ticker.to_string(),
-        side,
-        price_cents: ask,
-        qty: qty,
-        tif: Tif::Ioc,
-        post_only: false,
-        order_id: None,
-        client_order_id,
-        status: OrderStatus::PendingAck,
-        created_at: now,
-        filled_qty: 0,
-    });
-
+    let (_client_order_id, cmd) = stage_place_order(
+        ticker, m, now, side, ask, qty, Tif::Ioc, false
+    );
     set_last_taker(m, side, now);
+    return Some(cmd);
 
-    Some(ExecCommand::PlaceOrder {
-        ticker: ticker.to_string(),
-        side,
-        price_cents: ask,
-        qty: qty,
-        tif: Tif::Ioc,
-        post_only: false,
-        client_order_id,
-    })
+    // let client_order_id = uuid::Uuid::new_v4();
+    // m.orders.insert_pending(OrderRec {
+    //     ticker: ticker.to_string(),
+    //     side,
+    //     price_cents: ask,
+    //     qty: qty,
+    //     tif: Tif::Ioc,
+    //     post_only: false,
+    //     order_id: None,
+    //     client_order_id,
+    //     status: OrderStatus::PendingAck,
+    //     created_at: now,
+    //     filled_qty: 0,
+    // });
+
+    // set_last_taker(m, side, now);
+
+    // Some(ExecCommand::PlaceOrder {
+    //     ticker: ticker.to_string(),
+    //     side,
+    //     price_cents: ask,
+    //     qty: qty,
+    //     tif: Tif::Ioc,
+    //     post_only: false,
+    //     client_order_id,
+    // })
 }
 
 /// Maker quote logic:
@@ -866,21 +917,25 @@ fn maybe_maker_quote(
     }
 
     // 5) Place new resting order with qty
-    let client_order_id = uuid::Uuid::new_v4();
+    let (client_order_id, cmd) = stage_place_order(
+        ticker, m, now, desired_side, p, qty, Tif::Ioc, false
+    );
 
-    m.orders.insert_pending(OrderRec {
-        ticker: ticker.to_string(),
-        side: desired_side,
-        price_cents: p,
-        qty,
-        tif: Tif::Gtc,
-        post_only: true,
-        order_id: None,
-        client_order_id,
-        status: OrderStatus::PendingAck,
-        created_at: now,
-        filled_qty: 0,
-    });
+    // let client_order_id = uuid::Uuid::new_v4();
+
+    // m.orders.insert_pending(OrderRec {
+    //     ticker: ticker.to_string(),
+    //     side: desired_side,
+    //     price_cents: p,
+    //     qty,
+    //     tif: Tif::Gtc,
+    //     post_only: true,
+    //     order_id: None,
+    //     client_order_id,
+    //     status: OrderStatus::PendingAck,
+    //     created_at: now,
+    //     filled_qty: 0,
+    // });
 
     let queue_ahead = match desired_side {
         Side::Yes => m.book.yes_bids[p as usize],
@@ -898,15 +953,16 @@ fn maybe_maker_quote(
         queue_ahead,
     });
 
-    Some(ExecCommand::PlaceOrder {
-        ticker: ticker.to_string(),
-        side: desired_side,
-        price_cents: p,
-        qty,
-        tif: Tif::Gtc,
-        post_only: true,
-        client_order_id,
-    })
+    // Some(ExecCommand::PlaceOrder {
+    //     ticker: ticker.to_string(),
+    //     side: desired_side,
+    //     price_cents: p,
+    //     qty,
+    //     tif: Tif::Gtc,
+    //     post_only: true,
+    //     client_order_id,
+    // })
+    return Some(cmd);
 }
 
 // Small helper to reuse your existing "one resting order per side"
@@ -951,20 +1007,24 @@ fn place_or_manage_resting(
     return None;
     }
 
-    let client_order_id = uuid::Uuid::new_v4();
-    m.orders.insert_pending(OrderRec {
-        ticker: ticker.to_string(),
-        side,
-        price_cents: p,
-        qty: 1,
-        tif: Tif::Gtc,
-        post_only: true,
-        order_id: None,
-        client_order_id,
-        status: OrderStatus::PendingAck,
-        created_at: now,
-        filled_qty: 0,
-    });
+    // let client_order_id = uuid::Uuid::new_v4();
+    // m.orders.insert_pending(OrderRec {
+    //     ticker: ticker.to_string(),
+    //     side,
+    //     price_cents: p,
+    //     qty: 1,
+    //     tif: Tif::Gtc,
+    //     post_only: true,
+    //     order_id: None,
+    //     client_order_id,
+    //     status: OrderStatus::PendingAck,
+    //     created_at: now,
+    //     filled_qty: 0,
+    // });
+
+    let (client_order_id, cmd) = stage_place_order(
+        ticker, m, now, side, p, 1, Tif::Ioc, false
+    );
 
     let queue_ahead = match side {
     Side::Yes => m.book.yes_bids[p as usize],
@@ -981,15 +1041,16 @@ fn place_or_manage_resting(
         queue_ahead,
     });
 
-    Some(ExecCommand::PlaceOrder {
-        ticker: ticker.to_string(),
-        side,
-        price_cents: p,
-        qty: 1,
-        tif: Tif::Gtc,
-        post_only: true,
-        client_order_id,
-    })
+    // Some(ExecCommand::PlaceOrder {
+    //     ticker: ticker.to_string(),
+    //     side,
+    //     price_cents: p,
+    //     qty: 1,
+    //     tif: Tif::Gtc,
+    //     post_only: true,
+    //     client_order_id,
+    // })
+    return Some(cmd);
 }
 
 pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand> {

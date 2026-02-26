@@ -55,9 +55,8 @@ impl Orders {
     /// - Some(true)  => now fully filled
     /// - Some(false) => partial fill
     /// - None        => unknown client_id
-    pub fn on_fill_by_client(&mut self, client_id: uuid::Uuid, fill_qty: u64) -> Option<bool> {
+    pub fn record_fill_by_client(&mut self, client_id: uuid::Uuid, fill_qty: u64) -> Option<bool> {
         let rec = self.by_client.get_mut(&client_id)?;
-
         rec.filled_qty = rec.filled_qty.saturating_add(fill_qty);
 
         if rec.filled_qty >= rec.qty {
@@ -69,9 +68,9 @@ impl Orders {
     }
 
     /// Apply a fill by exchange order_id (fallback path).
-    pub fn on_fill_by_order(&mut self, order_id: &str, fill_qty: u64) -> Option<bool> {
+    pub fn record_fill_by_order(&mut self, order_id: &str, fill_qty: u64) -> Option<bool> {
         let client_id = *self.by_order.get(order_id)?;
-        self.on_fill_by_client(client_id, fill_qty)
+        self.record_fill_by_client(client_id, fill_qty)
     }
 
     pub fn on_fill (&mut self, order_id: &str, fill_qty: u64) -> Option<bool> {

@@ -18,6 +18,8 @@ use crate::config::Config;
 use crate::state::Shared;
 use crate::types::{Side, WsMarketCommand};
 
+const WS_CHANNELS: [&str; 3] = ["orderbook_delta", "trade", "fill"];
+
 fn parse_side(s: &str) -> Option<Side> {
     match s.to_ascii_lowercase().as_str() {
         "yes" => Some(Side::Yes),
@@ -43,9 +45,6 @@ pub async fn run_ws(
     // Commands that arrive before we have sids can be queued.
     let mut pending: Vec<WsMarketCommand> = Vec::new();
 
-    // The channels we care about for trading.
-    let channels: Vec<&str> = vec!["orderbook_delta", "trade", "fill"];
-
     loop {
         // Drain any queued control commands before connecting (keeps markets set up to date).
         while let Ok(cmd) = ctl_rx.try_recv() {
@@ -65,7 +64,7 @@ pub async fn run_ws(
         let trefs: Vec<String> = markets.iter().cloned().collect();
         let trefs_ref: Vec<&str> = trefs.iter().map(|s| s.as_str()).collect();
 
-        if let Err(e) = ws.subscribe(channels.clone(), trefs_ref).await {
+        if let Err(e) = ws.subscribe(WS_CHANNELS.to_vec(), trefs_ref).await {
             warn!("ws subscribe failed: {e:?}");
             sleep(Duration::from_millis(500)).await;
             continue;
@@ -168,7 +167,7 @@ fn handle_err(err: ErrorResponse) {
 
 fn has_all_sids(sids: &HashMap<String,u64>) -> bool {
     // We only update subscriptions for these three channels
-    sids.contains_key("orderbook_delta") && sids.contains_key("trade") && sids.contains_key("fill")
+    WS_CHANNELS.iter().all(|ch| sids.contains_key(*ch))
 }
 
 fn apply_ctl_local(markets: &mut HashSet<String>, cmd: &WsMarketCommand) {
@@ -191,9 +190,7 @@ async fn apply_update_subscription(
         WsMarketCommand::UpdateMarkets { add, remove } => (add, remove),
     };
 
-    let channels = ["orderbook_delta", "trade", "fill"];
-
-    for ch in channels {
+    for ch in WS_CHANNELS {
         let Some(&sid) = sids.get(ch) else { continue; };
 
         if !add.is_empty() {
@@ -224,8 +221,7 @@ async fn handle_snapshot(shared: &Shared, snap: OrderbookSnapshot) -> Result<()>
     let mut g = ts.mkt.write().await;
     g.book.reset(seq, &yes, &no);
 
-    ts.mark_dirty();
-    shared.notify.notify_one();
+    ts.touch(&shared);
     Ok(())
 }
 
@@ -233,7 +229,8 @@ async fn handle_delta(cfg: &Config, shared: &Shared, delta: OrderbookDelta) -> R
     let seq = delta.seq;
     let m = delta.msg;
     let ticker = m.market_ticker.clone();
-    let Some(side) = parse_side(&m.side) else { return Ok(true); };
+    // let Some(side) = parse_side(&m.side) else { return Ok(true); };
+    let Some(side) = m.side.parse::<Side>().ok() else { return Ok(true); };
 
     let ts = shared.ensure_ticker(&ticker);
     let mut g = ts.mkt.write().await;
@@ -243,8 +240,7 @@ async fn handle_delta(cfg: &Config, shared: &Shared, delta: OrderbookDelta) -> R
             crate::exec::paper::paper_on_delta_queue(&mut g, side, m.price, m.delta);
         }
     }
-    ts.mark_dirty();
-    shared.notify.notify_one();
+    ts.touch(&shared);
     Ok(ok)
 }
 
@@ -260,8 +256,7 @@ async fn handle_trade(cfg: &Config, shared: &Shared, tu: TradeUpdate) -> Result<
         crate::exec::paper::paper_on_trade_fill(&ticker, &mut g, taker_side, m.yes_price, m.no_price, m.count);
     }
 
-    ts.mark_dirty();
-    shared.notify.notify_one();
+    ts.touch(&shared);
     Ok(())
 }
 
@@ -289,7 +284,7 @@ async fn handle_fill(shared: &Shared, uf: UserFill) -> Result<()> {
             // Make sure order_id mapping exists even if Rest ack is late
             g.orders.link_order_id_if_missing(client_id, &m.order_id);
 
-            let fully_filled = g.orders.on_fill(&m.order_id, fill_qty as u64);
+            let fully_filled = g.orders.record_fill_by_order(&m.order_id, fill_qty as u64);
             
             if matches!(fully_filled, Some(true)) {
                 if let Some(h) = g.resting_hint(purchased).as_ref() {
@@ -300,7 +295,7 @@ async fn handle_fill(shared: &Shared, uf: UserFill) -> Result<()> {
             }
         } else {
             // Fallback: apply by order_id (works only if by_order mapping exists)
-            let fully_filled = g.orders.on_fill_by_order(&m.order_id.as_str(), fill_qty as u64);
+            let fully_filled = g.orders.record_fill_by_order(&m.order_id, fill_qty as u64);
             
             if matches!(fully_filled, Some(true)) {
                 if let Some(h) = g.resting_hint(purchased).as_ref() {
@@ -311,8 +306,7 @@ async fn handle_fill(shared: &Shared, uf: UserFill) -> Result<()> {
             }            
         }
 
-        ts.mark_dirty();
-        shared.notify.notify_one();
+        ts.touch(&shared);
     }
     Ok(())
 }

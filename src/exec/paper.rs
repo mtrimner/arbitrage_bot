@@ -80,7 +80,7 @@ pub fn paper_on_trade_fill(ticker: &str, m: &mut Market, taker_side: Side, yes_p
     m.pos.apply_fill(maker_side, fill_price, fill_qty as i64);
     crate::report::log_position(ticker, &m.pos);
 
-    let fully = m.orders.on_fill_by_client(client_id, fill_qty);
+    let fully = m.orders.record_fill_by_client(client_id, fill_qty);
 
     if matches!(fully, Some(true)) {
         // clear resting hint when fully filled
@@ -119,8 +119,7 @@ pub async fn paper_place(
             }
         }
 
-        ts.mark_dirty();
-        shared.notify.notify_one();
+        ts.touch(&shared);
         return;
     }
 
@@ -130,8 +129,7 @@ pub async fn paper_place(
             let Some(ask) = g.book.implied_ask(side) else {
                 info!(ticker, ?side, price_cents, "PAPER ioc reject no-ask");
                 g.orders.set_status_by_client(client_order_id, OrderStatus::Rejected);
-                ts.mark_dirty();
-                shared.notify.notify_one();
+                ts.touch(&shared);
                 return;
             };
 
@@ -139,15 +137,14 @@ pub async fn paper_place(
                 let fill_qty = qty;
                 info!(ticker, ?side, limit=price_cents, fill_price=ask, fill_qty, "PAPER ioc filled");
                 g.pos.apply_fill(side, ask, fill_qty as i64);
-                let _ = g.orders.on_fill_by_client(client_order_id, fill_qty);
+                let _ = g.orders.record_fill_by_client(client_order_id, fill_qty);
                 crate::report::log_position(ticker, &g.pos);
             } else {
                 info!(ticker, ?side, limit=price_cents, ask, "PAPER ioc not-filled reject");
                 g.orders.set_status_by_client(client_order_id, OrderStatus::Rejected);
             }
 
-            ts.mark_dirty();
-            shared.notify.notify_one();
+            ts.touch(&shared);
         }
 
         Tif::Gtc => {
@@ -163,8 +160,7 @@ pub async fn paper_place(
                 }
             }
 
-            ts.mark_dirty();
-            shared.notify.notify_one();
+            ts.touch(&shared);
         }
     }
 }
@@ -186,6 +182,5 @@ pub async fn paper_cancel(shared: &Shared, ticker: &str, order_id: &str) {
     }
 
     info!(ticker, order_id, "PAPER cancel ack");
-    ts.mark_dirty();
-    shared.notify.notify_one();
+    ts.touch(&shared);
 }

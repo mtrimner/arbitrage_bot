@@ -1,5 +1,6 @@
 use crate::state::{book::Book, orders::Orders, position::Position};
 use crate::types::RestingHint;
+use crate::state::Shared;
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::sync::RwLock;
@@ -80,6 +81,11 @@ impl TickerState {
             dirty: AtomicBool::new(true),
             last_dirty_ns: AtomicI64::new(0),
         }
+    }
+
+    pub fn touch(&self, shared: &Shared) {
+        self.mark_dirty();
+        shared.notify.notify_one();
     }
 
     pub fn mark_dirty(&self) {
