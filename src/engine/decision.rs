@@ -724,26 +724,6 @@ fn maybe_maker_quote(
     desired_side: Side,
 ) -> Option<ExecCommand> {
 
-    // let other = desired_side.other();
-    // if let Some(h) = m.resting_hint(other).as_ref().cloned() {
-    //     if let Some(order_id) = h.order_id.clone() {
-    //         let age_ms = now.duration_since(h.created_at).as_millis() as u64;
-    //         if age_ms >= cfg.min_resting_life_ms {
-    //             if h.cancel_requested_at.is_none()
-    //                 || now.duration_since(h.cancel_requested_at.unwrap()).as_millis() as u64 >= cfg.cancel_retry_ms
-    //             {
-    //                 if let Some(hm) = m.resting_hint_mut(other).as_mut() {
-    //                     hm.cancel_requested_at = Some(now);
-    //                 }
-    //                 return Some(ExecCommand::CancelOrder {
-    //                     ticker: ticker.to_string(),
-    //                     order_id,
-    //                 });
-    //             }
-    //         }
-    //     }
-    // }
-
     let cap_target = cfg.target_pair_cc;
     let cap_safe = cfg.safe_pair_cc;
     let cap_balance = cfg.balance_pair_cc.clamp(0,DOLLAR_CC);
@@ -833,6 +813,19 @@ fn maybe_maker_quote(
         require_noworse,
         qty as i64,
     );
+    
+    if p_opt.is_none() {
+    tracing::debug!(
+        ?desired_side,
+        top,
+        min_price,
+        cap_cc,
+        require_noworse,
+        qty,
+        old_pc,
+        "no maker price satisfies caps in band"
+    );
+}
 
     while p_opt.is_none() && qty > 1 {
         qty = (qty / 2).max(1);

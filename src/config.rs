@@ -131,7 +131,7 @@ impl Default for Config {
             catchup_aggressiveness: 0.35,
             catchup_balance_boost: 1.0,
 
-            cancel_stale_ms: 15000,
+            cancel_stale_ms: 120000,
             min_resting_life_ms: 1000,
             cancel_retry_ms: 800,
             cancel_drift_cents: 3,
