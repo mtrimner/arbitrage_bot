@@ -355,7 +355,7 @@ fn best_price_under_pair_cap(
 /// If we have a resting hint and it’s too old, cancel it.
 /// We do NOT cancel constantly; this is only for “stale” orders.
 fn cancel_stale_if_needed(cfg: &Config, ticker: &str, m: &mut Market, now: Instant) -> Option<ExecCommand> {
-    for side in [Side::Yes, Side::No] {
+    for side in Side::ALL {
         let Some(h) = m.resting_hint(side).as_ref().cloned() else { continue; };
         let Some(order_id) = h.order_id.clone() else { continue; };
 
@@ -425,7 +425,7 @@ fn choose_working_side_simple(cfg: &Config, m: &Market, t_rem: i64) -> Side {
 
     let mut best: Option<(Side, i64, u8, u8)> = None;
 
-    for side in [Side::Yes, Side::No] {
+    for side in Side::ALL {
         // Respect imbalance cap (don't choose side that would push beyond allowed imbalance)
         let would = m.pos.simulate_buy(side, 0, 1);
         if would.imbalance_ratio() > imbalance_cap {
@@ -549,32 +549,6 @@ fn maybe_opportunistic_taker(
         let (_client_order_id, cmd) = stage_place_order(
             ticker, m, now, side, ask, qty, Tif::Ioc, false
         );
-        // let client_order_id = uuid::Uuid::new_v4();
-        // m.orders.insert_pending(OrderRec {
-        //     ticker: ticker.to_string(),
-        //     side,
-        //     price_cents: ask,
-        //     qty: qty,
-        //     tif: Tif::Ioc,
-        //     post_only: false,
-        //     order_id: None,
-        //     client_order_id,
-        //     status: OrderStatus::PendingAck,
-        //     created_at: now,
-        //     filled_qty: 0,
-        // });
-
-        // set_last_taker(m, side, now);
-
-        // return Some(ExecCommand::PlaceOrder {
-        //     ticker: ticker.to_string(),
-        //     side,
-        //     price_cents: ask,
-        //     qty: qty,
-        //     tif: Tif::Ioc,
-        //     post_only: false,
-        //     client_order_id,
-        // });
 
         set_last_taker(m, side, now);
         return Some(cmd);
@@ -598,7 +572,7 @@ fn maybe_opportunistic_taker(
 
     let mut best: Option<(Side, u8, i64, u64)> = None;
 
-    for side in [Side::Yes, Side::No] {
+    for side in Side::ALL {
         // If we already have a maker resting on this side, give it time before paying taker fees.
         if !desperate {
             if let Some(h) = m.resting_hint(side).as_ref() {
@@ -704,32 +678,6 @@ fn maybe_opportunistic_taker(
     set_last_taker(m, side, now);
     return Some(cmd);
 
-    // let client_order_id = uuid::Uuid::new_v4();
-    // m.orders.insert_pending(OrderRec {
-    //     ticker: ticker.to_string(),
-    //     side,
-    //     price_cents: ask,
-    //     qty: qty,
-    //     tif: Tif::Ioc,
-    //     post_only: false,
-    //     order_id: None,
-    //     client_order_id,
-    //     status: OrderStatus::PendingAck,
-    //     created_at: now,
-    //     filled_qty: 0,
-    // });
-
-    // set_last_taker(m, side, now);
-
-    // Some(ExecCommand::PlaceOrder {
-    //     ticker: ticker.to_string(),
-    //     side,
-    //     price_cents: ask,
-    //     qty: qty,
-    //     tif: Tif::Ioc,
-    //     post_only: false,
-    //     client_order_id,
-    // })
 }
 
 /// Maker quote logic:
@@ -856,16 +804,16 @@ fn maybe_maker_quote(
     );
 
     while p_opt.is_none() && qty > 1 {
-    qty = (qty / 2).max(1);
-    p_opt = best_price_under_pair_cap_qty(
-        m,
-        desired_side,
-        top,
-        min_price,
-        cap_cc,
-        require_noworse,
-        qty as i64,
-    );
+        qty = (qty / 2).max(1);
+        p_opt = best_price_under_pair_cap_qty(
+            m,
+            desired_side,
+            top,
+            min_price,
+            cap_cc,
+            require_noworse,
+            qty as i64,
+        );
     }
 
     let p = p_opt?;
@@ -921,22 +869,6 @@ fn maybe_maker_quote(
         ticker, m, now, desired_side, p, qty, Tif::Ioc, false
     );
 
-    // let client_order_id = uuid::Uuid::new_v4();
-
-    // m.orders.insert_pending(OrderRec {
-    //     ticker: ticker.to_string(),
-    //     side: desired_side,
-    //     price_cents: p,
-    //     qty,
-    //     tif: Tif::Gtc,
-    //     post_only: true,
-    //     order_id: None,
-    //     client_order_id,
-    //     status: OrderStatus::PendingAck,
-    //     created_at: now,
-    //     filled_qty: 0,
-    // });
-
     let queue_ahead = match desired_side {
         Side::Yes => m.book.yes_bids[p as usize],
         Side::No  => m.book.no_bids[p as usize],
@@ -953,16 +885,7 @@ fn maybe_maker_quote(
         queue_ahead,
     });
 
-    // Some(ExecCommand::PlaceOrder {
-    //     ticker: ticker.to_string(),
-    //     side: desired_side,
-    //     price_cents: p,
-    //     qty,
-    //     tif: Tif::Gtc,
-    //     post_only: true,
-    //     client_order_id,
-    // })
-    return Some(cmd);
+    Some(cmd)
 }
 
 // Small helper to reuse your existing "one resting order per side"
@@ -1004,31 +927,16 @@ fn place_or_manage_resting(
                 order_id,
             });
         }
-    return None;
+        return None;
     }
-
-    // let client_order_id = uuid::Uuid::new_v4();
-    // m.orders.insert_pending(OrderRec {
-    //     ticker: ticker.to_string(),
-    //     side,
-    //     price_cents: p,
-    //     qty: 1,
-    //     tif: Tif::Gtc,
-    //     post_only: true,
-    //     order_id: None,
-    //     client_order_id,
-    //     status: OrderStatus::PendingAck,
-    //     created_at: now,
-    //     filled_qty: 0,
-    // });
 
     let (client_order_id, cmd) = stage_place_order(
         ticker, m, now, side, p, 1, Tif::Ioc, false
     );
 
     let queue_ahead = match side {
-    Side::Yes => m.book.yes_bids[p as usize],
-    Side::No => m.book.no_bids[p as usize],
+        Side::Yes => m.book.yes_bids[p as usize],
+        Side::No => m.book.no_bids[p as usize],
     };
     *m.resting_hint_mut(side) = Some(RestingHint {
         side,
@@ -1041,16 +949,7 @@ fn place_or_manage_resting(
         queue_ahead,
     });
 
-    // Some(ExecCommand::PlaceOrder {
-    //     ticker: ticker.to_string(),
-    //     side,
-    //     price_cents: p,
-    //     qty: 1,
-    //     tif: Tif::Gtc,
-    //     post_only: true,
-    //     client_order_id,
-    // })
-    return Some(cmd);
+    Some(cmd)
 }
 
 pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand> {

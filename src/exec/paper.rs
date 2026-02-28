@@ -6,7 +6,9 @@ use crate::types::{Side, Tif};
 use crate::state::ticker::Market;
 
 pub fn paper_on_delta_queue(m: &mut Market, side: Side, price: u8, delta: i64) {
-    if delta >= 0 { return; }
+    if delta >= 0 { 
+        return; 
+    }
 
     if let Some(h) = m.resting_hint_mut(side).as_mut() {
         if h.price_cents == price && h.order_id.is_some() {
@@ -19,7 +21,9 @@ pub fn paper_on_delta_queue(m: &mut Market, side: Side, price: u8, delta: i64) {
 
 pub fn paper_on_trade_fill(ticker: &str, m: &mut Market, taker_side: Side, yes_price: u8, no_price: u8, count: i64) {
     let fillable = count.max(0) as u64;
-    if fillable == 0 { return; }
+    if fillable == 0 { 
+        return; 
+    }
 
     // maker side is the opposite side of taker
     let maker_side = taker_side.other();
@@ -30,9 +34,12 @@ pub fn paper_on_trade_fill(ticker: &str, m: &mut Market, taker_side: Side, yes_p
 
     let (client_id, posted_price, remaining_after_queue_u64) = {
         let Some(h) = m.resting_hint_mut(maker_side).as_mut() else { return; };
-        if h.order_id.is_none() { return; }            // not acked yet
+        // not acked yet
+        if h.order_id.is_none() { 
+            return; 
+        }            
 
-                // --------- IMPORTANT CHANGE ----------
+        // --------- IMPORTANT CHANGE ----------
         // If the market traded at/through our posted maker price, we should be fill-eligible.
         //
         // For a resting BUY at h.price_cents:
@@ -63,15 +70,19 @@ pub fn paper_on_trade_fill(ticker: &str, m: &mut Market, taker_side: Side, yes_p
 
         (h.client_order_id, h.price_cents, remaining as u64)
     };
-        let order_remaining = match m.orders.by_client.get(&client_id) {
+    let order_remaining = match m.orders.by_client.get(&client_id) {
         Some(rec) => rec.qty.saturating_sub(rec.filled_qty),
         None => return,
     };
     
-    if order_remaining == 0 { return; }
+    if order_remaining == 0 { 
+        return; 
+    }
 
     let fill_qty = order_remaining.min(remaining_after_queue_u64);
-    if fill_qty == 0 { return; }
+    if fill_qty == 0 { 
+        return; 
+    }
 
     // Option A: fill at OUR posted maker price (conservative)
     let fill_price = posted_price;
@@ -173,7 +184,7 @@ pub async fn paper_cancel(shared: &Shared, ticker: &str, order_id: &str) {
     // (status lookup optional; we’ll just attempt cancel)
     g.orders.set_status_by_order(order_id, OrderStatus::Canceled);
 
-    for side in [Side::Yes, Side::No] {
+    for side in Side::ALL {
         if let Some(h) = g.resting_hint(side).as_ref() {
             if h.order_id.as_deref() == Some(order_id) {
                 *g.resting_hint_mut(side) = None;

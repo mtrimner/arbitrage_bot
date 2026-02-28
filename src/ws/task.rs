@@ -20,14 +20,6 @@ use crate::types::{Side, WsMarketCommand};
 
 const WS_CHANNELS: [&str; 3] = ["orderbook_delta", "trade", "fill"];
 
-fn parse_side(s: &str) -> Option<Side> {
-    match s.to_ascii_lowercase().as_str() {
-        "yes" => Some(Side::Yes),
-        "no" => Some(Side::No),
-        _ => None,
-    }
-}
-
 pub async fn run_ws(
     ws: KalshiWebsocketClient,
     _http: Arc<KalshiClient>,
@@ -229,7 +221,6 @@ async fn handle_delta(cfg: &Config, shared: &Shared, delta: OrderbookDelta) -> R
     let seq = delta.seq;
     let m = delta.msg;
     let ticker = m.market_ticker.clone();
-    // let Some(side) = parse_side(&m.side) else { return Ok(true); };
     let Some(side) = m.side.parse::<Side>().ok() else { return Ok(true); };
 
     let ts = shared.ensure_ticker(&ticker);
@@ -247,7 +238,7 @@ async fn handle_delta(cfg: &Config, shared: &Shared, delta: OrderbookDelta) -> R
 async fn handle_trade(cfg: &Config, shared: &Shared, tu: TradeUpdate) -> Result<()> {
     let m = tu.msg;
     let ticker = m.market_ticker.clone();
-    let Some(taker_side) = parse_side(&m.taker_side) else { return Ok(()); };
+    let Some(taker_side) = m.taker_side.parse::<Side>().ok() else { return Ok(()); };
 
     let ts = shared.ensure_ticker(&ticker);
     let mut g = ts.mkt.write().await;
@@ -264,7 +255,7 @@ async fn handle_fill(shared: &Shared, uf: UserFill) -> Result<()> {
     let m = uf.msg;
     let ticker = m.market_ticker.clone();
 
-    let Some(purchased) = parse_side(&m.purchased_side) else { return Ok(()); };
+    let Some(purchased) = m.purchased_side.parse::<Side>().ok() else { return Ok(()); };
     
     let fill_qty = m.count.max(0) as i64;
     if fill_qty == 0 { return Ok(()); }

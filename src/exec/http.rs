@@ -4,13 +4,6 @@ use kalshi_rs::portfolio::models::{CreateOrderRequest, CreateOrderResponse};
 
 use crate::types::{Side, Tif};
 
-fn tif_str(t: Tif) -> &'static str {
-    match t {
-        Tif::Ioc => "ioc",
-        Tif::Gtc => "gtc",
-    }
-}
-
 /// Place a limit order.
 ///
 /// NOTE: CreateOrderRequest does NOT implement Default in kalshi-rs 0.2.1,
@@ -44,7 +37,7 @@ pub async fn place(
         yes_price_dollars: None,
         no_price_dollars: None,
         expiration_ts: None,
-        time_in_force: Some(tif_str(tif).to_string()),
+        time_in_force: Some(tif.as_str().to_string()),
         buy_max_cost: None,
 
         post_only: Some(post_only),

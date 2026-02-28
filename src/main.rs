@@ -16,7 +16,7 @@ use dotenv::dotenv;
 use std::env;
 
 use state::Shared;
-use config::{Config, ExecMode};
+use config::Config;
 
 use kalshi_rs::{KalshiClient, KalshiWebsocketClient};
 use kalshi_rs::auth::Account;
@@ -31,12 +31,7 @@ async fn main() -> Result<()> {
 
     dotenv().ok();
 
-    let mut cfg = Config::default();
-    let mode = std::env::var("EXEC_MODE").unwrap_or_else(|_| "paper".to_string());
-    cfg.exec_mode = match mode.to_lowercase().as_str() {
-        "paper" | "dry" | "sim" => ExecMode::Paper,
-        _ => ExecMode::Live,
-    };
+    let cfg = Config::from_env();
 
     let api_key_id = env::var("API_KEY").expect("No API_KEY");
     let account = Account::from_file("./private_keys/kalshi_private.pem", api_key_id.as_str())?;

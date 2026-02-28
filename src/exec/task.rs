@@ -10,7 +10,16 @@ use crate::exec::{http, paper};
 use crate::state::orders::OrderStatus;
 use crate::state::Shared;
 use crate::types::{ExecCommand, Side, Tif};
-use crate::config::{Config, ExecMode};
+use crate::config::Config;
+
+fn kalshi_status_to_local(status: &str) -> OrderStatus {
+    match status {
+        "resting" => OrderStatus::Resting,
+        "canceled" => OrderStatus::Canceled,
+        "filled" => OrderStatus::Filled,
+        _ => OrderStatus::Resting, // conservatitve default
+    }
+}
 
 pub async fn run_exec(
     cfg: Config,
@@ -68,12 +77,7 @@ pub async fn run_exec(
                             g.orders.link_order_id(client_order_id, &order_id);
 
                             // Update local status
-                            let st = match status.as_str() {
-                                "resting" => OrderStatus::Resting,
-                                "canceled" => OrderStatus::Canceled,
-                                "filled" | "executed" => OrderStatus::Filled,
-                                _ => OrderStatus::Resting, // conservative
-                            };
+                            let st = kalshi_status_to_local(status.as_str());
                             g.orders.set_status_by_client(client_order_id, st);
 
                             // If this was meant to be a resting order, fill in the hint's order_id.
@@ -97,11 +101,12 @@ pub async fn run_exec(
                             g.orders.set_status_by_client(client_order_id, OrderStatus::Rejected);
 
                             // If we thought this was resting, clear the hint so engine can try again.
-                            if let Some(h) = g.resting_hint(side).clone() {
-                                if h.client_order_id == client_order_id {
+                            if g.resting_hint(side)
+                                .as_ref()
+                                .is_some_and(|h| h.client_order_id == client_order_id)
+                                {
                                     *g.resting_hint_mut(side) = None;
                                 }
-                            }
 
                             ts.touch(&shared);
                         }
@@ -126,12 +131,13 @@ pub async fn run_exec(
                             g.orders.set_status_by_order(&order_id, OrderStatus::Canceled);
 
                             // Clear any resting hint that matches this order_id.
-                            for side in [Side::Yes, Side::No] {
-                                if let Some(h) = g.resting_hint(side).clone() {
-                                    if h.order_id.as_deref() == Some(order_id.as_str()) {
+                            for side in Side::ALL {
+                                if g.resting_hint(side)
+                                    .as_ref()
+                                    .is_some_and(|h| h.order_id.as_deref() == Some(order_id.as_str()))
+                                    {
                                         *g.resting_hint_mut(side) = None;
                                     }
-                                }
                             }
 
                             ts.touch(&shared);

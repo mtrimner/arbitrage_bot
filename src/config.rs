@@ -1,10 +1,26 @@
+use std::env;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecMode {
     Live,
     Paper,
 }
 
-impl ExecMode {
+impl ExecMode{
+    /// Parse an execution mode from a string
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "paper" => ExecMode::Paper,
+            _ => ExecMode::Live,
+        }
+    }
+
+    /// Read `EXEC_MODE`` from the environment.
+    pub fn from_env() -> Self {
+        let raw = env::var("EXEC_MODE").unwrap_or_else(|_| "paper".to_string());
+        Self::parse(&raw)
+    }
+
     pub fn is_paper(self) -> bool {
         matches!(self, ExecMode::Paper)
     }
@@ -128,5 +144,14 @@ impl Default for Config {
             taker_desperate_s: 30,     // last 30s
             taker_big_improve_cc: 100, // 1.00 cent improvement in pair-cost
         }
+    }
+}
+
+impl Config {
+    /// Load config from environment variables (overrides defaults).
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        cfg.exec_mode = ExecMode::from_env();
+        cfg
     }
 }

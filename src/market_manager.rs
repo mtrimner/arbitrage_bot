@@ -20,7 +20,7 @@ use kalshi_rs::markets::models::MarketsQuery;
 
 use crate::config::Config;
 use crate::state::Shared;
-use crate::types::{ExecCommand, WsMarketCommand};
+use crate::types::{ExecCommand, Side, WsMarketCommand};
 
 
 #[derive(Debug, Clone)]
@@ -138,20 +138,18 @@ async fn cancel_known_resting(exec_tx: &mpsc::Sender<ExecCommand>, shared: &Shar
     // (If order_id is None because we never got ack, we can’t cancel by order_id.)
     let mut cancels = Vec::new();
 
-    if let Some(h) = g.resting_yes.as_ref() {
-        if let Some(oid) = h.order_id.as_ref() {
-            cancels.push(oid.clone());
-        }
-    }
-    if let Some(h) = g.resting_no.as_ref() {
-        if let Some(oid) = h.order_id.as_ref() {
-            cancels.push(oid.clone());
+    for side in Side::ALL {
+        if let Some(h) = g.resting_hint(side).as_ref() {
+            if let Some(oid) = h.order_id.as_ref() {
+                cancels.push(oid.clone());
+            }
         }
     }
 
-    // Clear hints so engine won’t keep acting on them.
-    g.resting_yes = None;
-    g.resting_no = None;
+    // Clear hints so engine won't keep acting on them.
+    for side in Side::ALL {
+        *g.resting_hint_mut(side) = None;
+    }
 
     drop(g);
 

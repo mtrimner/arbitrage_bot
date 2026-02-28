@@ -1,8 +1,9 @@
 use crate::state::{book::Book, orders::Orders, position::Position};
-use crate::types::RestingHint;
+use crate::types::{RestingHint, Side};
 use crate::state::Shared;
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Instant;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,8 +28,8 @@ pub struct Market {
     pub resting_no: Option<RestingHint>,
 
     // Cooldowns for takers so we don’t spam.
-    pub last_taker_yes: Option<std::time::Instant>,
-    pub last_taker_no: Option<std::time::Instant>,
+    pub last_taker_yes: Option<Instant>,
+    pub last_taker_no: Option<Instant>,
 
     pub mode: Mode,
 }
@@ -49,17 +50,54 @@ impl Market {
         }
     }
 
-    pub fn resting_hint_mut(&mut self, side: crate::types::Side) -> &mut Option<RestingHint> {
+    pub fn resting_hint_mut(&mut self, side: Side) -> &mut Option<RestingHint> {
         match side {
-            crate::types::Side::Yes => &mut self.resting_yes,
-            crate::types::Side::No => &mut self.resting_no,
+            Side::Yes => &mut self.resting_yes,
+            Side::No => &mut self.resting_no,
         }
     }
 
-    pub fn resting_hint(&self, side: crate::types::Side) -> &Option<RestingHint> {
+    pub fn resting_hint(&self, side: Side) -> &Option<RestingHint> {
         match side {
-            crate::types::Side::Yes => &self.resting_yes,
-            crate::types::Side::No => &self.resting_no,
+            Side::Yes => &self.resting_yes,
+            Side::No => &self.resting_no,
+        }
+    }
+
+    #[inline]
+    pub fn has_pair(&self) -> bool {
+        self.pos.yes_qty > 0 && self.pos.no_qty > 0
+    }
+
+    #[inline]
+    pub fn qty_for(&self, side: Side) -> i64 {
+        match side {
+            Side::Yes => self.pos.yes_qty,
+            Side::No => self.pos.no_qty,
+        }
+    }
+
+    #[inline]
+    pub fn avg_cc_for(&self, side: Side) -> Option<i64> {
+        match side {
+            Side::Yes => self.pos.avg_yes_cc(),
+            Side::No => self.pos.avg_no_cc(),
+        }
+    }
+
+    #[inline]
+    pub fn last_taker(&self, side: Side) -> Option<Instant> {
+        match side {
+            Side::Yes => self.last_taker_yes,
+            Side::No => self.last_taker_no,
+        }
+    }
+
+    #[inline]
+    pub fn set_last_taker(&mut self, side: Side, t: Instant) {
+        match side {
+            Side::Yes => self.last_taker_yes = Some(t),
+            Side::No => self.last_taker_no = Some(t),
         }
     }
 }

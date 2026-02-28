@@ -51,6 +51,15 @@ pub enum Tif {
     Gtc,
 }
 
+impl Tif {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tif::Ioc => "ioc",
+            Tif::Gtc => "gtc",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ExecCommand {
     PlaceOrder {

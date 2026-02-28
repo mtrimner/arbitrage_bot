@@ -73,21 +73,6 @@ impl Orders {
         self.record_fill_by_client(client_id, fill_qty)
     }
 
-    pub fn on_fill (&mut self, order_id: &str, fill_qty: u64) -> Option<bool> {
-        let client_id = *self.by_order.get(order_id)?;
-        let rec = self.by_client.get_mut(&client_id)?;
-
-        rec.filled_qty = rec.filled_qty.saturating_add(fill_qty);
-
-        if rec.filled_qty >= rec.qty {
-            rec.status = OrderStatus::Filled;
-            Some(true)
-        } else {
-            // Leave status as Resting/PendingAck; Add PartialFilled status later if needed
-            Some(false)
-        }
-    }
-
     pub fn insert_pending(&mut self, rec: OrderRec) {
         self.by_client.insert(rec.client_order_id, rec);
     }

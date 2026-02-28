@@ -19,6 +19,22 @@ impl Default for Book {
 }
 
 impl Book {
+    #[inline]
+    fn bids(&self, side: Side) -> &[i64; 101] {
+        match side {
+            Side::Yes => &self.yes_bids,
+            Side::No => &self.no_bids,
+        }
+    }
+
+    #[inline]
+    fn bids_mut(&mut self, side: Side) -> &mut [i64; 101] {
+        match side {
+            Side::Yes => &mut self.yes_bids,
+            Side::No => &mut self.no_bids,
+        }
+    }
+
     pub fn reset(&mut self, seq: i64, yes: &[(u8, i64)], no: &[(u8, i64)]) {
         self.yes_bids = [0; 101];
         self.no_bids = [0; 101];
@@ -41,20 +57,14 @@ impl Book {
             return true;
         }
 
-        let arr = match side {
-            Side::Yes => &mut self.yes_bids,
-            Side::No => &mut self.no_bids,
-        };
+        let arr = self.bids_mut(side);
         arr[idx] = (arr[idx] + delta).max(0);
         self.last_seq = seq;
         true
     }
 
     pub fn best_bid(&self, side: Side) -> Option<u8> {
-        let arr = match side {
-            Side::Yes => &self.yes_bids,
-            Side::No => &self.no_bids,
-        };
+        let arr = self.bids(side);
         for p in (0..=100).rev() {
             if arr[p] > 0 {
                 return Some(p as u8);
