@@ -382,6 +382,38 @@ fn cancel_stale_if_needed(cfg: &Config, ticker: &str, m: &mut Market, now: Insta
     None
 }
 
+fn cancel_side_if_allowed(
+    cfg: &Config,
+    ticker: &str,
+    m: &mut Market,
+    now: Instant,
+    side: Side,
+) -> Option<ExecCommand> {
+    let Some(h) = m.resting_hint(side).as_ref().cloned() else { return None; };
+    let Some(order_id) = h.order_id.clone() else { return None; };
+
+    let age_ms = now.duration_since(h.created_at).as_millis() as u64;
+    if age_ms < cfg.min_resting_life_ms {
+        return None;
+    }
+
+    if let Some(t0) = h.cancel_requested_at {
+        let since = now.duration_since(t0).as_millis() as u64;
+        if since < cfg.cancel_retry_ms {
+            return None;
+        }
+    }
+
+    if let Some(hm) = m.resting_hint_mut(side).as_mut() {
+        hm.cancel_requested_at = Some(now);
+    }
+
+    Some(ExecCommand::CancelOrder { 
+        ticker: ticker.to_string(), 
+        order_id,
+    })
+}
+
 /// Signal-free working side selection, but "pair-cost smart".
 /// Chooses the side that would most reduce avg_yes+avg_no if a 1-lot maker fill happens.
 ///
@@ -691,27 +723,26 @@ fn maybe_maker_quote(
     window_s: i64,
     desired_side: Side,
 ) -> Option<ExecCommand> {
-    // let desired_side = choose_working_side(cfg, m, t_rem, score);
 
-    let other = desired_side.other();
-    if let Some(h) = m.resting_hint(other).as_ref().cloned() {
-        if let Some(order_id) = h.order_id.clone() {
-            let age_ms = now.duration_since(h.created_at).as_millis() as u64;
-            if age_ms >= cfg.min_resting_life_ms {
-                if h.cancel_requested_at.is_none()
-                    || now.duration_since(h.cancel_requested_at.unwrap()).as_millis() as u64 >= cfg.cancel_retry_ms
-                {
-                    if let Some(hm) = m.resting_hint_mut(other).as_mut() {
-                        hm.cancel_requested_at = Some(now);
-                    }
-                    return Some(ExecCommand::CancelOrder {
-                        ticker: ticker.to_string(),
-                        order_id,
-                    });
-                }
-            }
-        }
-    }
+    // let other = desired_side.other();
+    // if let Some(h) = m.resting_hint(other).as_ref().cloned() {
+    //     if let Some(order_id) = h.order_id.clone() {
+    //         let age_ms = now.duration_since(h.created_at).as_millis() as u64;
+    //         if age_ms >= cfg.min_resting_life_ms {
+    //             if h.cancel_requested_at.is_none()
+    //                 || now.duration_since(h.cancel_requested_at.unwrap()).as_millis() as u64 >= cfg.cancel_retry_ms
+    //             {
+    //                 if let Some(hm) = m.resting_hint_mut(other).as_mut() {
+    //                     hm.cancel_requested_at = Some(now);
+    //                 }
+    //                 return Some(ExecCommand::CancelOrder {
+    //                     ticker: ticker.to_string(),
+    //                     order_id,
+    //                 });
+    //             }
+    //         }
+    //     }
+    // }
 
     let cap_target = cfg.target_pair_cc;
     let cap_safe = cfg.safe_pair_cc;
@@ -977,6 +1008,19 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
         choose_bootstrap_side_simple(cfg, m)
     };
 
+    // determine if we're in must balance
+    let imbalance_cap = allowed_imbalance(cfg, t_rem);
+    let must_balance = m.mode == Mode::Balance || m.pos.imbalance_ratio() > imbalance_cap;
+
+    // if must-balance, proactively cancel the non-hedge side maker (if present)
+    if has_pair(m) && must_balance {
+        let hedge = hedge_side(m);
+        let wrong_side = hedge.other();
+        if let Some(cmd) = cancel_side_if_allowed(cfg, ticker, m, now, wrong_side) {
+            return Some(cmd);
+        }
+    }
+
     // 0) Cancel stale resting orders (but never churn fast).
     if let Some(cmd) = cancel_stale_if_needed(cfg, ticker, m, now) {
         return Some(cmd);
@@ -987,6 +1031,22 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
         return Some(cmd);
     }
 
-    // 2) Maker quoting (resting) with churn control.
-    maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, desired_side)
+    // 2) Maker quoting on desired side (resting) with churn control.
+    if let Some(cmd) = maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, desired_side) {
+        return Some(cmd);
+    }
+
+    // 3) dual quote if were withing allowed balance and 1-lot fill on the secondary side
+    // stays within cap
+    if has_pair(m) && !must_balance {
+        if m.pos.imbalance_ratio() <= imbalance_cap {
+            let other = desired_side.other();
+            // would a single fill on other side violate imbalance rule
+            let would = m.pos.simulate_buy(other, 0, 1);
+            if would.imbalance_ratio() <= imbalance_cap {
+                return maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, other);
+            }
+        }
+    }
+    None
 }
