@@ -270,20 +270,31 @@ fn set_last_taker(m: &mut Market, side: Side, t: Instant) {
 /// - starts near best bid
 /// - bounded by post-only constraint (must be strictly below implied ask)
 fn top_maker_price(cfg: &Config, m: &Market, side: Side) -> Option<u8> {
-    let best = m.book.best_bid(side)?;
     let improve = if m.mode == Mode::Balance {
         cfg.maker_improve_tick_balance
     } else {
         cfg.maker_improve_tick
     };
 
-    let mut p = best.saturating_add(improve).min(cfg.max_buy_price_cents);
+    // Post-only celing: must be strictly below implied ask (ask - 1)
+    let ask_limit = match m.book.implied_ask(side) {
+        Some(0) => return None, // cannont be post-only below 0
+        Some(ask) => Some(ask.saturating_sub(1)),
+        None => None,
+    };
+
+    let best_bid = m.book.best_bid(side);
+    
+    // If there are no bids on this side, we can still quote: become the top by using ask-1.
+    let mut p = match (best_bid, ask_limit) {
+        (Some(best), Some(limit)) => best.saturating_add(improve).min(limit),
+        (Some(best), None) => best.saturating_add(improve),
+        (None, Some(limit)) => limit,
+        (None, None) => return None, // no book info at all
+    };
 
     // Post-only: must not cross the implied ask.
-    if let Some(ask) = m.book.implied_ask(side) {
-        if ask == 0 { return None; }
-        p = p.min(ask.saturating_sub(1));
-    }
+    p = p.min(cfg.max_buy_price_cents);
     Some(p)
 }
 
@@ -312,6 +323,37 @@ fn best_price_under_pair_cap_qty(
         }
 
         return Some(p);
+    }
+    None
+}
+
+fn best_maker_price_and_qty_under_cap(
+    cfg: &Config,
+    m: &Market,
+    side: Side,
+    top: u8,
+    min_price: u8,
+    cap_cc: i64,
+    require_noworse: bool,
+    desired_qty: u64,
+) -> Option<(u8, u64)> {
+    let desired_qty = desired_qty
+        .max(1)
+        .min(cfg.max_order_qty.max(1));
+
+    // Try biggest size first. Return first qy that can be priced in band.
+    for q in (1..=desired_qty).rev() {
+        if let Some(p) = best_price_under_pair_cap_qty(
+            m,
+            side,
+            top,
+            min_price,
+            cap_cc,
+            require_noworse,
+            q as i64,
+        ) {
+            return Some((p, q));
+        }
     }
     None
 }
@@ -794,53 +836,71 @@ fn maybe_maker_quote(
     let (cap_cc, require_noworse) = if m.mode == Mode::Balance {
         (cap_when_balancing, false)
     } else if unbalanced {
-        // allow hedging even if it worsens pair-cost, but keep it <= target
-        (cap_target, false)
+        // Don't stall while unbalanced: allow hedging up to "safe" (or current pc if already worse).
+        let cap_unbalanced = if old_pc <= cap_target {
+            cap_safe
+        } else {
+            old_pc
+        };
+        (cap_unbalanced, false)
     } else if old_pc <= cap_target {
         (cap_target, true)
     } else {
         (old_pc, true)
     };
 
-        // 3) Find a price using qty-aware simulation.
-    // If qty is too large to fit caps, fall back by shrinking qty.
-    let mut p_opt = best_price_under_pair_cap_qty(
+    // 3) Find a (price, qty) pair that satisfied caps.
+    // We pick the larges feasable qty <= desired qty
+//     let mut p_opt = best_price_under_pair_cap_qty(
+//         m,
+//         desired_side,
+//         top,
+//         min_price,
+//         cap_cc,
+//         require_noworse,
+//         qty as i64,
+//     );
+
+//     if p_opt.is_none() {
+//     tracing::debug!(
+//         ?desired_side,
+//         top,
+//         min_price,
+//         cap_cc,
+//         require_noworse,
+//         qty,
+//         old_pc,
+//         "no maker price satisfies caps in band"
+//     );
+// }
+
+//     while p_opt.is_none() && qty > 1 {
+//         qty = (qty / 2).max(1);
+//         p_opt = best_price_under_pair_cap_qty(
+//             m,
+//             desired_side,
+//             top,
+//             min_price,
+//             cap_cc,
+//             require_noworse,
+//             qty as i64,
+//         );
+//     }
+
+//     let p = p_opt?;
+    let desired_qty = qty;
+
+    let (p, qty) = best_maker_price_and_qty_under_cap(
+        cfg,
         m,
         desired_side,
         top,
         min_price,
         cap_cc,
         require_noworse,
-        qty as i64,
-    );
-    
-    if p_opt.is_none() {
-    tracing::debug!(
-        ?desired_side,
-        top,
-        min_price,
-        cap_cc,
-        require_noworse,
-        qty,
-        old_pc,
-        "no maker price satisfies caps in band"
-    );
-}
-
-    while p_opt.is_none() && qty > 1 {
-        qty = (qty / 2).max(1);
-        p_opt = best_price_under_pair_cap_qty(
-            m,
-            desired_side,
-            top,
-            min_price,
-            cap_cc,
-            require_noworse,
-            qty as i64,
-        );
-    }
-
-    let p = p_opt?;
+        desired_qty,
+    )?;
+   
     // 4) If we already have a resting order on this side, manage it.
     if let Some(existing) = m.resting_hint(desired_side).as_ref().cloned() {
         // Look up existing order qty from Orders (no need to store qty in RestingHint)
@@ -884,7 +944,16 @@ fn maybe_maker_quote(
                 order_id,
             });
         }
-
+        // tracing::debug!(
+        //     ?desired_side,
+        //     top,
+        //     min_price,
+        //     cap_cc,
+        //     require_noworse,
+        //     desired_qty,
+        //     old_pc,
+        //     "maker_quote: no feasible (price,qty) found"
+        // );
         return None;
     }
 
