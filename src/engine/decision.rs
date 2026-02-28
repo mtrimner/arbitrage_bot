@@ -866,7 +866,7 @@ fn maybe_maker_quote(
 
     // 5) Place new resting order with qty
     let (client_order_id, cmd) = stage_place_order(
-        ticker, m, now, desired_side, p, qty, Tif::Ioc, false
+        ticker, m, now, desired_side, p, qty, Tif::Gtc, true
     );
 
     let queue_ahead = match desired_side {
@@ -931,7 +931,7 @@ fn place_or_manage_resting(
     }
 
     let (client_order_id, cmd) = stage_place_order(
-        ticker, m, now, side, p, 1, Tif::Ioc, false
+        ticker, m, now, side, p, 1, Tif::Gtc, true
     );
 
     let queue_ahead = match side {
