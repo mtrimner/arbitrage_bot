@@ -35,7 +35,7 @@ fn passive_strong_price(cfg: &Config, m: &Market, side: Side) -> Option<u8> {
     let max_price = top.saturating_sub(cfg.dual_strong_backoff_cents);
 
     // Search downwards (we allow going deep; if want to constrain, use min bound)
-    best_price_under_pair_cap(m, side, max_price, 0, cap_cc, false)
+    best_price_under_pair_cap(m, side, max_price, 1, cap_cc, false)
 }
 
 fn stage_place_order(
@@ -101,15 +101,28 @@ fn desired_buy_qty(cfg: &Config, m: &Market, side: Side, t_rem: i64, window_s: i
 
     // In Balance mode, allow more aggressive catch-up
     if m.mode == Mode::Balance {
-        frac *= (1.0 + cfg.catchup_balance_boost);
+        frac *= 1.0 + cfg.catchup_balance_boost;
     }
 
-    // Convert gap -> desired qty chunk
+    // // Convert gap -> desired qty chunk
+    // let q = ((gap as f64) * frac).ceil() as i64;
+
+    // // Always at least 1, never above cap, never more than full gap
+    // let q = q.clamp(1, gap).min(cfg.max_order_qty as i64);
     let q = ((gap as f64) * frac).ceil() as i64;
 
-    // Always at least 1, never above cap, never more than full gap
-    let q = q.clamp(1, gap).min(cfg.max_order_qty as i64);
+    // If we already have both legs and we're buying the short side, try at least N.
+    // Still bounded by (gap, max_order_qty).
+    let min_short = if has_pair(m) {
+        cfg.short_side_min_order_qty.max(1) as i64
+    } else {
+        1
+    };
 
+    let q = q
+        .max(min_short)
+        .clamp(1, gap)
+        .min(cfg.max_order_qty as i64);
     q as u64
 }
 
@@ -151,7 +164,7 @@ fn avg_cc_for(m: &Market, side: Side) -> Option<i64> {
 fn max_missing_price_cents(cfg: &Config, m: &Market, existing_avg_cc: i64) -> u8 {
     // Use a looser cap late-window so you can finish hedged.
     let cap_cc = if m.mode == Mode::Balance {
-        cfg.balance_pair_cc.max(DOLLAR_CC)
+        cfg.balance_pair_cc.clamp(0, DOLLAR_CC)
     } else {
         cfg.bootstrap_pair_cc
     };
@@ -377,8 +390,36 @@ fn best_maker_price_and_qty_under_cap(
         .max(1)
         .min(cfg.max_order_qty.max(1));
 
-    // Try biggest size first. Return first qy that can be priced in band.
-    for q in (1..=desired_qty).rev() {
+    // // Try biggest size first. Return first qy that can be priced in band.
+    // for q in (1..=desired_qty).rev() {
+    //     if let Some(p) = best_price_under_pair_cap_qty(
+    //         m,
+    //         side,
+    //         top,
+    //         min_price,
+    //         cap_cc,
+    //         require_noworse,
+    //         q as i64,
+    //     ) {
+    //         return Some((p, q));
+    //     }
+    // }
+    // None
+
+    // TOLERANCE POLICY:
+    // 1) Find best price achievable among all sizes.
+    // 2) Among sizes within `tol_cents` of best price, choose the largest size.
+    //
+    // This prevents "deep price for big qty" (never fills) while still allowing
+    // bigger size when it costs only ~1-2 cents of competitiveness.
+    let tol_cents: u8 = if m.mode == Mode::Balance {
+        cfg.maker_qty_price_tol_cents_balance
+    } else {
+        cfg.maker_qty_price_tol_cents
+    };
+    
+    let mut candidates: Vec<(u8, u64)> = Vec::new();
+    for q in 1..=desired_qty {
         if let Some(p) = best_price_under_pair_cap_qty(
             m,
             side,
@@ -388,10 +429,30 @@ fn best_maker_price_and_qty_under_cap(
             require_noworse,
             q as i64,
         ) {
-            return Some((p, q));
+            candidates.push((p, q));
         }
     }
-    None
+
+    let (best_p, _) = *candidates.iter().max_by_key(|(p, _q)| *p)?;
+
+    // Keep only candidates within tol of best_p
+    let mut best: Option<(u8, u64)> = None;
+    for (p, q) in candidates {
+        if best_p.saturating_sub(p) > tol_cents {
+            continue;
+        }
+        match best {
+            None => best = Some((p, q)),
+            Some((bp, bq)) => {
+                // Within tolerance band: prefer larger size; tie-break by higher price.
+                if q > bq || (q == bq && p > bp) {
+                    best = Some((p, q));
+                }
+            }
+        }
+    }
+
+    best
 }
 
 
@@ -830,7 +891,7 @@ fn maybe_maker_quote(
     if !has_pair(m) {
         // Flat: just quote near top maker price on desired_side.
         if m.pos.yes_qty == 0 && m.pos.no_qty == 0 {
-            return place_or_manage_resting(cfg, ticker, m, now, desired_side, top, 1);
+            return place_or_manage_resting(cfg, ticker, m, now, desired_side, top, 1, false);
         }
 
         // one-sided bootstrap:
@@ -850,14 +911,14 @@ fn maybe_maker_quote(
             }
             // Allow "deep" quotes in bootstrap (do NOT enforce maker_max_edge here)
             let p = top.min(max_missing);
-            return place_or_manage_resting(cfg, ticker, m,  now, desired_side, p, 1);
+            return place_or_manage_resting(cfg, ticker, m,  now, desired_side, p, 1, false);
         } else {
             // Rescue-buy side: only if it improves avg and we haven't exceeded max one sided qty
             if qty_for(m, existing) >= cfg.bootstrap_max_one_side_qty {
                 return None;
             }
             let (p, _improve) = can_rescue_existing(cfg, m, existing)?;
-            return place_or_manage_resting(cfg, ticker, m, now, desired_side, p, 1);
+            return place_or_manage_resting(cfg, ticker, m, now, desired_side, p, 1, false);
         }
     }
 
@@ -1006,15 +1067,49 @@ fn maybe_maker_quote(
 
         let drift = existing.price_cents.abs_diff(p);
         let drift_threshold = drift_threshold_cents(cfg, m, desired_side);
-        let should_cancel = drift >= drift_threshold || want_upsize;
+
+        // For BUY orders: higher price = more aggressive
+        let more_aggressive = p > existing.price_cents;
+
+        // Decide where you want sticky-down active.
+        // A good default: onl do sticky-down on the hedge (short) side.
+        let hedge = hedge_side(m);
+        let sticky_down = (m.pos.yes_cost_cc != m.pos.no_qty) && desired_side == hedge;
+
+        // Safety check: if we kept the existing order and it filled,
+        // would it violate our CURRENT capp_cc/required_noworse rules?
+        let existing_ok_under_cap = {
+            let sim = m.pos.simulate_buy(desired_side, existing.price_cents, existing_remaining as i64);
+            if let Some(pc) = sim.pair_cost_cc() {
+                if pc > cap_cc {
+                    false 
+                } else if require_noworse {
+                    // require_noworse means "don't worsen relative to current"
+                    match m.pos.pair_cost_cc() {
+                        Some(old_pc) => pc <= old_pc,
+                        None => true,
+                    }
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        };
+        let should_cancel = 
+            want_upsize
+            // If sticky-down is OFF, keep current behavior
+            || (!sticky_down && drift >= drift_threshold)
+            // If sticky-down is ON, only cancel for drift when movie UP (more aggressive)
+            || (sticky_down && more_aggressive && drift >= drift_threshold)
+            // Even with sticky-down, cancel if teh existing order is no Longer acceptable
+            || (sticky_down && !existing_ok_under_cap);
 
         if should_cancel {
             let Some(order_id) = existing.order_id.clone() else { return None; };
-
             if let Some(hm) = m.resting_hint_mut(desired_side).as_mut() {
                 hm.cancel_requested_at = Some(now);
             }
-
             return Some(ExecCommand::CancelOrder {
                 ticker: ticker.to_string(),
                 order_id,
@@ -1071,6 +1166,7 @@ fn place_or_manage_resting(
     side: Side,
     p: u8,
     qty: u64,
+    only_reprice_if_more_aggressive: bool
 ) -> Option<ExecCommand> {
     if let Some(existing) = m.resting_hint(side).as_ref().cloned() {
         let existing_remaining = m.orders.by_client
@@ -1097,7 +1193,18 @@ fn place_or_manage_resting(
 
         let drift = existing.price_cents.abs_diff(p);
         let drift_threshold = drift_threshold_cents(cfg, m, side);
-        if drift >= drift_threshold || want_upsize {
+        
+        // For buys: higher bid is more aggressive
+        let more_aggressive = p > existing.price_cents;
+
+        let drift_triggers_cancel = if only_reprice_if_more_aggressive {
+            // Only cancel/replace if we're moving UP (more aggressive) by threshold
+            more_aggressive && drift >= drift_threshold
+        } else {
+            drift >= drift_threshold
+        };
+        
+        if drift_triggers_cancel || want_upsize {
             let Some(order_id) = existing.order_id.clone() else {
                 return None;
             };
@@ -1204,7 +1311,13 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
 
     // 3) dual quote: keep the other side quoted too
     if has_pair(m) && !must_balance && m.pos.imbalance_ratio() <= imbalance_cap {
-        let other = desired_side.other();
+        let hedge = hedge_side(m);
+        let strong = hedge.other();
+        let other = if skew { 
+            strong 
+        } else {
+            primary_side.other()
+        };
 
         // would a on the other side violate imbalance constraints?
         // use the actual qty we would place on that side:
@@ -1228,6 +1341,7 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
                         other,
                         p_strong,
                         cfg.dual_strong_qty,
+                        true, // sticky on downward moves
                     );
                 }
             } else {

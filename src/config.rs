@@ -90,6 +90,8 @@ pub struct Config {
     pub cancel_retry_ms: u64,        // if we sent cancel already, wait this long to retry
     pub cancel_drift_cents: u8,      // if desired quote moves away from current resting price by >= this, consider requote
     pub maker_max_edge_cents: u8,    // don’t quote more than this below “top maker price” (avoids super-low bids that never fill)
+    pub maker_qty_price_tol_cents: u8,          // price-vs-qty tolerance when choosing (price,qty) under cap (normal)
+    pub maker_qty_price_tol_cents_balance: u8,  // same tolerance in Balance mode
 
     // -------- Inventory-skewed dual quoting knobs --------
     // When imbalance_ratio >= this, we skew quoting:
@@ -118,6 +120,14 @@ pub struct Config {
     pub maker_first_ms: u64,      // wait this long for a resting maker to work
     pub taker_desperate_s: i64,   // only force IOC in last N seconds of Balance
     pub taker_big_improve_cc: i64, // allow IOC early only for huge improvements
+
+    // --- Short-side sizing ---
+    /// When we are buying the **short** side (gap > 0), try at least this many contracts.
+    /// Set to 1 to disable.
+    ///
+    /// NOTE: this is only the *desired* qty. The maker price/qty chooser may still fall
+    /// back to a smaller qty (down to 1) if larger sizes can't be priced under cap.
+    pub short_side_min_order_qty: u64,
 }
 
 impl Default for Config {
@@ -130,7 +140,7 @@ impl Default for Config {
 
             window_s: 900,
             accumulate_s: 150,
-            balance_s: 500,
+            balance_s: 240,
 
             series_tickers: vec!["KXBTC15M".to_string()],
             market_refresh_ms: 5000,
@@ -140,11 +150,11 @@ impl Default for Config {
             maker_improve_tick_balance: 99,
             max_buy_price_cents: 99,
 
-            safe_pair_cc: 9850,
+            safe_pair_cc: 9875,
             target_pair_cc: 9825,
 
             bootstrap_pair_cc: 10100, // $1.01
-            balance_pair_cc: 9900, // $0.99
+            balance_pair_cc: 9925, // $0.99.25
  
             bootstrap_max_one_side_qty: 5,
             bootstrap_rescue_min_improve_cc: 500,
@@ -156,14 +166,17 @@ impl Default for Config {
             imbalance_cap_small_total: 0.50,
 
             max_order_qty: 25,
-            catchup_aggressiveness: 0.35,
-            catchup_balance_boost: 1.0,
+            catchup_aggressiveness: 0.45,
+            catchup_balance_boost: 1.5,
 
             cancel_stale_ms: 120000,
             min_resting_life_ms: 1000,
             cancel_retry_ms: 800,
             cancel_drift_cents: 3,
             maker_max_edge_cents: 15,
+            // If qty>1 forces you to quote much lower, stick to smaller qty near top
+            maker_qty_price_tol_cents: 2,
+            maker_qty_price_tol_cents_balance: 1,
 
             // Inventory-skew defaults (tune these!)
             skew_imbalance_start: 0.05,
@@ -174,12 +187,14 @@ impl Default for Config {
             dual_strong_qty: 1,
             skew_min_total: 10,
 
-            taker_cooldown_ms: 500,
+            taker_cooldown_ms: 1000,
             min_taker_improve_cc: 20, // 0.2 cents improvement in pair-cost
 
             maker_first_ms: 1500,      // 1.5s
-            taker_desperate_s: 30,     // last 30s
+            taker_desperate_s: 120,     // last 120s
             taker_big_improve_cc: 100, // 1.00 cent improvement in pair-cost
+
+            short_side_min_order_qty: 3
         }
     }
 }
