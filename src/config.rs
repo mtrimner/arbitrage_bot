@@ -73,6 +73,11 @@ pub struct Config {
     pub early_imbalance_cap: f64,
     pub late_imbalance_cap: f64,
 
+    // If total position is small, ratio is too “jumpy” (e.g., 1 vs 2 = 0.333).
+    // Until total >= this, we relax the imbalance cap to at least `imbalance_cap_small_total`.
+    pub imbalance_min_total: i64,
+    pub imbalance_cap_small_total: f64,
+
     // Dynamic sizing (catch-up)
     pub max_order_qty: u64,            // hard safety cap
     pub catchup_aggressiveness: f64,   // 0.0..1.0 how fast to catch up
@@ -85,6 +90,26 @@ pub struct Config {
     pub cancel_retry_ms: u64,        // if we sent cancel already, wait this long to retry
     pub cancel_drift_cents: u8,      // if desired quote moves away from current resting price by >= this, consider requote
     pub maker_max_edge_cents: u8,    // don’t quote more than this below “top maker price” (avoids super-low bids that never fill)
+
+    // -------- Inventory-skewed dual quoting knobs --------
+    // When imbalance_ratio >= this, we skew quoting:
+    // - hedge side becomes "more competitive" (can force top to ask-1 in maker quote)
+    // - strong side becomes "weak" and only quotes if it materially improves pair cost
+    pub skew_imbalance_start: f64,
+
+    // Hedge side reprices faster (e.g. 1 cent), strong side uses cancel_drift_cents.
+    pub cancel_drift_cents_hedge: u8,
+
+    // If desired_side == hedge and imbalance_ratio >= this, push quote up to ask-1 (still post-only).
+    pub hedge_force_ask_minus_one_imbalance: f64,
+
+    // Strong-side passive quote constraints
+    pub dual_strong_min_improve_cc: i64, // require at least this much pair-cost improvement (cent-cents)
+    pub dual_strong_backoff_cents: u8,   // how many cents below top-maker to start searching for a weak bid
+    pub dual_strong_qty: u64,            // qty for strong-side passive order (usually 1)
+
+    // Don’t enable skew-dual quoting until we have enough inventory (prevents early “forced hedge” stalls).
+    pub skew_min_total: i64,
 
     // Opportunistic taker behavior
     pub taker_cooldown_ms: u64, // don’t fire takers on same side more often than this
@@ -101,7 +126,7 @@ impl Default for Config {
             exec_mode: ExecMode::Live,
             paper_reject_postonly_cross: true,
 
-            tick_ms: 25,
+            tick_ms: 250,
 
             window_s: 900,
             accumulate_s: 150,
@@ -113,7 +138,7 @@ impl Default for Config {
             aggressive_tick: 1,
             maker_improve_tick: 1,
             maker_improve_tick_balance: 99,
-            max_buy_price_cents: 98,
+            max_buy_price_cents: 99,
 
             safe_pair_cc: 9850,
             target_pair_cc: 9825,
@@ -125,7 +150,10 @@ impl Default for Config {
             bootstrap_rescue_min_improve_cc: 500,
 
             early_imbalance_cap: 0.20,
-            late_imbalance_cap: 0.05,
+            late_imbalance_cap: 0.10,
+
+            imbalance_min_total: 20,
+            imbalance_cap_small_total: 0.50,
 
             max_order_qty: 25,
             catchup_aggressiveness: 0.35,
@@ -135,7 +163,16 @@ impl Default for Config {
             min_resting_life_ms: 1000,
             cancel_retry_ms: 800,
             cancel_drift_cents: 3,
-            maker_max_edge_cents: 8,
+            maker_max_edge_cents: 15,
+
+            // Inventory-skew defaults (tune these!)
+            skew_imbalance_start: 0.05,
+            cancel_drift_cents_hedge: 1,
+            hedge_force_ask_minus_one_imbalance: 0.10,
+            dual_strong_min_improve_cc: 20, // 0.20 cents
+            dual_strong_backoff_cents: 3,
+            dual_strong_qty: 1,
+            skew_min_total: 10,
 
             taker_cooldown_ms: 500,
             min_taker_improve_cc: 20, // 0.2 cents improvement in pair-cost

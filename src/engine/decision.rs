@@ -9,6 +9,35 @@ use crate::types::{ExecCommand, RestingHint, Side, Tif, CC_PER_CENT};
 
 const DOLLAR_CC: i64 = 100 * CC_PER_CENT; // 10000
 
+fn total_qty(m: &Market) -> i64 {
+    // Defensive: position qty fields are i64; we expect non-negative, but clamp anyway.
+    (m.pos.yes_qty.max(0) + m.pos.no_qty.max(0)).max(1)
+}
+
+fn drift_threshold_cents(cfg: &Config, m: &Market, side: Side) -> u8 {
+    // Hedge side reprices faster so it stays competitive and catchs up
+    let hedge = hedge_side(m);
+    if side == hedge {
+        cfg.cancel_drift_cents_hedge.max(1)
+    } else {
+        cfg.cancel_drift_cents.max(1)
+    }
+}
+
+fn passive_strong_price(cfg: &Config, m: &Market, side: Side) -> Option<u8> {
+    // Only quote the strong side if it improves current pair-cost by at least N cc
+    // (cents - cents). This makes strong sdie fills rare unless its a "great price".
+    let old_pc = m.pos.pair_cost_cc()?;
+    let min_improve = cfg.dual_strong_min_improve_cc.max(0);
+    let cap_cc = old_pc.saturating_sub(min_improve);
+
+    let top = top_maker_price(cfg, m, side)?;
+    let max_price = top.saturating_sub(cfg.dual_strong_backoff_cents);
+
+    // Search downwards (we allow going deep; if want to constrain, use min bound)
+    best_price_under_pair_cap(m, side, max_price, 0, cap_cc, false)
+}
+
 fn stage_place_order(
     ticker: &str,
     m: &mut Market,
@@ -229,11 +258,18 @@ fn taper_factor(t_rem: i64, window_s: i64) -> f64 {
     (t_rem as f64 / w).clamp(0.0, 1.0)
 }
 
-fn allowed_imbalance(cfg: &Config, t_rem: i64) -> f64 {
-    if t_rem <= cfg.balance_s {
+fn allowed_imbalance(cfg: &Config, t_rem: i64, total: i64) -> f64 {
+    let base = if t_rem <= cfg.balance_s {
         cfg.late_imbalance_cap
     } else {
         cfg.early_imbalance_cap
+    };
+
+    // For small totals, ration swings to much; relax to at least higher cap
+    if total < cfg.imbalance_min_total {
+        base.max(cfg.imbalance_cap_small_total)
+    } else {
+        base
     }
 }
 
@@ -464,7 +500,8 @@ fn cancel_side_if_allowed(
 /// 2) If one-sided: buy missing side
 /// 3) If both sides exist: pick the side with best simulated pair-cost improvement
 fn choose_working_side_simple(cfg: &Config, m: &Market, t_rem: i64) -> Side {
-    let imbalance_cap = allowed_imbalance(cfg, t_rem);
+    let total = total_qty(m);
+    let imbalance_cap = allowed_imbalance(cfg, t_rem, total);
 
     // If we're forced to balance, always hedge.
     if m.mode == Mode::Balance || m.pos.imbalance_ratio() > imbalance_cap {
@@ -628,7 +665,8 @@ fn maybe_opportunistic_taker(
         return Some(cmd);
     }
 
-    let imbalance_cap = allowed_imbalance(cfg, t_rem);
+    let total = total_qty(m);
+    let imbalance_cap = allowed_imbalance(cfg, t_rem, total);
     let must_balance = m.mode == Mode::Balance || m.pos.imbalance_ratio() > imbalance_cap;
     let hedge = hedge_side(m);
     let desperate = must_balance && t_rem <= cfg.taker_desperate_s;
@@ -684,8 +722,11 @@ fn maybe_opportunistic_taker(
             continue;
         };
 
-        let cap_when_balancing = if old_pc <= cap_target {
-            cap_target // once under target, never exceed target
+        let unbalanced = !m.pos.is_balanced();
+        let cap_when_balancing = if unbalanced {
+            cap_balance
+        } else if old_pc <= cap_target {
+            cap_target
         } else {
             cap_balance // above target, allow balance cap behavior
         };
@@ -770,14 +811,26 @@ fn maybe_maker_quote(
     let cap_safe = cfg.safe_pair_cc;
     let cap_balance = cfg.balance_pair_cc.clamp(0,DOLLAR_CC);
 
-    let top = top_maker_price(cfg, m, desired_side)?;
+    let mut top = top_maker_price(cfg, m, desired_side)?;
+
+    // If we're quoting the hedge side while meaningfully imbalanced,
+    // push quote up to ask-1 (still post-only) so it actually fills.
+    // This is the more competitive bid on the short side
+    let hedge = hedge_side(m);
+    if desired_side == hedge && m.pos.imbalance_ratio() >= cfg.hedge_force_ask_minus_one_imbalance {
+        if let Some(ask) = m.book.implied_ask(desired_side) {
+            if ask > 0 {
+                top = top.max(ask.saturating_sub(1)).min(cfg.max_buy_price_cents);
+            }
+        }
+    }
     let min_price = top.saturating_sub(cfg.maker_max_edge_cents);
 
     // ----------BOOTSTRAP MAKER QUOTE------------
     if !has_pair(m) {
         // Flat: just quote near top maker price on desired_side.
         if m.pos.yes_qty == 0 && m.pos.no_qty == 0 {
-            return place_or_manage_resting(cfg, ticker, m, now, desired_side, top);
+            return place_or_manage_resting(cfg, ticker, m, now, desired_side, top, 1);
         }
 
         // one-sided bootstrap:
@@ -797,14 +850,14 @@ fn maybe_maker_quote(
             }
             // Allow "deep" quotes in bootstrap (do NOT enforce maker_max_edge here)
             let p = top.min(max_missing);
-            return place_or_manage_resting(cfg, ticker, m,  now, desired_side, p);
+            return place_or_manage_resting(cfg, ticker, m,  now, desired_side, p, 1);
         } else {
             // Rescue-buy side: only if it improves avg and we haven't exceeded max one sided qty
             if qty_for(m, existing) >= cfg.bootstrap_max_one_side_qty {
                 return None;
             }
             let (p, _improve) = can_rescue_existing(cfg, m, existing)?;
-            return place_or_manage_resting(cfg, ticker, m, now, desired_side, p);
+            return place_or_manage_resting(cfg, ticker, m, now, desired_side, p, 1);
         }
     }
 
@@ -818,7 +871,10 @@ fn maybe_maker_quote(
     // Balance-mode ratchet:
     // - if we're already under target, NEVER allow maker fills to push us above target
     // - otherwise, use the looser balance cap
-    let cap_when_balancing = if old_pc <= cap_target {
+    let unbalanced = !m.pos.is_balanced();
+    let cap_when_balancing = if unbalanced {
+        cap_balance
+    } else if old_pc <= cap_target {
         cap_target
     } else {
         cap_balance
@@ -890,7 +946,7 @@ fn maybe_maker_quote(
 //     let p = p_opt?;
     let desired_qty = qty;
 
-    let (p, qty) = best_maker_price_and_qty_under_cap(
+    let mut quote = best_maker_price_and_qty_under_cap(
         cfg,
         m,
         desired_side,
@@ -899,7 +955,26 @@ fn maybe_maker_quote(
         cap_cc,
         require_noworse,
         desired_qty,
-    )?;
+    );
+
+    // if quote.is_none() {
+    //     tracing::debug!(
+    //         ticker = %ticker,
+    //         mode = ?m.mode,
+    //         desired_side = ?desired_side,
+    //         yes_qty = m.pos.yes_qty,
+    //         no_qty = m.pos.no_qty,
+    //         imbalance = m.pos.imbalance_ratio(),
+    //         old_pair_cc = ?m.pos.pair_cost_cc(),
+    //         cap_cc = cap_cc,
+    //         require_noworse = require_noworse,
+    //         top = top,
+    //         min_price = min_price,
+    //         maker_max_edge_cents = cfg.maker_max_edge_cents,
+    //         "maker_quote: no feasible (price,qty) found under cap in band"
+    //     );
+    // }
+    let (p, qty) = quote?;
    
     // 4) If we already have a resting order on this side, manage it.
     if let Some(existing) = m.resting_hint(desired_side).as_ref().cloned() {
@@ -930,7 +1005,8 @@ fn maybe_maker_quote(
         }
 
         let drift = existing.price_cents.abs_diff(p);
-        let should_cancel = drift >= cfg.cancel_drift_cents || want_upsize;
+        let drift_threshold = drift_threshold_cents(cfg, m, desired_side);
+        let should_cancel = drift >= drift_threshold || want_upsize;
 
         if should_cancel {
             let Some(order_id) = existing.order_id.clone() else { return None; };
@@ -945,14 +1021,19 @@ fn maybe_maker_quote(
             });
         }
         // tracing::debug!(
-        //     ?desired_side,
-        //     top,
-        //     min_price,
-        //     cap_cc,
-        //     require_noworse,
-        //     desired_qty,
-        //     old_pc,
-        //     "maker_quote: no feasible (price,qty) found"
+        //     ticker = %ticker,
+        //     mode = ?m.mode,
+        //     yes_qty = m.pos.yes_qty,
+        //     no_qty = m.pos.no_qty,
+        //     imbalance = m.pos.imbalance_ratio(),
+        //     old_pair_cc = ?m.pos.pair_cost_cc(),
+        //     best_bid_yes = ?m.book.best_bid(Side::Yes),
+        //     best_bid_no  = ?m.book.best_bid(Side::No),
+        //     implied_ask_yes = ?m.book.implied_ask(Side::Yes),
+        //     implied_ask_no  = ?m.book.implied_ask(Side::No),
+        //     resting_yes = ?m.resting_hint(Side::Yes).as_ref().map(|h| (h.price_cents, h.order_id.is_some())),
+        //     resting_no  = ?m.resting_hint(Side::No).as_ref().map(|h| (h.price_cents, h.order_id.is_some())),
+        //     "decide: no action (no cancel, no taker, no maker)"
         // );
         return None;
     }
@@ -989,9 +1070,16 @@ fn place_or_manage_resting(
     now: Instant,
     side: Side,
     p: u8,
+    qty: u64,
 ) -> Option<ExecCommand> {
     if let Some(existing) = m.resting_hint(side).as_ref().cloned() {
-        if existing.price_cents == p {
+        let existing_remaining = m.orders.by_client
+            .get(&existing.client_order_id)
+            .map(|r| r.qty.saturating_sub(r.filled_qty))
+            .unwrap_or(1);
+        
+        let want_upsize = qty > existing_remaining;
+        if existing.price_cents == p && !want_upsize {
             return None;
         }
 
@@ -1008,7 +1096,8 @@ fn place_or_manage_resting(
         }
 
         let drift = existing.price_cents.abs_diff(p);
-        if drift >= cfg.cancel_drift_cents {
+        let drift_threshold = drift_threshold_cents(cfg, m, side);
+        if drift >= drift_threshold || want_upsize {
             let Some(order_id) = existing.order_id.clone() else {
                 return None;
             };
@@ -1024,7 +1113,7 @@ fn place_or_manage_resting(
     }
 
     let (client_order_id, cmd) = stage_place_order(
-        ticker, m, now, side, p, 1, Tif::Gtc, true
+        ticker, m, now, side, p, qty.max(1), Tif::Gtc, true
     );
 
     let queue_ahead = match side {
@@ -1071,8 +1160,23 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     };
 
     // determine if we're in must balance
-    let imbalance_cap = allowed_imbalance(cfg, t_rem);
+    let total = total_qty(m);
+    let imbalance_cap = allowed_imbalance(cfg, t_rem, total);
     let must_balance = m.mode == Mode::Balance || m.pos.imbalance_ratio() > imbalance_cap;
+
+    // Skew qutoing when meaningfully imbalanced (but not must_balance):
+    // - primary = hedge side (short side) gets competitive maker management
+    // - secondary (strong side) gets weak quote only if it materially improve pair cost
+    let skew = has_pair(m)
+        && !must_balance
+        && total >= cfg.skew_min_total
+        && m.pos.imbalance_ratio() >= cfg.skew_imbalance_start;
+
+    let primary_side = if skew && has_pair(m) {
+        hedge_side(m)
+    } else {
+        desired_side
+    };
 
     // if must-balance, proactively cancel the non-hedge side maker (if present)
     if has_pair(m) && must_balance {
@@ -1094,19 +1198,41 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
     }
 
     // 2) Maker quoting on desired side (resting) with churn control.
-    if let Some(cmd) = maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, desired_side) {
+    if let Some(cmd) = maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, primary_side) {
         return Some(cmd);
     }
 
-    // 3) dual quote if were withing allowed balance and 1-lot fill on the secondary side
-    // stays within cap
-    if has_pair(m) && !must_balance {
-        if m.pos.imbalance_ratio() <= imbalance_cap {
-            let other = desired_side.other();
-            // would a single fill on other side violate imbalance rule
-            let would = m.pos.simulate_buy(other, 0, 1);
-            if would.imbalance_ratio() <= imbalance_cap {
-                return maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, other);
+    // 3) dual quote: keep the other side quoted too
+    if has_pair(m) && !must_balance && m.pos.imbalance_ratio() <= imbalance_cap {
+        let other = desired_side.other();
+
+        // would a on the other side violate imbalance constraints?
+        // use the actual qty we would place on that side:
+        let other_qty: i64 = if skew {
+            // In skew mode, "other" is the strong side
+            cfg.dual_strong_qty.max(1) as i64
+        } else {
+            1
+        };
+
+        let would = m.pos.simulate_buy(other, 0, other_qty);
+        if would.imbalance_ratio() <= imbalance_cap {
+            if skew {
+                // Strong side quote: only if it material improves pair-cost
+                if let Some(p_strong) = passive_strong_price(cfg, m, other) {
+                    return place_or_manage_resting(
+                        cfg,
+                        ticker,
+                        m,
+                        now,
+                        other,
+                        p_strong,
+                        cfg.dual_strong_qty,
+                    );
+                }
+            } else {
+            // Near-balanced: normal quote on the other side too
+            return maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, other);
             }
         }
     }
