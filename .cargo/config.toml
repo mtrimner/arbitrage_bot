@@ -1,3 +1,4 @@
 [env]
 RUST_LOG = "debug"
 EXEC_MODE = "paper"
+RESULTS_FILE = "results.csv"

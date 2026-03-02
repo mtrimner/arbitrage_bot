@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::{collections::HashMap, sync::Arc};
 use tokio::{sync::mpsc, time::{self, Duration}};
-use tracing::info;
+use tracing::{info, warn};
 
 use kalshi_rs::KalshiClient;
 use kalshi_rs::markets::models::MarketsQuery;
@@ -21,7 +21,6 @@ use kalshi_rs::markets::models::MarketsQuery;
 use crate::config::Config;
 use crate::state::Shared;
 use crate::types::{ExecCommand, Side, WsMarketCommand};
-
 
 #[derive(Debug, Clone)]
 pub struct ActiveMarketMeta {
@@ -208,6 +207,35 @@ pub async fn run_market_manager(
                 seed_shared_times(&shared, &[next.clone()]).await?;
                 active_by_series.insert(series.clone(), next);
                 continue;
+            }
+
+            // NEW: snapshot old ticker position and write end-of-window results
+            let ts_arc = shared
+                .tickers
+                .get(&cur.market_ticker)
+                .map(|r| r.value().clone());
+
+            if let Some(ts) = ts_arc {
+                let pos = {
+                    let g = ts.mkt.read().await;
+                    g.pos.clone()
+                };
+
+                if let Err(e) = crate::report::append_result_csv(
+                    cfg.results_file.as_str(),
+                    cur.open_ts,
+                    cur.close_ts,
+                    &pos,
+                )
+                .await
+                {
+                    warn!(
+                        series = %cur.series_ticker,
+                        ticker = %cur.market_ticker,
+                        err = ?e,
+                        "failed to append window results"
+                    );
+                }
             }
 
             // 1) Ensure NEW ticker exists in Shared and seed times (so WS snapshot won't be dropped)

@@ -128,6 +128,8 @@ pub struct Config {
     /// NOTE: this is only the *desired* qty. The maker price/qty chooser may still fall
     /// back to a smaller qty (down to 1) if larger sizes can't be priced under cap.
     pub short_side_min_order_qty: u64,
+
+    pub results_file: String,
 }
 
 impl Default for Config {
@@ -194,7 +196,9 @@ impl Default for Config {
             taker_desperate_s: 120,     // last 120s
             taker_big_improve_cc: 100, // 1.00 cent improvement in pair-cost
 
-            short_side_min_order_qty: 3
+            short_side_min_order_qty: 6,
+
+            results_file: "results.csv".to_string(),
         }
     }
 }
@@ -204,6 +208,10 @@ impl Config {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
         cfg.exec_mode = ExecMode::from_env();
+
+        if let Ok(v) = env::var("RESULTS_FILE") {
+            cfg.results_file = v;
+        }
         cfg
     }
 }
