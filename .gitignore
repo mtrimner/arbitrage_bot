@@ -1,3 +1,5 @@
 /target
 private_keys
 .env
+
+results.csv
