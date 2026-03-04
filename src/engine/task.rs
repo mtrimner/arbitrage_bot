@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 
@@ -30,7 +30,10 @@ pub async fn run_engine(cfg: Config, shared: Shared, tx: mpsc::Sender<ExecComman
             };
 
             if let Some(cmd) = cmd {
-                let _ = tx.try_send(cmd);
+                if let Err(e) = tx.send(cmd).await {
+                    return Err(anyhow!("exec channel closed: {e}"));
+                }
+                
             }
         }
     }

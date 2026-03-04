@@ -8,10 +8,70 @@ use crate::state::ticker::{Market, Mode};
 use crate::types::{ExecCommand, RestingHint, Side, Tif, CC_PER_CENT};
 
 const DOLLAR_CC: i64 = 100 * CC_PER_CENT; // 10000
+const MAX_CAP_CC: i64 = 200 * CC_PER_CENT; // generous safety clamp for caps
 
 fn total_qty(m: &Market) -> i64 {
     // Defensive: position qty fields are i64; we expect non-negative, but clamp anyway.
     (m.pos.yes_qty.max(0) + m.pos.no_qty.max(0)).max(1)
+}
+
+fn unhedged_qty(m: &Market) -> i64 {
+    (m.pos.yes_qty - m.pos.no_qty).abs().max(0)
+}
+
+fn allowed_unhedged_qty(cfg: &Config, m: &Market) -> i64 {
+    if m.mode == Mode::Balance {
+        cfg.max_unhedged_qty_late.max(0)
+    } else {
+        cfg.max_unhedged_qty_early.max(0)
+    }
+}
+
+/// Dynamic Balance cap: linearly ramp from `balance_pair_cc` at start of Balance
+/// to `final_balance_pair_cc` at expiry.
+fn dynamic_balance_cap_cc(cfg: &Config, t_rem: i64) -> i64 {
+    let start = cfg.balance_pair_cc;
+    let end = cfg.final_balance_pair_cc;
+
+    let bal = cfg.balance_s.max(1);
+    let elapsed = (bal - t_rem).clamp(0, bal) as f64;
+    let frac = (elapsed / bal as f64).clamp(0.0, 1.0);
+
+    let cap = (start as f64 + (end - start) as f64 * frac).round() as i64;
+    cap.clamp(0, MAX_CAP_CC)
+}
+
+/// Strict cap used for "profit-seeking" trading in Balance mode.
+/// Never allow > $1 here.
+fn strict_balance_cap_cc(cfg: &Config) -> i64 {
+    cfg.balance_pair_cc.clamp(0, DOLLAR_CC)
+}
+
+/// Closeout cap used ONLY when we must flatten (IOC hedge).
+/// In the last `taker_desperate_s` seconds, we allow up to `final_balance_pair_cc`.
+fn closeout_cap_cc(cfg: &Config, t_rem: i64) -> i64 {
+    if t_rem <= cfg.taker_desperate_s {
+        cfg.final_balance_pair_cc.clamp(0, MAX_CAP_CC)
+    } else {
+        // outside closeout, never allow negative pairs via IOC
+        dynamic_balance_cap_cc(cfg, t_rem).clamp(0, DOLLAR_CC)
+    }
+}
+
+fn should_freeze_trading(cfg: &Config, m: &Market, t_rem: i64) -> bool {
+    if cfg.freeze_if_balanced_s <= 0 {
+        return false;
+    }
+    if t_rem > cfg.freeze_if_balanced_s {
+        return false;
+    }
+    if !m.pos.is_balanced() {
+        return false;
+    }
+    match m.pos.pair_cost_cc() {
+        Some(pc) => pc <= cfg.target_pair_cc,
+        None => false,
+    }
 }
 
 fn drift_threshold_cents(cfg: &Config, m: &Market, side: Side) -> u8 {
@@ -553,6 +613,41 @@ fn cancel_side_if_allowed(
     })
 }
 
+/// Force-cancel helper:
+/// - ignores `min_resting_life_ms` (inventory safety comes first)
+/// - still respects `cancel_retry_ms`
+/// - if order_id is not known yet, we mark `cancel_requested_at` and retry once it appears
+fn cancel_side_force(
+    cfg: &Config,
+    ticker: &str,
+    m: &mut Market,
+    now: Instant,
+    side: Side,
+) -> Option<ExecCommand> {
+    let Some(h) = m.resting_hint(side).as_ref().cloned() else { return None; };
+
+    if let Some(t0) = h.cancel_requested_at {
+        let since = now.duration_since(t0).as_millis() as u64;
+        if since < cfg.cancel_retry_ms {
+            return None;
+        }
+    }
+
+    if let Some(hm) = m.resting_hint_mut(side).as_mut() {
+        hm.cancel_requested_at = Some(now);
+    }
+
+    let Some(order_id) = h.order_id.clone() else {
+        // Can't send cancel yet; we'll retry once exec fills in order_id.
+        return None;
+    };
+
+    Some(ExecCommand::CancelOrder {
+        ticker: ticker.to_string(),
+        order_id,
+    })
+}
+
 /// Signal-free working side selection, but "pair-cost smart".
 /// Chooses the side that would most reduce avg_yes+avg_no if a 1-lot maker fill happens.
 ///
@@ -733,7 +828,7 @@ fn maybe_opportunistic_taker(
     let desperate = must_balance && t_rem <= cfg.taker_desperate_s;
 
     let cap_target = cfg.target_pair_cc;
-    let cap_balance = cfg.balance_pair_cc.clamp(0,DOLLAR_CC);
+    let cap_balance = strict_balance_cap_cc(cfg);
     let old_pc = m.pos.pair_cost_cc().unwrap_or(i64::MAX);
 
     // Same "improvement-mode" cap as maker quoting to somparison is fair
@@ -856,6 +951,61 @@ fn maybe_opportunistic_taker(
 
 }
 
+/// Balance-mode IOC hedge: try to close the absolute gap on the short side.
+/// Only used when we are already paired.
+fn maybe_balance_ioc(
+    cfg: &Config,
+    ticker: &str,
+    m: &mut Market,
+    now: Instant,
+    t_rem: i64,
+    hedge: Side,
+    gap: i64,
+) -> Option<ExecCommand> {
+    if gap <= 0 {
+        return None;
+    }
+
+    // Optional maker-first grace (unless we're truly desperate).
+    if t_rem > cfg.taker_desperate_s {
+        if let Some(h) = m.resting_hint(hedge).as_ref() {
+            let age_ms = now.duration_since(h.created_at).as_millis() as u64;
+            if age_ms < cfg.maker_first_ms {
+                return None;
+            }
+        }
+    }
+
+    let Some(ask) = m.book.implied_ask(hedge) else { return None; };
+    if ask > cfg.max_buy_price_cents {
+        return None;
+    }
+
+    if let Some(last) = last_taker(m, hedge) {
+        if (now.duration_since(last).as_millis() as u64) < cfg.taker_cooldown_ms {
+            return None;
+        }
+    }
+
+    let qty = (gap as u64)
+        .max(1)
+        .min(cfg.max_order_qty.max(1));
+
+    // Closeou cap: ONLY here do we allow >$1, so we can gaurentee flattening.
+    let cap = closeout_cap_cc(cfg, t_rem);
+    let sim = m.pos.simulate_buy(hedge, ask, qty as i64);
+    let Some(new_pc) = sim.pair_cost_cc() else { return None; };
+    if new_pc > cap {
+        return None;
+    }
+
+    let (_client_order_id, cmd) = stage_place_order(
+        ticker, m, now, hedge, ask, qty, Tif::Ioc, false
+    );
+    set_last_taker(m, hedge, now);
+    Some(cmd)
+}
+
 /// Maker quote logic:
 /// Maintain at most one resting order, don’t churn, and keep prices within pair-cost constraints.
 fn maybe_maker_quote(
@@ -870,7 +1020,7 @@ fn maybe_maker_quote(
 
     let cap_target = cfg.target_pair_cc;
     let cap_safe = cfg.safe_pair_cc;
-    let cap_balance = cfg.balance_pair_cc.clamp(0,DOLLAR_CC);
+    let cap_balance = strict_balance_cap_cc(cfg);
 
     let mut top = top_maker_price(cfg, m, desired_side)?;
 
@@ -878,14 +1028,20 @@ fn maybe_maker_quote(
     // push quote up to ask-1 (still post-only) so it actually fills.
     // This is the more competitive bid on the short side
     let hedge = hedge_side(m);
-    if desired_side == hedge && m.pos.imbalance_ratio() >= cfg.hedge_force_ask_minus_one_imbalance {
+    let gap = unhedged_qty(m);
+    if desired_side == hedge &&gap >= cfg.hedge_force_ask_minus_one_gap.max(1) {
         if let Some(ask) = m.book.implied_ask(desired_side) {
             if ask > 0 {
                 top = top.max(ask.saturating_sub(1)).min(cfg.max_buy_price_cents);
             }
         }
     }
-    let min_price = top.saturating_sub(cfg.maker_max_edge_cents);
+    let maker_edge = if m.mode == Mode::Balance && !m.pos.is_balanced() {
+        cfg.maker_max_edge_cents_balance
+    } else {
+        cfg.maker_max_edge_cents
+    };
+    let min_price = top.saturating_sub(maker_edge);
 
     // ----------BOOTSTRAP MAKER QUOTE------------
     if !has_pair(m) {
@@ -1074,7 +1230,7 @@ fn maybe_maker_quote(
         // Decide where you want sticky-down active.
         // A good default: onl do sticky-down on the hedge (short) side.
         let hedge = hedge_side(m);
-        let sticky_down = (m.pos.yes_cost_cc != m.pos.no_qty) && desired_side == hedge;
+        let sticky_down = !m.pos.is_balanced() && desired_side == hedge;
 
         // Safety check: if we kept the existing order and it filled,
         // would it violate our CURRENT capp_cc/required_noworse rules?
@@ -1258,97 +1414,101 @@ pub fn decide(cfg: &Config, ticker: &str, m: &mut Market) -> Option<ExecCommand>
 
     // Mode uses actual window_s (not cfg.window_s).
     m.mode = pick_mode(cfg, t_rem, window_s);
-    // println!("Current Mode: {:#?}", m.mode);
-
-    let desired_side = if has_pair(m) {
-        choose_working_side_simple(cfg, m, t_rem)
-    } else {
-        choose_bootstrap_side_simple(cfg, m)
-    };
-
-    // determine if we're in must balance
-    let total = total_qty(m);
-    let imbalance_cap = allowed_imbalance(cfg, t_rem, total);
-    let must_balance = m.mode == Mode::Balance || m.pos.imbalance_ratio() > imbalance_cap;
-
-    // Skew qutoing when meaningfully imbalanced (but not must_balance):
-    // - primary = hedge side (short side) gets competitive maker management
-    // - secondary (strong side) gets weak quote only if it materially improve pair cost
-    let skew = has_pair(m)
-        && !must_balance
-        && total >= cfg.skew_min_total
-        && m.pos.imbalance_ratio() >= cfg.skew_imbalance_start;
-
-    let primary_side = if skew && has_pair(m) {
-        hedge_side(m)
-    } else {
-        desired_side
-    };
-
-    // if must-balance, proactively cancel the non-hedge side maker (if present)
-    if has_pair(m) && must_balance {
-        let hedge = hedge_side(m);
-        let wrong_side = hedge.other();
-        if let Some(cmd) = cancel_side_if_allowed(cfg, ticker, m, now, wrong_side) {
+    // --------- Freeze endgame: if we're "done", stop risking imbalance ----------
+    if should_freeze_trading(cfg, m, t_rem) {
+        // Cancel both sides (one per tick) then stop.
+        if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, Side::Yes) {
             return Some(cmd);
         }
+        if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, Side::No) {
+            return Some(cmd);
+        }
+        return None;
     }
 
-    // 0) Cancel stale resting orders (but never churn fast).
+    // ---------------- BOOTSTRAP (missing a leg) ----------------
+    if !has_pair(m) {
+        if let Some(cmd) = cancel_stale_if_needed(cfg, ticker, m, now) {
+            return Some(cmd);
+        }
+
+        let desired = choose_bootstrap_side_simple(cfg, m);
+
+        // Bootstrap taker is still allowed (existing logic).
+        if let Some(cmd) = maybe_opportunistic_taker(cfg, ticker, m, now, t_rem, window_s, desired) {
+            return Some(cmd);
+        }
+
+        if let Some(cmd) = maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, desired) {
+            return Some(cmd);
+        }
+
+        // If totally flat (0/0), quote the other side too to start the first pair faster.
+        if m.pos.yes_qty == 0 && m.pos.no_qty == 0 {
+            if let Some(cmd) = maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, desired.other()) {
+                return Some(cmd);
+            }
+        }
+
+        return None;
+    }
+
+    // ---------------- PAIRED (Policy C inventory control) ----------------
+    let gap = unhedged_qty(m);
+    let allowed_gap = allowed_unhedged_qty(cfg, m);
+
+    if gap > allowed_gap {
+        let hedge = hedge_side(m);
+        let strong = hedge.other();
+
+        // 1) Stop the strong side from getting longer.
+        if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, strong) {
+            return Some(cmd);
+        }
+
+        // 2) Housekeeping
+        if let Some(cmd) = cancel_stale_if_needed(cfg, ticker, m, now) {
+            return Some(cmd);
+        }
+
+        // 3) In Balance mode: if we're still unbalanced late, try IOC hedges first.
+        let force_ioc = m.mode == Mode::Balance
+            && (t_rem <= cfg.taker_desperate_s || gap >= cfg.taker_force_gap.max(1));
+
+        if force_ioc {
+            if let Some(cmd) = maybe_balance_ioc(cfg, ticker, m, now, t_rem, hedge, gap) {
+                return Some(cmd);
+            }
+        }
+
+        // 4) Default: maker quote only the hedge side.
+        return maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, hedge);
+    }
+
+    // Balanced-enough: quote BOTH sides to accumulate paired inventory.
     if let Some(cmd) = cancel_stale_if_needed(cfg, ticker, m, now) {
         return Some(cmd);
     }
 
-    // 1) Opportunistic taker (cost-driven): if ask is cheap enough to improve/keep caps.
-    if let Some(cmd) = maybe_opportunistic_taker(cfg, ticker, m, now, t_rem, window_s, desired_side) {
-        return Some(cmd);
-    }
-
-    // 2) Maker quoting on desired side (resting) with churn control.
-    if let Some(cmd) = maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, primary_side) {
-        return Some(cmd);
-    }
-
-    // 3) dual quote: keep the other side quoted too
-    if has_pair(m) && !must_balance && m.pos.imbalance_ratio() <= imbalance_cap {
-        let hedge = hedge_side(m);
-        let strong = hedge.other();
-        let other = if skew { 
-            strong 
-        } else {
-            primary_side.other()
-        };
-
-        // would a on the other side violate imbalance constraints?
-        // use the actual qty we would place on that side:
-        let other_qty: i64 = if skew {
-            // In skew mode, "other" is the strong side
-            cfg.dual_strong_qty.max(1) as i64
-        } else {
-            1
-        };
-
-        let would = m.pos.simulate_buy(other, 0, other_qty);
-        if would.imbalance_ratio() <= imbalance_cap {
-            if skew {
-                // Strong side quote: only if it material improves pair-cost
-                if let Some(p_strong) = passive_strong_price(cfg, m, other) {
-                    return place_or_manage_resting(
-                        cfg,
-                        ticker,
-                        m,
-                        now,
-                        other,
-                        p_strong,
-                        cfg.dual_strong_qty,
-                        true, // sticky on downward moves
-                    );
-                }
-            } else {
-            // Near-balanced: normal quote on the other side too
-            return maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, other);
-            }
+    // Closeout phase: once we enter the taker-desperate window, DO NOT start new pairs.
+    // If we're balanced, cancel any resting orders and sit flat so we don't end 1-off again.
+    if m.mode == Mode::Balance && t_rem <= cfg.taker_desperate_s && m.pos.is_balanced() {
+        if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, Side::Yes) {
+            return Some(cmd);
         }
+        if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, Side::No) {
+            return Some(cmd);
+        }
+        return None;
     }
+
+    let primary = choose_working_side_simple(cfg, m, t_rem);
+    if let Some(cmd) = maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, primary) {
+        return Some(cmd);
+    }
+    if let Some(cmd) = maybe_maker_quote(cfg, ticker, m, now, t_rem, window_s, primary.other()) {
+        return Some(cmd);
+    }
+
     None
 }

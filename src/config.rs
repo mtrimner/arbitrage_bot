@@ -62,6 +62,9 @@ pub struct Config {
     // - balance_pair_cc: allowed avg_yes+avg_no when forcing balance near the end
     pub bootstrap_pair_cc: i64,
     pub balance_pair_cc: i64,
+    /// In Balance mode, we ramp the pair-cost cap from `balance_pair_cc` (start of Balance)
+    /// up to this value (at expiry) so we can finish hedged.
+    pub final_balance_pair_cc: i64,
 
     // One-sided “rescue” behavior:
     // - max unhedged qty allowed while waiting for the other side
@@ -78,11 +81,20 @@ pub struct Config {
     pub imbalance_min_total: i64,
     pub imbalance_cap_small_total: f64,
 
+    /// Max allowed absolute |yes-no| during Accumulate/Hedge.
+    /// Set to 0 for "always snap back to perfectly balanced".
+    pub max_unhedged_qty_early: i64,
+    /// Max allowed absolute |yes-no| during Balance (near the end).
+    pub max_unhedged_qty_late: i64,
+
+    /// If we're balanced and already under `target_pair_cc` in the last N seconds,
+    /// cancel any resting orders and stop trading to avoid getting unbalanced again.
+    pub freeze_if_balanced_s: i64,
+
     // Dynamic sizing (catch-up)
     pub max_order_qty: u64,            // hard safety cap
     pub catchup_aggressiveness: f64,   // 0.0..1.0 how fast to catch up
     pub catchup_balance_boost: f64,    // multiplier in Balance mode
-
 
     // Resting order management
     pub cancel_stale_ms: u64,        // cancel resting orders older than this
@@ -90,6 +102,8 @@ pub struct Config {
     pub cancel_retry_ms: u64,        // if we sent cancel already, wait this long to retry
     pub cancel_drift_cents: u8,      // if desired quote moves away from current resting price by >= this, consider requote
     pub maker_max_edge_cents: u8,    // don’t quote more than this below “top maker price” (avoids super-low bids that never fill)
+    /// Wider edge band in Balance mode (lets us park deeper hedge-side bids under a tight cap).
+    pub maker_max_edge_cents_balance: u8,
     pub maker_qty_price_tol_cents: u8,          // price-vs-qty tolerance when choosing (price,qty) under cap (normal)
     pub maker_qty_price_tol_cents_balance: u8,  // same tolerance in Balance mode
 
@@ -104,6 +118,9 @@ pub struct Config {
 
     // If desired_side == hedge and imbalance_ratio >= this, push quote up to ask-1 (still post-only).
     pub hedge_force_ask_minus_one_imbalance: f64,
+    /// Absolute-gap version of `hedge_force_ask_minus_one_imbalance`.
+    /// When |yes-no| >= this, push hedge-side maker quotes up to ask-1 (still post-only).
+    pub hedge_force_ask_minus_one_gap: i64,
 
     // Strong-side passive quote constraints
     pub dual_strong_min_improve_cc: i64, // require at least this much pair-cost improvement (cent-cents)
@@ -120,6 +137,8 @@ pub struct Config {
     pub maker_first_ms: u64,      // wait this long for a resting maker to work
     pub taker_desperate_s: i64,   // only force IOC in last N seconds of Balance
     pub taker_big_improve_cc: i64, // allow IOC early only for huge improvements
+    /// If the absolute gap is this large in Balance mode, allow IOC hedges earlier.
+    pub taker_force_gap: i64,
 
     // --- Short-side sizing ---
     /// When we are buying the **short** side (gap > 0), try at least this many contracts.
@@ -157,7 +176,11 @@ impl Default for Config {
 
             bootstrap_pair_cc: 10100, // $1.01
             balance_pair_cc: 9925, // $0.99.25
- 
+
+            // Endgame safety valve: allow small loss *only* to guarantee we end hedged.
+            // 10100 = allow up to $1.01 average pair cost during forced closeout.
+            // (Tune: 10025, 10050, 10100...)
+            final_balance_pair_cc: 10100,
             bootstrap_max_one_side_qty: 5,
             bootstrap_rescue_min_improve_cc: 500,
 
@@ -166,6 +189,11 @@ impl Default for Config {
 
             imbalance_min_total: 20,
             imbalance_cap_small_total: 0.50,
+
+            // Keep inventory essentially flat
+            max_unhedged_qty_early: 0,
+            max_unhedged_qty_late: 0,
+            freeze_if_balanced_s: 240,
 
             max_order_qty: 25,
             catchup_aggressiveness: 0.45,
@@ -176,6 +204,7 @@ impl Default for Config {
             cancel_retry_ms: 800,
             cancel_drift_cents: 3,
             maker_max_edge_cents: 15,
+            maker_max_edge_cents_balance: 40,
             // If qty>1 forces you to quote much lower, stick to smaller qty near top
             maker_qty_price_tol_cents: 2,
             maker_qty_price_tol_cents_balance: 1,
@@ -184,6 +213,7 @@ impl Default for Config {
             skew_imbalance_start: 0.05,
             cancel_drift_cents_hedge: 1,
             hedge_force_ask_minus_one_imbalance: 0.10,
+            hedge_force_ask_minus_one_gap: 2,
             dual_strong_min_improve_cc: 20, // 0.20 cents
             dual_strong_backoff_cents: 3,
             dual_strong_qty: 1,
@@ -195,7 +225,7 @@ impl Default for Config {
             maker_first_ms: 1500,      // 1.5s
             taker_desperate_s: 120,     // last 120s
             taker_big_improve_cc: 100, // 1.00 cent improvement in pair-cost
-
+            taker_force_gap: 3,
             short_side_min_order_qty: 6,
 
             results_file: "results.csv".to_string(),
