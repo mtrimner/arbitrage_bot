@@ -2,3 +2,6 @@
 RUST_LOG = "debug"
 EXEC_MODE = "paper"
 RESULTS_FILE = "results.csv"
+COINBASE_WS = "false"
+COINBASE_PRODUCT_ID = "BTC-USD"
+COINBASE_LOG_DELTA_USD = "5"

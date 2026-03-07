@@ -148,6 +148,15 @@ pub struct Config {
     /// back to a smaller qty (down to 1) if larger sizes can't be priced under cap.
     pub short_side_min_order_qty: u64,
 
+    // --- Coinbase price feed (optional, for lead/lag validation) ---
+    /// Enable Coinbase websocket ticker feed (BTC-USD by default).
+    pub coinbase_ws_enabled: bool,
+    /// Coinbase product id, e.g. "BTC-USD"
+    pub coinbase_product_id: String,
+    /// Only log Coinbase updates when price moves at least this much (USD)
+    pub coinbase_log_delta_usd: f64,
+
+
     pub results_file: String,
 }
 
@@ -171,10 +180,10 @@ impl Default for Config {
             maker_improve_tick_balance: 99,
             max_buy_price_cents: 99,
 
-            safe_pair_cc: 9875,
-            target_pair_cc: 9825,
+            safe_pair_cc: 9950,
+            target_pair_cc: 9900,
 
-            bootstrap_pair_cc: 10100, // $1.01
+            bootstrap_pair_cc: 9950, // $1.01
             balance_pair_cc: 9925, // $0.99.25
 
             // Endgame safety valve: allow small loss *only* to guarantee we end hedged.
@@ -191,16 +200,16 @@ impl Default for Config {
             imbalance_cap_small_total: 0.50,
 
             // Keep inventory essentially flat
-            max_unhedged_qty_early: 0,
+            max_unhedged_qty_early: 1,
             max_unhedged_qty_late: 0,
-            freeze_if_balanced_s: 240,
+            freeze_if_balanced_s: 420,
 
             max_order_qty: 25,
             catchup_aggressiveness: 0.45,
             catchup_balance_boost: 1.5,
 
-            cancel_stale_ms: 120000,
-            min_resting_life_ms: 1000,
+            cancel_stale_ms: 300000,
+            min_resting_life_ms: 2500,
             cancel_retry_ms: 800,
             cancel_drift_cents: 3,
             maker_max_edge_cents: 15,
@@ -213,7 +222,7 @@ impl Default for Config {
             skew_imbalance_start: 0.05,
             cancel_drift_cents_hedge: 1,
             hedge_force_ask_minus_one_imbalance: 0.10,
-            hedge_force_ask_minus_one_gap: 2,
+            hedge_force_ask_minus_one_gap: 1,
             dual_strong_min_improve_cc: 20, // 0.20 cents
             dual_strong_backoff_cents: 3,
             dual_strong_qty: 1,
@@ -223,10 +232,14 @@ impl Default for Config {
             min_taker_improve_cc: 20, // 0.2 cents improvement in pair-cost
 
             maker_first_ms: 1500,      // 1.5s
-            taker_desperate_s: 120,     // last 120s
-            taker_big_improve_cc: 100, // 1.00 cent improvement in pair-cost
-            taker_force_gap: 3,
-            short_side_min_order_qty: 6,
+            taker_desperate_s: 240,     // last 120s
+            taker_big_improve_cc: 200, // 1.00 cent improvement in pair-cost
+            taker_force_gap: 1,
+            short_side_min_order_qty: 1,
+
+            coinbase_ws_enabled: false,
+            coinbase_product_id: "BTC-USD".to_string(),
+            coinbase_log_delta_usd: 10.0,
 
             results_file: "results.csv".to_string(),
         }
@@ -242,6 +255,25 @@ impl Config {
         if let Ok(v) = env::var("RESULTS_FILE") {
             cfg.results_file = v;
         }
+
+        if let Ok(v) = env::var("COINBASE_WS") {
+            let s = v.trim().to_ascii_lowercase();
+            cfg.coinbase_ws_enabled = matches!(s.as_str(), "1" | "true" | "yes" | "y" | "on");
+        }
+        if let Ok(v) = env::var("COINBASE_PRODUCT_ID") {
+            let s = v.trim();
+            if !s.is_empty() {
+                cfg.coinbase_product_id = s.to_string();
+            }
+        }
+        if let Ok(v) = env::var("COINBASE_LOG_DELTA_USD") {
+            if let Ok(x) = v.trim().parse::<f64>() {
+                if x.is_finite() && x > 0.0 {
+                    cfg.coinbase_log_delta_usd = x;
+                }
+            }
+        }
+
         cfg
     }
 }

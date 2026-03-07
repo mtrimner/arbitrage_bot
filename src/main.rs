@@ -6,6 +6,7 @@ mod config;
 mod exec;
 mod market_manager;
 mod report;
+mod coinbase_ws;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -96,6 +97,16 @@ async fn main() -> Result<()> {
             ).await;
         });
     }
+
+    // --- Coinbase ticker feed (optional) ---
+    let _coinbase_rx = if cfg.coinbase_ws_enabled {
+        let rx = coinbase_ws::spawn_coinbase_ticker(cfg.coinbase_product_id.clone());
+        coinbase_ws::spawn_coinbase_logger(rx.clone(), cfg.coinbase_log_delta_usd);
+        Some(rx)
+    } else {
+        None
+    };
+
 
     // Engine runs on the main task
     engine::task::run_engine(cfg, shared, exec_tx).await?;

@@ -13,3 +13,4 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 kalshi-rs = "0.2.1"
 dotenv = "0.15.0"
+cbadv = { git = "https://github.com/ohkthx/cbadv-rs", branch = "main" }
