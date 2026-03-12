@@ -7,6 +7,7 @@ mod exec;
 mod market_manager;
 mod report;
 mod coinbase_ws;
+mod leadlag;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -47,7 +48,7 @@ async fn main() -> Result<()> {
     // Create Shared with all current active tickers (so engine/ws start correct)
     let tickers: Vec<String> = active.iter().map(|m| m.market_ticker.clone()).collect();
     let shared = Shared::new(tickers.clone());
-
+    let leadlag = leadlag::new_shared_leadlag();
     // Seed close_ts/open_ts into Market state for each ticker
     market_manager::seed_shared_times(&shared, &active).await?;
 
@@ -63,8 +64,9 @@ async fn main() -> Result<()> {
         let shared = shared.clone();
         let http = http.clone();
         let cfg = cfg.clone();
+        let leadlag2 = leadlag.clone();
         tokio::spawn(async move {
-            let _ = ws::task::run_ws(ws_client, http, cfg, shared, tickers, ws_ctl_rx).await;
+            let _ = ws::task::run_ws(ws_client, http, cfg, shared, leadlag2, tickers, ws_ctl_rx).await;
         });
     }
 
@@ -99,13 +101,25 @@ async fn main() -> Result<()> {
     }
 
     // --- Coinbase ticker feed (optional) ---
-    let _coinbase_rx = if cfg.coinbase_ws_enabled {
-        let rx = coinbase_ws::spawn_coinbase_ticker(cfg.coinbase_product_id.clone());
-        coinbase_ws::spawn_coinbase_logger(rx.clone(), cfg.coinbase_log_delta_usd);
-        Some(rx)
-    } else {
-        None
-    };
+let _coinbase_rx = if cfg.coinbase_ws_enabled {
+    let rx = coinbase_ws::spawn_coinbase_ticker(cfg.coinbase_product_id.clone());
+    let rx_clone = rx.clone();
+    coinbase_ws::spawn_coinbase_logger(rx.clone(), cfg.coinbase_log_delta_usd);
+
+    if cfg.coinbase_leadlag_enabled {
+        let shared = shared.clone();
+        let leadlag = leadlag.clone();
+        let cfg2 = cfg.clone();
+
+        tokio::spawn(async move {
+            coinbase_ws::spawn_coinbase_move_detector(rx_clone, cfg2, shared, leadlag).await;
+        });
+    }
+
+    Some(rx)
+} else {
+    None
+};
 
 
     // Engine runs on the main task

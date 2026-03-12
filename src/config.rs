@@ -155,6 +155,12 @@ pub struct Config {
     pub coinbase_product_id: String,
     /// Only log Coinbase updates when price moves at least this much (USD)
     pub coinbase_log_delta_usd: f64,
+    pub coinbase_leadlag_enabled: bool,
+    pub coinbase_leadlag_min_move_usd: f64,
+    pub coinbase_leadlag_file: String,
+    pub coinbase_leadlag_max_wait_ms: u64,
+    pub coinbase_leadlag_min_kalshi_move_cents: u8,
+    pub coinbase_leadlag_window_ms: u64,
 
 
     pub results_file: String,
@@ -240,7 +246,12 @@ impl Default for Config {
             coinbase_ws_enabled: false,
             coinbase_product_id: "BTC-USD".to_string(),
             coinbase_log_delta_usd: 10.0,
-
+            coinbase_leadlag_enabled: true,
+            coinbase_leadlag_min_move_usd: 10.0,
+            coinbase_leadlag_file: "coinbase_kalshi_leadlag.csv".to_string(),
+            coinbase_leadlag_max_wait_ms: 5000,
+            coinbase_leadlag_min_kalshi_move_cents: 1,
+            coinbase_leadlag_window_ms: 1000,
             results_file: "results.csv".to_string(),
         }
     }

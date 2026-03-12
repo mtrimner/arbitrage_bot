@@ -18,6 +18,7 @@ pub struct Market {
     // UTC epoch seconds
     pub open_ts: Option<i64>,
     pub close_ts: Option<i64>,
+    pub strike_price: Option<f64>,
 
     pub book: Book,
 
@@ -39,6 +40,7 @@ impl Market {
         Self {
             open_ts: None,
             close_ts: None,
+            strike_price: None,
             book: Book::default(),
             pos: Position::default(),
             orders: Orders::default(),

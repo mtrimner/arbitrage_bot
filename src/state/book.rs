@@ -19,6 +19,29 @@ impl Default for Book {
 }
 
 impl Book {
+    // COINBASE LOGGING ---------------------
+        pub fn best_yes_bid(&self) -> Option<u8> {
+        self.best_bid(Side::Yes)
+    }
+
+    pub fn best_no_bid(&self) -> Option<u8> {
+        self.best_bid(Side::No)
+    }
+
+    pub fn best_yes_ask(&self) -> Option<u8> {
+        self.implied_ask(Side::Yes)
+    }
+
+    pub fn best_no_ask(&self) -> Option<u8> {
+        self.implied_ask(Side::No)
+    }
+
+    pub fn spread_cents(&self, side: Side) -> Option<u8> {
+        let bid = self.best_bid(side)?;
+        let ask = self.implied_ask(side)?;
+        Some(ask.saturating_sub(bid))
+    }
+    // -----------------------------------
     #[inline]
     fn bids(&self, side: Side) -> &[i64; 101] {
         match side {
