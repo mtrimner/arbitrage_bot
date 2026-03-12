@@ -231,25 +231,20 @@ pub async fn append_leadlag_row(path: &str, ev: &CoinbaseMove) -> Result<()> {
         format!("{:.2}", ev.old_price),
         format!("{:.2}", ev.new_price),
         format!("{:.2}", ev.delta_usd),
-
         fmt_opt_u64(ev.anchor_exchange_ts_ms),
         ev.anchor_local_ts_ms.to_string(),
         fmt_opt_u64(ev.anchor_sequence_num),
-
         fmt_opt_u64(ev.exchange_ts_ms),
         ev.local_ts_ms.to_string(),
         fmt_opt_u64(ev.sequence_num),
         ev.window_ms.to_string(),
-
         fmt_opt_u8(ev.trigger_yes_bid),
         fmt_opt_u8(ev.trigger_yes_ask),
         fmt_opt_u8(ev.trigger_no_bid),
         fmt_opt_u8(ev.trigger_no_ask),
-
         ev.opportunity_side.as_str().to_string(),
         fmt_opt_u8(ev.trigger_entry_price_cents),
         fmt_opt_u8(ev.trigger_entry_spread_cents),
-
         ev.first_response
             .as_ref()
             .map(|x| x.response_type.clone())
@@ -262,20 +257,16 @@ pub async fn append_leadlag_row(path: &str, ev: &CoinbaseMove) -> Result<()> {
             .as_ref()
             .map(|x| x.lag_ms.to_string())
             .unwrap_or_default(),
-
         fmt_opt_u8(ev.first_response.as_ref().and_then(|x| x.yes_bid_after)),
         fmt_opt_u8(ev.first_response.as_ref().and_then(|x| x.no_bid_after)),
         fmt_opt_u8(ev.first_response.as_ref().and_then(|x| x.yes_ask_after)),
         fmt_opt_u8(ev.first_response.as_ref().and_then(|x| x.no_ask_after)),
-
         fmt_opt_u8(ev.post.best_yes_bid),
         fmt_opt_u8(ev.post.best_yes_ask),
         fmt_opt_u8(ev.post.best_no_bid),
         fmt_opt_u8(ev.post.best_no_ask),
-
         ev.post.best_favorable_entry_edge_cents.to_string(),
         ev.post.best_favorable_exit_edge_cents.to_string(),
-
         fmt_opt_u16(ev.post.min_pair_cost_cents),
         fmt_opt_u64(ev.post.min_pair_cost_ts_ms),
     ]

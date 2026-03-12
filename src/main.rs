@@ -1,28 +1,27 @@
-mod types;
-mod state;
-mod ws;
-mod engine;
+mod coinbase_ws;
 mod config;
+mod engine;
 mod exec;
+mod leadlag;
 mod market_manager;
 mod report;
-mod coinbase_ws;
-mod leadlag;
+mod state;
+mod types;
+mod ws;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-use std::sync::Arc;
 use dotenv::dotenv;
 use std::env;
+use std::sync::Arc;
 
-use state::Shared;
 use config::Config;
+use state::Shared;
 
-use kalshi_rs::{KalshiClient, KalshiWebsocketClient};
 use kalshi_rs::auth::Account;
-
+use kalshi_rs::{KalshiClient, KalshiWebsocketClient};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,7 +57,6 @@ async fn main() -> Result<()> {
     // WS control channel (market_manager -> ws task)
     let (ws_ctl_tx, ws_ctl_rx) = mpsc::channel(64);
 
-
     // WS task
     {
         let shared = shared.clone();
@@ -66,7 +64,8 @@ async fn main() -> Result<()> {
         let cfg = cfg.clone();
         let leadlag2 = leadlag.clone();
         tokio::spawn(async move {
-            let _ = ws::task::run_ws(ws_client, http, cfg, shared, leadlag2, tickers, ws_ctl_rx).await;
+            let _ =
+                ws::task::run_ws(ws_client, http, cfg, shared, leadlag2, tickers, ws_ctl_rx).await;
         });
     }
 
@@ -89,38 +88,32 @@ async fn main() -> Result<()> {
         let exec_tx = exec_tx.clone();
 
         tokio::spawn(async move {
-            let _ = market_manager::run_market_manager(
-                cfg,
-                http,
-                shared,
-                ws_ctl_tx,
-                exec_tx,
-                active,
-            ).await;
+            let _ =
+                market_manager::run_market_manager(cfg, http, shared, ws_ctl_tx, exec_tx, active)
+                    .await;
         });
     }
 
     // --- Coinbase ticker feed (optional) ---
-let _coinbase_rx = if cfg.coinbase_ws_enabled {
-    let rx = coinbase_ws::spawn_coinbase_ticker(cfg.coinbase_product_id.clone());
-    let rx_clone = rx.clone();
-    coinbase_ws::spawn_coinbase_logger(rx.clone(), cfg.coinbase_log_delta_usd);
+    let _coinbase_rx = if cfg.coinbase_ws_enabled {
+        let rx = coinbase_ws::spawn_coinbase_ticker(cfg.coinbase_product_id.clone());
+        let rx_clone = rx.clone();
+        coinbase_ws::spawn_coinbase_logger(rx.clone(), cfg.coinbase_log_delta_usd);
 
-    if cfg.coinbase_leadlag_enabled {
-        let shared = shared.clone();
-        let leadlag = leadlag.clone();
-        let cfg2 = cfg.clone();
+        if cfg.coinbase_leadlag_enabled {
+            let shared = shared.clone();
+            let leadlag = leadlag.clone();
+            let cfg2 = cfg.clone();
 
-        tokio::spawn(async move {
-            coinbase_ws::spawn_coinbase_move_detector(rx_clone, cfg2, shared, leadlag).await;
-        });
-    }
+            tokio::spawn(async move {
+                coinbase_ws::spawn_coinbase_move_detector(rx_clone, cfg2, shared, leadlag).await;
+            });
+        }
 
-    Some(rx)
-} else {
-    None
-};
-
+        Some(rx)
+    } else {
+        None
+    };
 
     // Engine runs on the main task
     engine::task::run_engine(cfg, shared, exec_tx).await?;

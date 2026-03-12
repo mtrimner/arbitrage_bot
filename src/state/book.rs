@@ -20,7 +20,7 @@ impl Default for Book {
 
 impl Book {
     // COINBASE LOGGING ---------------------
-        pub fn best_yes_bid(&self) -> Option<u8> {
+    pub fn best_yes_bid(&self) -> Option<u8> {
         self.best_bid(Side::Yes)
     }
 
@@ -108,6 +108,8 @@ impl Book {
     // True if a new BUY order at `price` would cross the (implied) ask right now.
     // Useful to ensure post_only orders won't be rejected at entry time.
     pub fn crosses_ask(&self, side: Side, price: u8) -> bool {
-        self.implied_ask(side).map(|ask| price >= ask).unwrap_or(false)
+        self.implied_ask(side)
+            .map(|ask| price >= ask)
+            .unwrap_or(false)
     }
 }

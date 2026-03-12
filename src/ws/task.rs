@@ -1,5 +1,5 @@
 use anyhow::Result;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -8,18 +8,18 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use kalshi_rs::{KalshiClient, KalshiWebsocketClient};
 use kalshi_rs::websocket::models::{
-    KalshiSocketMessage, OrderbookSnapshot, OrderbookDelta, TradeUpdate, UserFill,
-    SubscribedResponse, OkResponse, ErrorResponse,
+    ErrorResponse, KalshiSocketMessage, OkResponse, OrderbookDelta, OrderbookSnapshot,
+    SubscribedResponse, TradeUpdate, UserFill,
 };
+use kalshi_rs::{KalshiClient, KalshiWebsocketClient};
 
 use crate::config::Config;
+use crate::leadlag::{FirstResponse, OpportunitySide};
 use crate::state::Shared;
+use crate::state::book::Book;
 use crate::types::{Side, WsMarketCommand};
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::state::book::Book;
-use crate::leadlag::{OpportunitySide, FirstResponse};
 
 const WS_CHANNELS: [&str; 3] = ["orderbook_delta", "trade", "fill"];
 
@@ -145,7 +145,7 @@ pub async fn run_ws(
     }
 }
 
-fn handle_subscribed(sids: &mut HashMap<String,u64>, sr: SubscribedResponse) {
+fn handle_subscribed(sids: &mut HashMap<String, u64>, sr: SubscribedResponse) {
     let ch = sr.msg.channel;
     let sid = sr.msg.sid as u64;
     info!("subscribed channel={} sid={}", ch, sid);
@@ -154,14 +154,20 @@ fn handle_subscribed(sids: &mut HashMap<String,u64>, sr: SubscribedResponse) {
 
 fn handle_ok(ok: OkResponse) {
     // Often returned by update_subscription; contains sid + affected market_tickers.
-    info!("ok response id={} sid={} markets={:?}", ok.id, ok.sid, ok.msg.market_tickers);
+    info!(
+        "ok response id={} sid={} markets={:?}",
+        ok.id, ok.sid, ok.msg.market_tickers
+    );
 }
 
 fn handle_err(err: ErrorResponse) {
-    warn!("ws error id={} code={} msg={}", err.id, err.msg.code, err.msg.msg);
+    warn!(
+        "ws error id={} code={} msg={}",
+        err.id, err.msg.code, err.msg.msg
+    );
 }
 
-fn has_all_sids(sids: &HashMap<String,u64>) -> bool {
+fn has_all_sids(sids: &HashMap<String, u64>) -> bool {
     // We only update subscriptions for these three channels
     WS_CHANNELS.iter().all(|ch| sids.contains_key(*ch))
 }
@@ -169,8 +175,12 @@ fn has_all_sids(sids: &HashMap<String,u64>) -> bool {
 fn apply_ctl_local(markets: &mut HashSet<String>, cmd: &WsMarketCommand) {
     match cmd {
         WsMarketCommand::UpdateMarkets { add, remove } => {
-            for t in add { markets.insert(t.clone()); }
-            for t in remove { markets.remove(t); }
+            for t in add {
+                markets.insert(t.clone());
+            }
+            for t in remove {
+                markets.remove(t);
+            }
         }
     }
 }
@@ -179,7 +189,7 @@ fn apply_ctl_local(markets: &mut HashSet<String>, cmd: &WsMarketCommand) {
 /// We do ADD first, then DELETE, so we minimize “no subscription” gaps.
 async fn apply_update_subscription(
     ws: &KalshiWebsocketClient,
-    sids: &HashMap<String,u64>,
+    sids: &HashMap<String, u64>,
     cmd: &WsMarketCommand,
 ) -> Result<()> {
     let (add, remove) = match cmd {
@@ -187,7 +197,9 @@ async fn apply_update_subscription(
     };
 
     for ch in WS_CHANNELS {
-        let Some(&sid) = sids.get(ch) else { continue; };
+        let Some(&sid) = sids.get(ch) else {
+            continue;
+        };
 
         if !add.is_empty() {
             let add_refs: Vec<&str> = add.iter().map(|s| s.as_str()).collect();
@@ -221,11 +233,18 @@ async fn handle_snapshot(shared: &Shared, snap: OrderbookSnapshot) -> Result<()>
     Ok(())
 }
 
-async fn handle_delta(cfg: &Config, shared: &Shared, leadlag: &crate::leadlag::SharedLeadLag, delta: OrderbookDelta) -> Result<bool> {
+async fn handle_delta(
+    cfg: &Config,
+    shared: &Shared,
+    leadlag: &crate::leadlag::SharedLeadLag,
+    delta: OrderbookDelta,
+) -> Result<bool> {
     let seq = delta.seq;
     let m = delta.msg;
     let ticker = m.market_ticker.clone();
-    let Some(side) = m.side.parse::<Side>().ok() else { return Ok(true); };
+    let Some(side) = m.side.parse::<Side>().ok() else {
+        return Ok(true);
+    };
 
     let ts = shared.ensure_ticker(&ticker);
     let mut g = ts.mkt.write().await;
@@ -238,7 +257,6 @@ async fn handle_delta(cfg: &Config, shared: &Shared, leadlag: &crate::leadlag::S
         if cfg.coinbase_leadlag_enabled {
             maybe_record_leadlag(cfg, leadlag, &ticker, &g.book).await?;
         }
-
     }
     ts.touch(&shared);
     Ok(ok)
@@ -247,13 +265,22 @@ async fn handle_delta(cfg: &Config, shared: &Shared, leadlag: &crate::leadlag::S
 async fn handle_trade(cfg: &Config, shared: &Shared, tu: TradeUpdate) -> Result<()> {
     let m = tu.msg;
     let ticker = m.market_ticker.clone();
-    let Some(taker_side) = m.taker_side.parse::<Side>().ok() else { return Ok(()); };
+    let Some(taker_side) = m.taker_side.parse::<Side>().ok() else {
+        return Ok(());
+    };
 
     let ts = shared.ensure_ticker(&ticker);
     let mut g = ts.mkt.write().await;
 
     if cfg.exec_mode.is_paper() {
-        crate::exec::paper::paper_on_trade_fill(&ticker, &mut g, taker_side, m.yes_price, m.no_price, m.count);
+        crate::exec::paper::paper_on_trade_fill(
+            &ticker,
+            &mut g,
+            taker_side,
+            m.yes_price,
+            m.no_price,
+            m.count,
+        );
     }
 
     ts.touch(&shared);
@@ -264,10 +291,14 @@ async fn handle_fill(shared: &Shared, uf: UserFill) -> Result<()> {
     let m = uf.msg;
     let ticker = m.market_ticker.clone();
 
-    let Some(purchased) = m.purchased_side.parse::<Side>().ok() else { return Ok(()); };
-    
+    let Some(purchased) = m.purchased_side.parse::<Side>().ok() else {
+        return Ok(());
+    };
+
     let fill_qty = m.count.max(0) as i64;
-    if fill_qty == 0 { return Ok(()); }
+    if fill_qty == 0 {
+        return Ok(());
+    }
 
     let price = match purchased {
         Side::Yes => m.yes_price,
@@ -279,13 +310,12 @@ async fn handle_fill(shared: &Shared, uf: UserFill) -> Result<()> {
 
         // Update position.
         g.pos.apply_fill(purchased, price, fill_qty);
-        // crate::report::log_position(&ticker, &g.pos);
         if let Ok(client_id) = Uuid::parse_str(&m.client_order_id) {
             // Make sure order_id mapping exists even if Rest ack is late
             g.orders.link_order_id_if_missing(client_id, &m.order_id);
 
             let fully_filled = g.orders.record_fill_by_order(&m.order_id, fill_qty as u64);
-            
+
             if matches!(fully_filled, Some(true)) {
                 if let Some(h) = g.resting_hint(purchased).as_ref() {
                     if h.order_id.as_deref() == Some(&m.order_id.as_str()) {
@@ -296,14 +326,14 @@ async fn handle_fill(shared: &Shared, uf: UserFill) -> Result<()> {
         } else {
             // Fallback: apply by order_id (works only if by_order mapping exists)
             let fully_filled = g.orders.record_fill_by_order(&m.order_id, fill_qty as u64);
-            
+
             if matches!(fully_filled, Some(true)) {
                 if let Some(h) = g.resting_hint(purchased).as_ref() {
                     if h.order_id.as_deref() == Some(m.order_id.as_str()) {
                         *g.resting_hint_mut(purchased) = None;
                     }
                 }
-            }            
+            }
         }
 
         ts.touch(&shared);
@@ -330,11 +360,15 @@ fn favorable_entry_edge_cents(
 
     match side {
         OpportunitySide::BuyYes => {
-            let Some(now_ask) = yes_ask_now else { return 0; };
+            let Some(now_ask) = yes_ask_now else {
+                return 0;
+            };
             now_ask as i16 - entry as i16
         }
         OpportunitySide::BuyNo => {
-            let Some(now_ask) = no_ask_now else { return 0; };
+            let Some(now_ask) = no_ask_now else {
+                return 0;
+            };
             now_ask as i16 - entry as i16
         }
     }
@@ -352,11 +386,15 @@ fn favorable_exit_edge_cents(
 
     match side {
         OpportunitySide::BuyYes => {
-            let Some(now_bid) = yes_bid_now else { return 0; };
+            let Some(now_bid) = yes_bid_now else {
+                return 0;
+            };
             now_bid as i16 - entry as i16
         }
         OpportunitySide::BuyNo => {
-            let Some(now_bid) = no_bid_now else { return 0; };
+            let Some(now_bid) = no_bid_now else {
+                return 0;
+            };
             now_bid as i16 - entry as i16
         }
     }
@@ -426,22 +464,30 @@ async fn maybe_record_leadlag(
     // Update rolling post-trigger bests
     match (ev.post.best_yes_bid, yes_bid_now) {
         (None, x) => ev.post.best_yes_bid = x,
-        (Some(cur_best), Some(now_bid)) if now_bid > cur_best => ev.post.best_yes_bid = Some(now_bid),
+        (Some(cur_best), Some(now_bid)) if now_bid > cur_best => {
+            ev.post.best_yes_bid = Some(now_bid)
+        }
         _ => {}
     }
     match (ev.post.best_no_bid, no_bid_now) {
         (None, x) => ev.post.best_no_bid = x,
-        (Some(cur_best), Some(now_bid)) if now_bid > cur_best => ev.post.best_no_bid = Some(now_bid),
+        (Some(cur_best), Some(now_bid)) if now_bid > cur_best => {
+            ev.post.best_no_bid = Some(now_bid)
+        }
         _ => {}
     }
     match (ev.post.best_yes_ask, yes_ask_now) {
         (None, x) => ev.post.best_yes_ask = x,
-        (Some(cur_best), Some(now_ask)) if now_ask > cur_best => ev.post.best_yes_ask = Some(now_ask),
+        (Some(cur_best), Some(now_ask)) if now_ask > cur_best => {
+            ev.post.best_yes_ask = Some(now_ask)
+        }
         _ => {}
     }
     match (ev.post.best_no_ask, no_ask_now) {
         (None, x) => ev.post.best_no_ask = x,
-        (Some(cur_best), Some(now_ask)) if now_ask > cur_best => ev.post.best_no_ask = Some(now_ask),
+        (Some(cur_best), Some(now_ask)) if now_ask > cur_best => {
+            ev.post.best_no_ask = Some(now_ask)
+        }
         _ => {}
     }
 

@@ -19,10 +19,10 @@ fn cc_to_dollars(cc: i64) -> f64 {
 
 pub fn log_position(ticker: &str, pos: &Position) {
     let yes_avg_cents = pos.avg_yes_cc().map(cc_to_cents);
-    let no_avg_cents  = pos.avg_no_cc().map(cc_to_cents);
+    let no_avg_cents = pos.avg_no_cc().map(cc_to_cents);
 
     // “total avg price” in your world is really “pair cost” (avg_yes + avg_no)
-    let pair_cost_cents  = pos.pair_cost_cc().map(cc_to_cents);
+    let pair_cost_cents = pos.pair_cost_cc().map(cc_to_cents);
     let pair_cost_dollars = pos.pair_cost_cc().map(cc_to_dollars);
 
     info!(
@@ -46,11 +46,13 @@ fn fmt_ts_rfc3339(ts: i64) -> String {
 }
 
 fn fmt_opt_2(v: Option<f64>) -> String {
-    v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "".to_string())
+    v.map(|x| format!("{x:.2}"))
+        .unwrap_or_else(|| "".to_string())
 }
 
 fn fmt_opt_4(v: Option<f64>) -> String {
-    v.map(|x| format!("{x:.4}")).unwrap_or_else(|| "".to_string())
+    v.map(|x| format!("{x:.4}"))
+        .unwrap_or_else(|| "".to_string())
 }
 
 pub async fn append_result_csv(
@@ -84,20 +86,20 @@ pub async fn append_result_csv(
     let close_time = fmt_ts_rfc3339(close_ts);
 
     let yes_avg_cents = pos.avg_yes_cc().map(cc_to_cents);
-    let no_avg_cents  = pos.avg_no_cc().map(cc_to_cents);
+    let no_avg_cents = pos.avg_no_cc().map(cc_to_cents);
     let pair_cost_cents = pos.pair_cost_cc().map(cc_to_cents);
     let pair_cost_dollars = pos.pair_cost_cc().map(cc_to_dollars);
 
     let total_cost_cc = pos.yes_cost_cc.saturating_add(pos.no_cost_cc);
-    
+
     let total_cost_dollars = cc_to_dollars(total_cost_cc);
 
     let yes_qty = pos.yes_qty.max(0) as f64;
-    let no_qty  = pos.no_qty.max(0) as f64;
+    let no_qty = pos.no_qty.max(0) as f64;
 
     let pnl_yes_win_dollars = yes_qty - total_cost_dollars;
-    let pnl_no_win_dollars  = no_qty  - total_cost_dollars;
-    
+    let pnl_no_win_dollars = no_qty - total_cost_dollars;
+
     let line = format!(
         "{run_ts},{open_time},{close_time},{},{},{},{},{},{},{},{}\n",
         pos.yes_qty,

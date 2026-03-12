@@ -12,7 +12,10 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::{collections::HashMap, sync::Arc};
-use tokio::{sync::mpsc, time::{self, Duration}};
+use tokio::{
+    sync::mpsc,
+    time::{self, Duration},
+};
 use tracing::{info, warn};
 
 use kalshi_rs::KalshiClient;
@@ -51,7 +54,11 @@ fn extract_strike_price(m: &kalshi_rs::markets::models::Market) -> Option<f64> {
     if let Some(v) = m.cap_strike.filter(|v| v.is_finite()) {
         return Some(v);
     }
-    if let Some(v) = m.functional_strike.as_deref().and_then(parse_numeric_strike) {
+    if let Some(v) = m
+        .functional_strike
+        .as_deref()
+        .and_then(parse_numeric_strike)
+    {
         return Some(v);
     }
     if let Some(v) = m.subtitle.split_whitespace().find_map(parse_numeric_strike) {
@@ -84,7 +91,10 @@ fn parse_rfc3339_utc(ts: &str) -> Result<i64> {
 
 /// Fetch the currently active market for a series (e.g. KXBTC15M).
 /// If none are active (rare), picks the soonest future market by open_time.
-pub async fn fetch_current_market(http: &KalshiClient, series_ticker: &str) -> Result<ActiveMarketMeta> {
+pub async fn fetch_current_market(
+    http: &KalshiClient,
+    series_ticker: &str,
+) -> Result<ActiveMarketMeta> {
     let params = MarketsQuery {
         limit: Some(1000),
         status: Some("open".to_string()),
@@ -117,7 +127,9 @@ pub async fn fetch_current_market(http: &KalshiClient, series_ticker: &str) -> R
             Err(_) => continue,
         };
 
-        if open_ts < now { continue; }
+        if open_ts < now {
+            continue;
+        }
 
         let close_ts = match parse_rfc3339_utc(&m.close_time) {
             Ok(v) => v,
@@ -125,10 +137,22 @@ pub async fn fetch_current_market(http: &KalshiClient, series_ticker: &str) -> R
         };
 
         match &best {
-            None => best = Some((open_ts, close_ts, m.ticker.to_string(), resolve_strike_price(http, m).await?)),
+            None => {
+                best = Some((
+                    open_ts,
+                    close_ts,
+                    m.ticker.to_string(),
+                    resolve_strike_price(http, m).await?,
+                ))
+            }
             Some((best_open, _, _, _)) => {
                 if open_ts < *best_open {
-                    best = Some((open_ts, close_ts, m.ticker.to_string(), resolve_strike_price(http, m).await?));
+                    best = Some((
+                        open_ts,
+                        close_ts,
+                        m.ticker.to_string(),
+                        resolve_strike_price(http, m).await?,
+                    ));
                 }
             }
         }
@@ -180,7 +204,9 @@ pub async fn seed_shared_times(shared: &Shared, markets: &[ActiveMarketMeta]) ->
 /// Optional helper: cancel any known resting orders on a ticker before we drop it.
 /// This is “nice to have”. If you don’t want cancels, you can remove this.
 async fn cancel_known_resting(exec_tx: &mpsc::Sender<ExecCommand>, shared: &Shared, ticker: &str) {
-    let Some(ts) = shared.tickers.get(ticker) else { return; };
+    let Some(ts) = shared.tickers.get(ticker) else {
+        return;
+    };
     let mut g = ts.mkt.write().await;
 
     // If your RestingHint stores order_id, cancel them.
@@ -203,10 +229,12 @@ async fn cancel_known_resting(exec_tx: &mpsc::Sender<ExecCommand>, shared: &Shar
     drop(g);
 
     for oid in cancels {
-        let _ = exec_tx.send(ExecCommand::CancelOrder {
-            ticker: ticker.to_string(),
-            order_id: oid,
-        }).await;
+        let _ = exec_tx
+            .send(ExecCommand::CancelOrder {
+                ticker: ticker.to_string(),
+                order_id: oid,
+            })
+            .await;
     }
 }
 
@@ -236,7 +264,9 @@ pub async fn run_market_manager(
         let series_list: Vec<String> = active_by_series.keys().cloned().collect();
 
         for series in series_list {
-            let Some(mut cur) = active_by_series.get(&series).cloned() else { continue; };
+            let Some(mut cur) = active_by_series.get(&series).cloned() else {
+                continue;
+            };
 
             if cur.strike_price.is_none() {
                 match fetch_strike_price_by_ticker(&http, &cur.market_ticker).await {
@@ -270,7 +300,10 @@ pub async fn run_market_manager(
 
             tracing::info!(
                 "series={} current market {} closed (now={} close_ts={}), rotating...",
-                series, cur.market_ticker, now, cur.close_ts
+                series,
+                cur.market_ticker,
+                now,
+                cur.close_ts
             );
 
             // Fetch new current market for this series
@@ -278,7 +311,11 @@ pub async fn run_market_manager(
 
             // If ticker didn't change, just refresh times (maybe Kalshi updated close_time)
             if next.market_ticker == cur.market_ticker {
-                tracing::info!("series={} active ticker unchanged {}, refreshing times", series, cur.market_ticker);
+                tracing::info!(
+                    "series={} active ticker unchanged {}, refreshing times",
+                    series,
+                    cur.market_ticker
+                );
                 seed_shared_times(&shared, &[next.clone()]).await?;
                 active_by_series.insert(series.clone(), next);
                 continue;
@@ -320,10 +357,12 @@ pub async fn run_market_manager(
             // 2) Tell WS task to update subscriptions:
             //    - add new ticker
             //    - delete old ticker
-            let _ = ws_tx.send(WsMarketCommand::UpdateMarkets {
-                add: vec![next.market_ticker.clone()],
-                remove: vec![cur.market_ticker.clone()],
-            }).await;
+            let _ = ws_tx
+                .send(WsMarketCommand::UpdateMarkets {
+                    add: vec![next.market_ticker.clone()],
+                    remove: vec![cur.market_ticker.clone()],
+                })
+                .await;
 
             // 3) Optional: cancel known resting orders on old ticker
             cancel_known_resting(&exec_tx, &shared, &cur.market_ticker).await;

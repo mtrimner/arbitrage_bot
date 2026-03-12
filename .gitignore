@@ -1,5 +1,6 @@
 /target
 private_keys
 .env
+/crates/kalshi-rs/
 
 results.csv

@@ -33,7 +33,6 @@ pub async fn run_engine(cfg: Config, shared: Shared, tx: mpsc::Sender<ExecComman
                 if let Err(e) = tx.send(cmd).await {
                     return Err(anyhow!("exec channel closed: {e}"));
                 }
-                
             }
         }
     }

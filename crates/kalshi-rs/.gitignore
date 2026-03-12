@@ -1,9 +1,0 @@
-/target
-/.lsp
-/.clj-kondo
-/*.json
-kalshi_private.pem
-CLAUDE.md
-t.py
-.idea
-.CLAUDE

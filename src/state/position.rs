@@ -1,4 +1,4 @@
-use crate::types::{Side, CC_PER_CENT};
+use crate::types::{CC_PER_CENT, Side};
 
 #[derive(Debug, Clone, Default)]
 pub struct Position {

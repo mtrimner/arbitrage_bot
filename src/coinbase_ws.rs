@@ -1,9 +1,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cbadv::{
+    WebSocketClientBuilder,
     models::websocket::{Channel, EndpointStream},
     types::CbResult,
-    WebSocketClientBuilder,
 };
 use chrono::DateTime;
 use futures_util::StreamExt;
@@ -82,11 +82,7 @@ fn parse_f64_field(raw: &str, field: &str, product_id: &str) -> Option<f64> {
     }
 }
 
-fn parse_optional_f64_field(
-    raw: Option<&str>,
-    field: &str,
-    product_id: &str,
-) -> Option<f64> {
+fn parse_optional_f64_field(raw: Option<&str>, field: &str, product_id: &str) -> Option<f64> {
     raw.and_then(|v| parse_f64_field(v, field, product_id))
 }
 
@@ -94,11 +90,7 @@ fn parse_exchange_ts_ms(raw: Option<&str>) -> Option<u64> {
     let ts = raw?;
     let dt = DateTime::parse_from_rfc3339(ts).ok()?;
     let ms = dt.timestamp_millis();
-    if ms < 0 {
-        None
-    } else {
-        Some(ms as u64)
-    }
+    if ms < 0 { None } else { Some(ms as u64) }
 }
 
 fn same_opt_f64(a: Option<f64>, b: Option<f64>) -> bool {
@@ -117,11 +109,7 @@ fn should_publish(cur: &CoinbasePrice, next: &CoinbasePrice) -> bool {
         || cur.sequence_num != next.sequence_num
 }
 
-fn handle_text_message(
-    text: &str,
-    expected_product_id: &str,
-    tx: &watch::Sender<CoinbasePrice>,
-) {
+fn handle_text_message(text: &str, expected_product_id: &str, tx: &watch::Sender<CoinbasePrice>) {
     let envelope: CoinbaseEnvelope = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
@@ -279,9 +267,8 @@ pub fn spawn_coinbase_logger(mut rx: watch::Receiver<CoinbasePrice>, min_delta_u
             };
 
             if should_log {
-                let exchange_to_local_ms = cur
-                    .exchange_ts_ms
-                    .map(|ex| cur.ts_ms.saturating_sub(ex));
+                let exchange_to_local_ms =
+                    cur.exchange_ts_ms.map(|ex| cur.ts_ms.saturating_sub(ex));
 
                 info!(
                     target: "coinbase",
@@ -366,7 +353,11 @@ pub async fn spawn_coinbase_move_detector(
         let trigger_yes_ask = m.book.best_yes_ask();
         let trigger_no_ask = m.book.best_no_ask();
 
-        let dir = if delta > 0.0 { MoveDir::Up } else { MoveDir::Down };
+        let dir = if delta > 0.0 {
+            MoveDir::Up
+        } else {
+            MoveDir::Down
+        };
         let opportunity_side = match dir {
             MoveDir::Up => OpportunitySide::BuyYes,
             MoveDir::Down => OpportunitySide::BuyNo,

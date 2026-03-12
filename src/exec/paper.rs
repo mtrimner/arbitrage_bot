@@ -1,13 +1,13 @@
 use tracing::info;
 
-use crate::state::{Shared};
+use crate::state::Shared;
 use crate::state::orders::OrderStatus;
-use crate::types::{Side, Tif};
 use crate::state::ticker::Market;
+use crate::types::{Side, Tif};
 
 pub fn paper_on_delta_queue(m: &mut Market, side: Side, price: u8, delta: i64) {
-    if delta >= 0 { 
-        return; 
+    if delta >= 0 {
+        return;
     }
 
     if let Some(h) = m.resting_hint_mut(side).as_mut() {
@@ -19,25 +19,34 @@ pub fn paper_on_delta_queue(m: &mut Market, side: Side, price: u8, delta: i64) {
     }
 }
 
-pub fn paper_on_trade_fill(ticker: &str, m: &mut Market, taker_side: Side, yes_price: u8, no_price: u8, count: i64) {
+pub fn paper_on_trade_fill(
+    ticker: &str,
+    m: &mut Market,
+    taker_side: Side,
+    yes_price: u8,
+    no_price: u8,
+    count: i64,
+) {
     let fillable = count.max(0) as u64;
-    if fillable == 0 { 
-        return; 
+    if fillable == 0 {
+        return;
     }
 
     // maker side is the opposite side of taker
     let maker_side = taker_side.other();
     let maker_price = match maker_side {
         Side::Yes => yes_price,
-        Side::No  => no_price,
+        Side::No => no_price,
     };
 
     let (client_id, posted_price, remaining_after_queue_u64) = {
-        let Some(h) = m.resting_hint_mut(maker_side).as_mut() else { return; };
+        let Some(h) = m.resting_hint_mut(maker_side).as_mut() else {
+            return;
+        };
         // not acked yet
-        if h.order_id.is_none() { 
-            return; 
-        }            
+        if h.order_id.is_none() {
+            return;
+        }
 
         // --------- IMPORTANT CHANGE ----------
         // If the market traded at/through our posted maker price, we should be fill-eligible.
@@ -66,7 +75,9 @@ pub fn paper_on_trade_fill(ticker: &str, m: &mut Market, taker_side: Side, yes_p
             remaining -= consume;
         }
 
-        if remaining <= 0 { return; }
+        if remaining <= 0 {
+            return;
+        }
 
         (h.client_order_id, h.price_cents, remaining as u64)
     };
@@ -74,20 +85,23 @@ pub fn paper_on_trade_fill(ticker: &str, m: &mut Market, taker_side: Side, yes_p
         Some(rec) => rec.qty.saturating_sub(rec.filled_qty),
         None => return,
     };
-    
-    if order_remaining == 0 { 
-        return; 
+
+    if order_remaining == 0 {
+        return;
     }
 
     let fill_qty = order_remaining.min(remaining_after_queue_u64);
-    if fill_qty == 0 { 
-        return; 
+    if fill_qty == 0 {
+        return;
     }
 
     // Option A: fill at OUR posted maker price (conservative)
     let fill_price = posted_price;
 
-    info!(?maker_side, maker_price, fill_price, fill_qty, "PAPER maker filled");
+    info!(
+        ?maker_side,
+        maker_price, fill_price, fill_qty, "PAPER maker filled"
+    );
     m.pos.apply_fill(maker_side, fill_price, fill_qty as i64);
     crate::report::log_position(ticker, &m.pos);
 
@@ -98,7 +112,6 @@ pub fn paper_on_trade_fill(ticker: &str, m: &mut Market, taker_side: Side, yes_p
         *m.resting_hint_mut(maker_side) = None;
     }
 }
-
 
 pub async fn paper_place(
     shared: &Shared,
@@ -111,7 +124,9 @@ pub async fn paper_place(
     client_order_id: uuid::Uuid,
     reject_postonly_cross: bool,
 ) {
-    let Some(ts) = shared.tickers.get(ticker) else { return; };
+    let Some(ts) = shared.tickers.get(ticker) else {
+        return;
+    };
     let mut g = ts.mkt.write().await;
 
     // synthetic exchange order id
@@ -120,8 +135,15 @@ pub async fn paper_place(
 
     // Post-only reject if it would cross *right now*
     if post_only && reject_postonly_cross && g.book.crosses_ask(side, price_cents) {
-        info!(ticker, ?side, price_cents, qty, "PAPER reject post_only would-cross");
-        g.orders.set_status_by_client(client_order_id, OrderStatus::Rejected);
+        info!(
+            ticker,
+            ?side,
+            price_cents,
+            qty,
+            "PAPER reject post_only would-cross"
+        );
+        g.orders
+            .set_status_by_client(client_order_id, OrderStatus::Rejected);
 
         // Clear hint if we set one for this client_order_id
         if let Some(h) = g.resting_hint(side).as_ref() {
@@ -139,20 +161,35 @@ pub async fn paper_place(
             // IOC: fill if limit >= implied ask
             let Some(ask) = g.book.implied_ask(side) else {
                 info!(ticker, ?side, price_cents, "PAPER ioc reject no-ask");
-                g.orders.set_status_by_client(client_order_id, OrderStatus::Rejected);
+                g.orders
+                    .set_status_by_client(client_order_id, OrderStatus::Rejected);
                 ts.touch(&shared);
                 return;
             };
 
             if ask <= price_cents {
                 let fill_qty = qty;
-                info!(ticker, ?side, limit=price_cents, fill_price=ask, fill_qty, "PAPER ioc filled");
+                info!(
+                    ticker,
+                    ?side,
+                    limit = price_cents,
+                    fill_price = ask,
+                    fill_qty,
+                    "PAPER ioc filled"
+                );
                 g.pos.apply_fill(side, ask, fill_qty as i64);
                 let _ = g.orders.record_fill_by_client(client_order_id, fill_qty);
                 crate::report::log_position(ticker, &g.pos);
             } else {
-                info!(ticker, ?side, limit=price_cents, ask, "PAPER ioc not-filled reject");
-                g.orders.set_status_by_client(client_order_id, OrderStatus::Rejected);
+                info!(
+                    ticker,
+                    ?side,
+                    limit = price_cents,
+                    ask,
+                    "PAPER ioc not-filled reject"
+                );
+                g.orders
+                    .set_status_by_client(client_order_id, OrderStatus::Rejected);
             }
 
             ts.touch(&shared);
@@ -162,7 +199,8 @@ pub async fn paper_place(
             // GTC: accept as resting
             info!(ticker, ?side, price_cents, qty, post_only, order_id=%order_id, "PAPER resting ack");
 
-            g.orders.set_status_by_client(client_order_id, OrderStatus::Resting);
+            g.orders
+                .set_status_by_client(client_order_id, OrderStatus::Resting);
 
             // Fill in hint order_id so cancels work
             if let Some(h) = g.resting_hint_mut(side).as_mut() {
@@ -177,12 +215,15 @@ pub async fn paper_place(
 }
 
 pub async fn paper_cancel(shared: &Shared, ticker: &str, order_id: &str) {
-    let Some(ts) = shared.tickers.get(ticker) else { return; };
+    let Some(ts) = shared.tickers.get(ticker) else {
+        return;
+    };
     let mut g = ts.mkt.write().await;
 
     // If already filled, do nothing (realistic race behavior)
     // (status lookup optional; we’ll just attempt cancel)
-    g.orders.set_status_by_order(order_id, OrderStatus::Canceled);
+    g.orders
+        .set_status_by_order(order_id, OrderStatus::Canceled);
 
     for side in Side::ALL {
         if let Some(h) = g.resting_hint(side).as_ref() {

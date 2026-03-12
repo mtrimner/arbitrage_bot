@@ -1,7 +1,7 @@
-pub mod ticker;
-pub mod position;
 pub mod book;
 pub mod orders;
+pub mod position;
+pub mod ticker;
 
 use dashmap::DashMap;
 use std::sync::Arc;
