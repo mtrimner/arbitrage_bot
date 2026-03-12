@@ -866,8 +866,7 @@ dependencies = [
 [[package]]
 name = "kalshi-rs"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b7a04364c495c409b5415635d3449202eed57d7fb267142f7ac3068fcfdc850"
+source = "git+https://github.com/mtrimner/kalshi-rs.git?rev=7af2d7c#7af2d7cc4e9c4e9427159ded326f816d6975511b"
 dependencies = [
  "base64",
  "chrono",
