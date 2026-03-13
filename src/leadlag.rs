@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoveDir {
@@ -276,7 +276,7 @@ pub async fn append_leadlag_row(path: &str, ev: &CoinbaseMove) -> Result<()> {
     f.write_all(line.as_bytes()).await?;
     f.flush().await?;
 
-    info!(
+    debug!(
         target: "leadlag",
         kalshi_ticker = %ev.kalshi_ticker,
         kalshi_strike_price = ?ev.kalshi_strike_price,

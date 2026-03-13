@@ -16,7 +16,7 @@ use tokio::{
     sync::mpsc,
     time::{self, Duration},
 };
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use kalshi_rs::KalshiClient;
 use kalshi_rs::markets::models::MarketsQuery;
@@ -178,7 +178,7 @@ pub async fn bootstrap_active_markets(
         let cur = fetch_current_market(http, s).await?;
         out.push(cur);
     }
-    info!("Markets: {:#?}", out);
+    debug!("Markets: {:#?}", out);
     Ok(out)
 }
 
@@ -271,7 +271,7 @@ pub async fn run_market_manager(
             if cur.strike_price.is_none() {
                 match fetch_strike_price_by_ticker(&http, &cur.market_ticker).await {
                     Ok(Some(strike_price)) => {
-                        info!(
+                        debug!(
                             series = %series,
                             ticker = %cur.market_ticker,
                             strike_price,
@@ -298,7 +298,7 @@ pub async fn run_market_manager(
                 continue;
             }
 
-            tracing::info!(
+            tracing::debug!(
                 "series={} current market {} closed (now={} close_ts={}), rotating...",
                 series,
                 cur.market_ticker,
@@ -311,7 +311,7 @@ pub async fn run_market_manager(
 
             // If ticker didn't change, just refresh times (maybe Kalshi updated close_time)
             if next.market_ticker == cur.market_ticker {
-                tracing::info!(
+                tracing::debug!(
                     "series={} active ticker unchanged {}, refreshing times",
                     series,
                     cur.market_ticker

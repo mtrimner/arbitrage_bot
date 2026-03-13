@@ -1,5 +1,5 @@
 [env]
-RUST_LOG = "debug"
+RUST_LOG = "info"
 EXEC_MODE = "paper"
 RESULTS_FILE = "results.csv"
 COINBASE_WS = "true"

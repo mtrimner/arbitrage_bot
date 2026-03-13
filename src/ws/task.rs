@@ -1,6 +1,6 @@
 use anyhow::Result;
 use tokio::time::{Duration, sleep};
-use tracing::{info, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 use std::collections::{HashMap, HashSet};
@@ -66,8 +66,6 @@ pub async fn run_ws(
             continue;
         }
 
-        info!("ws connected+subscribed to {} tickers", markets.len());
-
         // Inner loop: handle WS messages and control commands concurrently.
         loop {
             tokio::select! {
@@ -111,7 +109,6 @@ pub async fn run_ws(
                             }
                         }
                         KalshiSocketMessage::TradeUpdate(tu) => {
-                            // println!("TradeUpdate: {:#?}", tu);
                             handle_trade(&cfg, &shared, tu).await?;
                         }
                         KalshiSocketMessage::UserFill(uf) => {
@@ -148,16 +145,12 @@ pub async fn run_ws(
 fn handle_subscribed(sids: &mut HashMap<String, u64>, sr: SubscribedResponse) {
     let ch = sr.msg.channel;
     let sid = sr.msg.sid as u64;
-    info!("subscribed channel={} sid={}", ch, sid);
     sids.insert(ch, sid);
 }
 
 fn handle_ok(ok: OkResponse) {
     // Often returned by update_subscription; contains sid + affected market_tickers.
-    info!(
-        "ok response id={} sid={} markets={:?}",
-        ok.id, ok.sid, ok.msg.market_tickers
-    );
+    let _ = ok;
 }
 
 fn handle_err(err: ErrorResponse) {

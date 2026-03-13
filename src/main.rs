@@ -25,12 +25,12 @@ use kalshi_rs::{KalshiClient, KalshiWebsocketClient};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenv().ok();
+
     // Basic logging: set RUST_LOG=info (or debug) to see output.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-
-    dotenv().ok();
 
     let cfg = Config::from_env();
 
@@ -64,8 +64,11 @@ async fn main() -> Result<()> {
         let cfg = cfg.clone();
         let leadlag2 = leadlag.clone();
         tokio::spawn(async move {
-            let _ =
-                ws::task::run_ws(ws_client, http, cfg, shared, leadlag2, tickers, ws_ctl_rx).await;
+            if let Err(e) =
+                ws::task::run_ws(ws_client, http, cfg, shared, leadlag2, tickers, ws_ctl_rx).await
+            {
+                tracing::error!(err = %format!("{e:#}"), "ws task exited");
+            }
         });
     }
 
@@ -75,7 +78,9 @@ async fn main() -> Result<()> {
         let http = http.clone();
         let cfg = cfg.clone();
         tokio::spawn(async move {
-            let _ = exec::task::run_exec(cfg, http, shared, exec_rx).await;
+            if let Err(e) = exec::task::run_exec(cfg, http, shared, exec_rx).await {
+                tracing::error!(err = %format!("{e:#}"), "exec task exited");
+            }
         });
     }
 
@@ -88,9 +93,12 @@ async fn main() -> Result<()> {
         let exec_tx = exec_tx.clone();
 
         tokio::spawn(async move {
-            let _ =
+            if let Err(e) =
                 market_manager::run_market_manager(cfg, http, shared, ws_ctl_tx, exec_tx, active)
-                    .await;
+                    .await
+            {
+                tracing::error!(err = %format!("{e:#}"), "market manager exited");
+            }
         });
     }
 

@@ -9,7 +9,7 @@ use chrono::DateTime;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::config::Config;
 use crate::leadlag::{
@@ -223,7 +223,7 @@ async fn run_coinbase_ticker_once(
         .subscribe(&Channel::Ticker, &[product_id.clone()])
         .await?;
 
-    info!(product_id = %product_id, "coinbase ws connected and subscribed");
+    debug!(product_id = %product_id, "coinbase ws connected and subscribed");
 
     let mut stream: EndpointStream = readers.into();
 
@@ -270,7 +270,7 @@ pub fn spawn_coinbase_logger(mut rx: watch::Receiver<CoinbasePrice>, min_delta_u
                 let exchange_to_local_ms =
                     cur.exchange_ts_ms.map(|ex| cur.ts_ms.saturating_sub(ex));
 
-                info!(
+                debug!(
                     target: "coinbase",
                     product_id = %cur.product_id,
                     price = cur.price,
