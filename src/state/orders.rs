@@ -1,7 +1,4 @@
 use std::collections::HashMap;
-use std::time::Instant;
-
-use crate::types::{Side, Tif};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderStatus {
@@ -14,19 +11,11 @@ pub enum OrderStatus {
 
 #[derive(Debug, Clone)]
 pub struct OrderRec {
-    pub ticker: String,
-    pub side: Side,
-    pub price_cents: u8,
     pub qty: u64,
-    pub tif: Tif,
-    pub post_only: bool,
-
     pub order_id: Option<String>,
     pub client_order_id: uuid::Uuid,
 
     pub status: OrderStatus,
-    pub created_at: Instant,
-
     pub filled_qty: u64,
 }
 
@@ -39,7 +28,9 @@ pub struct Orders {
 impl Orders {
     pub fn link_order_id_if_missing(&mut self, client_id: uuid::Uuid, order_id: &str) {
         // If we don't know this client_id do nothing
-        let Some(rec) = self.by_client.get_mut(&client_id) else { return; };
+        let Some(rec) = self.by_client.get_mut(&client_id) else {
+            return;
+        };
 
         // If order_id is missing, set it.
         if rec.order_id.as_deref() != Some(order_id) {
@@ -95,5 +86,4 @@ impl Orders {
             self.set_status_by_client(client_id, st);
         }
     }
-
 }

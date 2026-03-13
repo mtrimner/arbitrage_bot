@@ -85,7 +85,6 @@ pub enum ExecCommand {
 /// - avoid churn (min_resting_life_ms)
 #[derive(Debug, Clone)]
 pub struct RestingHint {
-    pub side: Side,
     pub price_cents: u8,
     pub created_at: Instant,
 

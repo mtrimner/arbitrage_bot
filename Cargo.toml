@@ -11,5 +11,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"]}
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
-kalshi-rs = "0.2.1"
+kalshi-rs = { path = "crates/kalshi-rs" }
 dotenv = "0.15.0"
+cbadv = { git = "https://github.com/ohkthx/cbadv-rs", branch = "main" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"

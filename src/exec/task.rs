@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use kalshi_rs::KalshiClient;
 
-use crate::exec::{http, paper};
-use crate::state::orders::OrderStatus;
-use crate::state::Shared;
-use crate::types::{ExecCommand, Side, Tif};
 use crate::config::Config;
+use crate::exec::{http, paper};
+use crate::state::Shared;
+use crate::state::orders::OrderStatus;
+use crate::types::{ExecCommand, Side, Tif};
 
 fn kalshi_status_to_local(status: &str) -> OrderStatus {
     match status {
@@ -38,12 +38,19 @@ pub async fn run_exec(
                 post_only,
                 client_order_id,
             } => {
-
                 if cfg.exec_mode.is_paper() {
                     paper::paper_place(
-                        &shared, &ticker, side, price_cents, qty, tif, post_only,
-                        client_order_id, cfg.paper_reject_postonly_cross
-                    ).await;
+                        &shared,
+                        &ticker,
+                        side,
+                        price_cents,
+                        qty,
+                        tif,
+                        post_only,
+                        client_order_id,
+                        cfg.paper_reject_postonly_cross,
+                    )
+                    .await;
                     continue;
                 }
 
@@ -98,15 +105,16 @@ pub async fn run_exec(
                         warn!("place failed: {e:?}");
                         if let Some(ts) = shared.tickers.get(&ticker) {
                             let mut g = ts.mkt.write().await;
-                            g.orders.set_status_by_client(client_order_id, OrderStatus::Rejected);
+                            g.orders
+                                .set_status_by_client(client_order_id, OrderStatus::Rejected);
 
                             // If we thought this was resting, clear the hint so engine can try again.
                             if g.resting_hint(side)
                                 .as_ref()
                                 .is_some_and(|h| h.client_order_id == client_order_id)
-                                {
-                                    *g.resting_hint_mut(side) = None;
-                                }
+                            {
+                                *g.resting_hint_mut(side) = None;
+                            }
 
                             ts.touch(&shared);
                         }
@@ -128,16 +136,16 @@ pub async fn run_exec(
                         if let Some(ts) = shared.tickers.get(&ticker) {
                             let mut g = ts.mkt.write().await;
 
-                            g.orders.set_status_by_order(&order_id, OrderStatus::Canceled);
+                            g.orders
+                                .set_status_by_order(&order_id, OrderStatus::Canceled);
 
                             // Clear any resting hint that matches this order_id.
                             for side in Side::ALL {
-                                if g.resting_hint(side)
-                                    .as_ref()
-                                    .is_some_and(|h| h.order_id.as_deref() == Some(order_id.as_str()))
-                                    {
-                                        *g.resting_hint_mut(side) = None;
-                                    }
+                                if g.resting_hint(side).as_ref().is_some_and(|h| {
+                                    h.order_id.as_deref() == Some(order_id.as_str())
+                                }) {
+                                    *g.resting_hint_mut(side) = None;
+                                }
                             }
 
                             ts.touch(&shared);

@@ -1,8 +1,8 @@
+use crate::state::Shared;
 use crate::state::{book::Book, orders::Orders, position::Position};
 use crate::types::{RestingHint, Side};
-use crate::state::Shared;
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::RwLock;
 
@@ -18,6 +18,7 @@ pub struct Market {
     // UTC epoch seconds
     pub open_ts: Option<i64>,
     pub close_ts: Option<i64>,
+    pub strike_price: Option<f64>,
 
     pub book: Book,
 
@@ -39,6 +40,7 @@ impl Market {
         Self {
             open_ts: None,
             close_ts: None,
+            strike_price: None,
             book: Book::default(),
             pos: Position::default(),
             orders: Orders::default(),
@@ -63,61 +65,20 @@ impl Market {
             Side::No => &self.resting_no,
         }
     }
-
-    #[inline]
-    pub fn has_pair(&self) -> bool {
-        self.pos.yes_qty > 0 && self.pos.no_qty > 0
-    }
-
-    #[inline]
-    pub fn qty_for(&self, side: Side) -> i64 {
-        match side {
-            Side::Yes => self.pos.yes_qty,
-            Side::No => self.pos.no_qty,
-        }
-    }
-
-    #[inline]
-    pub fn avg_cc_for(&self, side: Side) -> Option<i64> {
-        match side {
-            Side::Yes => self.pos.avg_yes_cc(),
-            Side::No => self.pos.avg_no_cc(),
-        }
-    }
-
-    #[inline]
-    pub fn last_taker(&self, side: Side) -> Option<Instant> {
-        match side {
-            Side::Yes => self.last_taker_yes,
-            Side::No => self.last_taker_no,
-        }
-    }
-
-    #[inline]
-    pub fn set_last_taker(&mut self, side: Side, t: Instant) {
-        match side {
-            Side::Yes => self.last_taker_yes = Some(t),
-            Side::No => self.last_taker_no = Some(t),
-        }
-    }
 }
 
 #[derive(Debug)]
 pub struct TickerState {
-    pub ticker: String,
     pub mkt: RwLock<Market>,
 
     pub dirty: AtomicBool,
-    pub last_dirty_ns: AtomicI64,
 }
 
 impl TickerState {
-    pub fn new(ticker: String) -> Self {
+    pub fn new(_ticker: String) -> Self {
         Self {
-            ticker,
             mkt: RwLock::new(Market::new()),
             dirty: AtomicBool::new(true),
-            last_dirty_ns: AtomicI64::new(0),
         }
     }
 

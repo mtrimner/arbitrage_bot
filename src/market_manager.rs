@@ -12,8 +12,11 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::{collections::HashMap, sync::Arc};
-use tokio::{sync::mpsc, time::{self, Duration}};
-use tracing::{info, warn};
+use tokio::{
+    sync::mpsc,
+    time::{self, Duration},
+};
+use tracing::{debug, warn};
 
 use kalshi_rs::KalshiClient;
 use kalshi_rs::markets::models::MarketsQuery;
@@ -28,6 +31,56 @@ pub struct ActiveMarketMeta {
     pub market_ticker: String,
     pub open_ts: i64,
     pub close_ts: i64,
+    pub strike_price: Option<f64>,
+}
+
+fn parse_numeric_strike(raw: &str) -> Option<f64> {
+    let filtered: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+
+    if filtered.is_empty() {
+        None
+    } else {
+        filtered.parse::<f64>().ok().filter(|v| v.is_finite())
+    }
+}
+
+fn extract_strike_price(m: &kalshi_rs::markets::models::Market) -> Option<f64> {
+    if let Some(v) = m.floor_strike.filter(|v| v.is_finite()) {
+        return Some(v);
+    }
+    if let Some(v) = m.cap_strike.filter(|v| v.is_finite()) {
+        return Some(v);
+    }
+    if let Some(v) = m
+        .functional_strike
+        .as_deref()
+        .and_then(parse_numeric_strike)
+    {
+        return Some(v);
+    }
+    if let Some(v) = m.subtitle.split_whitespace().find_map(parse_numeric_strike) {
+        return Some(v);
+    }
+    None
+}
+
+async fn fetch_strike_price_by_ticker(http: &KalshiClient, ticker: &str) -> Result<Option<f64>> {
+    let resp = http.get_market(ticker).await?;
+    Ok(extract_strike_price(&resp.market))
+}
+
+async fn resolve_strike_price(
+    http: &KalshiClient,
+    market: &kalshi_rs::markets::models::Market,
+) -> Result<Option<f64>> {
+    if let Some(v) = extract_strike_price(market) {
+        return Ok(Some(v));
+    }
+
+    fetch_strike_price_by_ticker(http, &market.ticker).await
 }
 
 /// Parse RFC3339 timestamps like "2026-01-27T23:15:00Z" into epoch seconds (UTC).
@@ -38,7 +91,10 @@ fn parse_rfc3339_utc(ts: &str) -> Result<i64> {
 
 /// Fetch the currently active market for a series (e.g. KXBTC15M).
 /// If none are active (rare), picks the soonest future market by open_time.
-pub async fn fetch_current_market(http: &KalshiClient, series_ticker: &str) -> Result<ActiveMarketMeta> {
+pub async fn fetch_current_market(
+    http: &KalshiClient,
+    series_ticker: &str,
+) -> Result<ActiveMarketMeta> {
     let params = MarketsQuery {
         limit: Some(1000),
         status: Some("open".to_string()),
@@ -59,18 +115,21 @@ pub async fn fetch_current_market(http: &KalshiClient, series_ticker: &str) -> R
             market_ticker: m.ticker.to_string(),
             open_ts,
             close_ts,
+            strike_price: resolve_strike_price(http, m).await?,
         });
     }
 
     // 2) Fallback: pick soonest future market by open_time
-    let mut best: Option<(i64, i64, String)> = None; // (open_ts, close_ts, ticker)
+    let mut best: Option<(i64, i64, String, Option<f64>)> = None; // (open_ts, close_ts, ticker, strike_price)
     for m in markets.iter() {
         let open_ts = match parse_rfc3339_utc(&m.open_time) {
             Ok(v) => v,
             Err(_) => continue,
         };
 
-        if open_ts < now { continue; }
+        if open_ts < now {
+            continue;
+        }
 
         let close_ts = match parse_rfc3339_utc(&m.close_time) {
             Ok(v) => v,
@@ -78,21 +137,35 @@ pub async fn fetch_current_market(http: &KalshiClient, series_ticker: &str) -> R
         };
 
         match &best {
-            None => best = Some((open_ts, close_ts, m.ticker.to_string())),
-            Some((best_open, _, _)) => {
+            None => {
+                best = Some((
+                    open_ts,
+                    close_ts,
+                    m.ticker.to_string(),
+                    resolve_strike_price(http, m).await?,
+                ))
+            }
+            Some((best_open, _, _, _)) => {
                 if open_ts < *best_open {
-                    best = Some((open_ts, close_ts, m.ticker.to_string()));
+                    best = Some((
+                        open_ts,
+                        close_ts,
+                        m.ticker.to_string(),
+                        resolve_strike_price(http, m).await?,
+                    ));
                 }
             }
         }
     }
 
-    let (open_ts, close_ts, ticker) = best.context("No active market and no upcoming market found")?;
+    let (open_ts, close_ts, ticker, strike_price) =
+        best.context("No active market and no upcoming market found")?;
     Ok(ActiveMarketMeta {
         series_ticker: series_ticker.to_string(),
         market_ticker: ticker,
         open_ts,
         close_ts,
+        strike_price,
     })
 }
 
@@ -105,7 +178,7 @@ pub async fn bootstrap_active_markets(
         let cur = fetch_current_market(http, s).await?;
         out.push(cur);
     }
-    info!("Markets: {:#?}", out);
+    debug!("Markets: {:#?}", out);
     Ok(out)
 }
 
@@ -120,6 +193,7 @@ pub async fn seed_shared_times(shared: &Shared, markets: &[ActiveMarketMeta]) ->
             let mut g = ts.mkt.write().await;
             g.open_ts = Some(m.open_ts);
             g.close_ts = Some(m.close_ts);
+            g.strike_price = m.strike_price;
         }
 
         ts.touch(&shared);
@@ -130,7 +204,9 @@ pub async fn seed_shared_times(shared: &Shared, markets: &[ActiveMarketMeta]) ->
 /// Optional helper: cancel any known resting orders on a ticker before we drop it.
 /// This is “nice to have”. If you don’t want cancels, you can remove this.
 async fn cancel_known_resting(exec_tx: &mpsc::Sender<ExecCommand>, shared: &Shared, ticker: &str) {
-    let Some(ts) = shared.tickers.get(ticker) else { return; };
+    let Some(ts) = shared.tickers.get(ticker) else {
+        return;
+    };
     let mut g = ts.mkt.write().await;
 
     // If your RestingHint stores order_id, cancel them.
@@ -153,10 +229,12 @@ async fn cancel_known_resting(exec_tx: &mpsc::Sender<ExecCommand>, shared: &Shar
     drop(g);
 
     for oid in cancels {
-        let _ = exec_tx.send(ExecCommand::CancelOrder {
-            ticker: ticker.to_string(),
-            order_id: oid,
-        }).await;
+        let _ = exec_tx
+            .send(ExecCommand::CancelOrder {
+                ticker: ticker.to_string(),
+                order_id: oid,
+            })
+            .await;
     }
 }
 
@@ -186,16 +264,46 @@ pub async fn run_market_manager(
         let series_list: Vec<String> = active_by_series.keys().cloned().collect();
 
         for series in series_list {
-            let Some(cur) = active_by_series.get(&series).cloned() else { continue; };
+            let Some(mut cur) = active_by_series.get(&series).cloned() else {
+                continue;
+            };
+
+            if cur.strike_price.is_none() {
+                match fetch_strike_price_by_ticker(&http, &cur.market_ticker).await {
+                    Ok(Some(strike_price)) => {
+                        debug!(
+                            series = %series,
+                            ticker = %cur.market_ticker,
+                            strike_price,
+                            "backfilled strike price for active market"
+                        );
+                        cur.strike_price = Some(strike_price);
+                        seed_shared_times(&shared, &[cur.clone()]).await?;
+                        active_by_series.insert(series.clone(), cur.clone());
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            series = %series,
+                            ticker = %cur.market_ticker,
+                            err = ?e,
+                            "failed to refresh strike price for active market"
+                        );
+                    }
+                }
+            }
 
             // If we don't know close_ts (shouldn't happen), skip.
             if now < cur.close_ts {
                 continue;
             }
 
-            tracing::info!(
+            tracing::debug!(
                 "series={} current market {} closed (now={} close_ts={}), rotating...",
-                series, cur.market_ticker, now, cur.close_ts
+                series,
+                cur.market_ticker,
+                now,
+                cur.close_ts
             );
 
             // Fetch new current market for this series
@@ -203,7 +311,11 @@ pub async fn run_market_manager(
 
             // If ticker didn't change, just refresh times (maybe Kalshi updated close_time)
             if next.market_ticker == cur.market_ticker {
-                tracing::info!("series={} active ticker unchanged {}, refreshing times", series, cur.market_ticker);
+                tracing::debug!(
+                    "series={} active ticker unchanged {}, refreshing times",
+                    series,
+                    cur.market_ticker
+                );
                 seed_shared_times(&shared, &[next.clone()]).await?;
                 active_by_series.insert(series.clone(), next);
                 continue;
@@ -245,10 +357,12 @@ pub async fn run_market_manager(
             // 2) Tell WS task to update subscriptions:
             //    - add new ticker
             //    - delete old ticker
-            let _ = ws_tx.send(WsMarketCommand::UpdateMarkets {
-                add: vec![next.market_ticker.clone()],
-                remove: vec![cur.market_ticker.clone()],
-            }).await;
+            let _ = ws_tx
+                .send(WsMarketCommand::UpdateMarkets {
+                    add: vec![next.market_ticker.clone()],
+                    remove: vec![cur.market_ticker.clone()],
+                })
+                .await;
 
             // 3) Optional: cancel known resting orders on old ticker
             cancel_known_resting(&exec_tx, &shared, &cur.market_ticker).await;

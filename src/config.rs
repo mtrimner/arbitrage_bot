@@ -6,7 +6,7 @@ pub enum ExecMode {
     Paper,
 }
 
-impl ExecMode{
+impl ExecMode {
     /// Parse an execution mode from a string
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -48,8 +48,8 @@ pub struct Config {
     pub balance_s: i64,    // “late” phase length (force balancing)
 
     // Maker/taker price constraints.
-    pub aggressive_tick: u8,     // used for “slightly more aggressive” logic
-    pub maker_improve_tick: u8,  // how much we improve best bid when quoting (often 0 or 1)
+    pub aggressive_tick: u8,    // used for “slightly more aggressive” logic
+    pub maker_improve_tick: u8, // how much we improve best bid when quoting (often 0 or 1)
     pub maker_improve_tick_balance: u8, // in balance mode, basically forces maker to ask-1
     pub max_buy_price_cents: u8, // never pay above this
 
@@ -62,6 +62,9 @@ pub struct Config {
     // - balance_pair_cc: allowed avg_yes+avg_no when forcing balance near the end
     pub bootstrap_pair_cc: i64,
     pub balance_pair_cc: i64,
+    /// In Balance mode, we ramp the pair-cost cap from `balance_pair_cc` (start of Balance)
+    /// up to this value (at expiry) so we can finish hedged.
+    pub final_balance_pair_cc: i64,
 
     // One-sided “rescue” behavior:
     // - max unhedged qty allowed while waiting for the other side
@@ -78,48 +81,47 @@ pub struct Config {
     pub imbalance_min_total: i64,
     pub imbalance_cap_small_total: f64,
 
-    // Dynamic sizing (catch-up)
-    pub max_order_qty: u64,            // hard safety cap
-    pub catchup_aggressiveness: f64,   // 0.0..1.0 how fast to catch up
-    pub catchup_balance_boost: f64,    // multiplier in Balance mode
+    /// Max allowed absolute |yes-no| during Accumulate/Hedge.
+    /// Set to 0 for "always snap back to perfectly balanced".
+    pub max_unhedged_qty_early: i64,
+    /// Max allowed absolute |yes-no| during Balance (near the end).
+    pub max_unhedged_qty_late: i64,
 
+    /// If we're balanced and already under `target_pair_cc` in the last N seconds,
+    /// cancel any resting orders and stop trading to avoid getting unbalanced again.
+    pub freeze_if_balanced_s: i64,
+
+    // Dynamic sizing (catch-up)
+    pub max_order_qty: u64,          // hard safety cap
+    pub catchup_aggressiveness: f64, // 0.0..1.0 how fast to catch up
+    pub catchup_balance_boost: f64,  // multiplier in Balance mode
 
     // Resting order management
-    pub cancel_stale_ms: u64,        // cancel resting orders older than this
-    pub min_resting_life_ms: u64,    // DO NOT churn/cancel before this age
-    pub cancel_retry_ms: u64,        // if we sent cancel already, wait this long to retry
-    pub cancel_drift_cents: u8,      // if desired quote moves away from current resting price by >= this, consider requote
-    pub maker_max_edge_cents: u8,    // don’t quote more than this below “top maker price” (avoids super-low bids that never fill)
-    pub maker_qty_price_tol_cents: u8,          // price-vs-qty tolerance when choosing (price,qty) under cap (normal)
-    pub maker_qty_price_tol_cents_balance: u8,  // same tolerance in Balance mode
-
-    // -------- Inventory-skewed dual quoting knobs --------
-    // When imbalance_ratio >= this, we skew quoting:
-    // - hedge side becomes "more competitive" (can force top to ask-1 in maker quote)
-    // - strong side becomes "weak" and only quotes if it materially improves pair cost
-    pub skew_imbalance_start: f64,
+    pub cancel_stale_ms: u64,     // cancel resting orders older than this
+    pub min_resting_life_ms: u64, // DO NOT churn/cancel before this age
+    pub cancel_retry_ms: u64,     // if we sent cancel already, wait this long to retry
+    pub cancel_drift_cents: u8, // if desired quote moves away from current resting price by >= this, consider requote
+    pub maker_max_edge_cents: u8, // don’t quote more than this below “top maker price” (avoids super-low bids that never fill)
+    /// Wider edge band in Balance mode (lets us park deeper hedge-side bids under a tight cap).
+    pub maker_max_edge_cents_balance: u8,
+    pub maker_qty_price_tol_cents: u8, // price-vs-qty tolerance when choosing (price,qty) under cap (normal)
+    pub maker_qty_price_tol_cents_balance: u8, // same tolerance in Balance mode
 
     // Hedge side reprices faster (e.g. 1 cent), strong side uses cancel_drift_cents.
     pub cancel_drift_cents_hedge: u8,
 
-    // If desired_side == hedge and imbalance_ratio >= this, push quote up to ask-1 (still post-only).
-    pub hedge_force_ask_minus_one_imbalance: f64,
-
-    // Strong-side passive quote constraints
-    pub dual_strong_min_improve_cc: i64, // require at least this much pair-cost improvement (cent-cents)
-    pub dual_strong_backoff_cents: u8,   // how many cents below top-maker to start searching for a weak bid
-    pub dual_strong_qty: u64,            // qty for strong-side passive order (usually 1)
-
-    // Don’t enable skew-dual quoting until we have enough inventory (prevents early “forced hedge” stalls).
-    pub skew_min_total: i64,
+    /// When |yes-no| >= this, push hedge-side maker quotes up to ask-1 (still post-only).
+    pub hedge_force_ask_minus_one_gap: i64,
 
     // Opportunistic taker behavior
     pub taker_cooldown_ms: u64, // don’t fire takers on same side more often than this
     pub min_taker_improve_cc: i64, // require at least this much pair-cost improvement (cent-cents) for opportunistic taker (unless balancing)
 
-    pub maker_first_ms: u64,      // wait this long for a resting maker to work
-    pub taker_desperate_s: i64,   // only force IOC in last N seconds of Balance
+    pub maker_first_ms: u64,    // wait this long for a resting maker to work
+    pub taker_desperate_s: i64, // only force IOC in last N seconds of Balance
     pub taker_big_improve_cc: i64, // allow IOC early only for huge improvements
+    /// If the absolute gap is this large in Balance mode, allow IOC hedges earlier.
+    pub taker_force_gap: i64,
 
     // --- Short-side sizing ---
     /// When we are buying the **short** side (gap > 0), try at least this many contracts.
@@ -128,6 +130,20 @@ pub struct Config {
     /// NOTE: this is only the *desired* qty. The maker price/qty chooser may still fall
     /// back to a smaller qty (down to 1) if larger sizes can't be priced under cap.
     pub short_side_min_order_qty: u64,
+
+    // --- Coinbase price feed (optional, for lead/lag validation) ---
+    /// Enable Coinbase websocket ticker feed (BTC-USD by default).
+    pub coinbase_ws_enabled: bool,
+    /// Coinbase product id, e.g. "BTC-USD"
+    pub coinbase_product_id: String,
+    /// Only log Coinbase updates when price moves at least this much (USD)
+    pub coinbase_log_delta_usd: f64,
+    pub coinbase_leadlag_enabled: bool,
+    pub coinbase_leadlag_min_move_usd: f64,
+    pub coinbase_leadlag_file: String,
+    pub coinbase_leadlag_max_wait_ms: u64,
+    pub coinbase_leadlag_min_kalshi_move_cents: u8,
+    pub coinbase_leadlag_window_ms: u64,
 
     pub results_file: String,
 }
@@ -152,12 +168,16 @@ impl Default for Config {
             maker_improve_tick_balance: 99,
             max_buy_price_cents: 99,
 
-            safe_pair_cc: 9875,
-            target_pair_cc: 9825,
+            safe_pair_cc: 9950,
+            target_pair_cc: 9900,
 
-            bootstrap_pair_cc: 10100, // $1.01
-            balance_pair_cc: 9925, // $0.99.25
- 
+            bootstrap_pair_cc: 9950, // $1.01
+            balance_pair_cc: 9925,   // $0.99.25
+
+            // Endgame safety valve: allow small loss *only* to guarantee we end hedged.
+            // 10100 = allow up to $1.01 average pair cost during forced closeout.
+            // (Tune: 10025, 10050, 10100...)
+            final_balance_pair_cc: 10100,
             bootstrap_max_one_side_qty: 5,
             bootstrap_rescue_min_improve_cc: 500,
 
@@ -167,37 +187,46 @@ impl Default for Config {
             imbalance_min_total: 20,
             imbalance_cap_small_total: 0.50,
 
+            // Keep inventory essentially flat
+            max_unhedged_qty_early: 1,
+            max_unhedged_qty_late: 0,
+            freeze_if_balanced_s: 420,
+
             max_order_qty: 25,
             catchup_aggressiveness: 0.45,
             catchup_balance_boost: 1.5,
 
-            cancel_stale_ms: 120000,
-            min_resting_life_ms: 1000,
+            cancel_stale_ms: 300000,
+            min_resting_life_ms: 2500,
             cancel_retry_ms: 800,
             cancel_drift_cents: 3,
             maker_max_edge_cents: 15,
+            maker_max_edge_cents_balance: 40,
             // If qty>1 forces you to quote much lower, stick to smaller qty near top
             maker_qty_price_tol_cents: 2,
             maker_qty_price_tol_cents_balance: 1,
 
-            // Inventory-skew defaults (tune these!)
-            skew_imbalance_start: 0.05,
             cancel_drift_cents_hedge: 1,
-            hedge_force_ask_minus_one_imbalance: 0.10,
-            dual_strong_min_improve_cc: 20, // 0.20 cents
-            dual_strong_backoff_cents: 3,
-            dual_strong_qty: 1,
-            skew_min_total: 10,
+            hedge_force_ask_minus_one_gap: 1,
 
             taker_cooldown_ms: 1000,
             min_taker_improve_cc: 20, // 0.2 cents improvement in pair-cost
 
             maker_first_ms: 1500,      // 1.5s
-            taker_desperate_s: 120,     // last 120s
-            taker_big_improve_cc: 100, // 1.00 cent improvement in pair-cost
+            taker_desperate_s: 240,    // last 120s
+            taker_big_improve_cc: 200, // 1.00 cent improvement in pair-cost
+            taker_force_gap: 1,
+            short_side_min_order_qty: 1,
 
-            short_side_min_order_qty: 6,
-
+            coinbase_ws_enabled: false,
+            coinbase_product_id: "BTC-USD".to_string(),
+            coinbase_log_delta_usd: 10.0,
+            coinbase_leadlag_enabled: true,
+            coinbase_leadlag_min_move_usd: 10.0,
+            coinbase_leadlag_file: "coinbase_kalshi_leadlag.csv".to_string(),
+            coinbase_leadlag_max_wait_ms: 5000,
+            coinbase_leadlag_min_kalshi_move_cents: 1,
+            coinbase_leadlag_window_ms: 1000,
             results_file: "results.csv".to_string(),
         }
     }
@@ -212,6 +241,25 @@ impl Config {
         if let Ok(v) = env::var("RESULTS_FILE") {
             cfg.results_file = v;
         }
+
+        if let Ok(v) = env::var("COINBASE_WS") {
+            let s = v.trim().to_ascii_lowercase();
+            cfg.coinbase_ws_enabled = matches!(s.as_str(), "1" | "true" | "yes" | "y" | "on");
+        }
+        if let Ok(v) = env::var("COINBASE_PRODUCT_ID") {
+            let s = v.trim();
+            if !s.is_empty() {
+                cfg.coinbase_product_id = s.to_string();
+            }
+        }
+        if let Ok(v) = env::var("COINBASE_LOG_DELTA_USD") {
+            if let Ok(x) = v.trim().parse::<f64>() {
+                if x.is_finite() && x > 0.0 {
+                    cfg.coinbase_log_delta_usd = x;
+                }
+            }
+        }
+
         cfg
     }
 }

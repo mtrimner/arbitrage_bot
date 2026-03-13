@@ -19,6 +19,29 @@ impl Default for Book {
 }
 
 impl Book {
+    // COINBASE LOGGING ---------------------
+    pub fn best_yes_bid(&self) -> Option<u8> {
+        self.best_bid(Side::Yes)
+    }
+
+    pub fn best_no_bid(&self) -> Option<u8> {
+        self.best_bid(Side::No)
+    }
+
+    pub fn best_yes_ask(&self) -> Option<u8> {
+        self.implied_ask(Side::Yes)
+    }
+
+    pub fn best_no_ask(&self) -> Option<u8> {
+        self.implied_ask(Side::No)
+    }
+
+    pub fn spread_cents(&self, side: Side) -> Option<u8> {
+        let bid = self.best_bid(side)?;
+        let ask = self.implied_ask(side)?;
+        Some(ask.saturating_sub(bid))
+    }
+    // -----------------------------------
     #[inline]
     fn bids(&self, side: Side) -> &[i64; 101] {
         match side {
@@ -85,6 +108,8 @@ impl Book {
     // True if a new BUY order at `price` would cross the (implied) ask right now.
     // Useful to ensure post_only orders won't be rejected at entry time.
     pub fn crosses_ask(&self, side: Side, price: u8) -> bool {
-        self.implied_ask(side).map(|ask| price >= ask).unwrap_or(false)
+        self.implied_ask(side)
+            .map(|ask| price >= ask)
+            .unwrap_or(false)
     }
 }

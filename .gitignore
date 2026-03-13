@@ -1,5 +1,7 @@
 /target
 private_keys
 .env
+/crates/
+/coinbase_kalshi_leadlag.csv
 
 results.csv
