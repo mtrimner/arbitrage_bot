@@ -11,6 +11,9 @@ const DOLLAR_CC: i64 = 100 * CC_PER_CENT;
 const MAX_CAP_CC: i64 = 200 * CC_PER_CENT;
 const NO_ORDER_LOG_REPEAT_SECS: u64 = 5;
 const COINBASE_SIGNAL_LOG_REPEAT_MS: u64 = 5_000;
+const MIN_HEDGE_FLOOR_IMPROVE_CC: i64 = 500;
+const COINBASE_SIGNAL_WEIGHT: f64 = 0.35;
+const MAX_OPEN_DISLOCATION_CENTS: f64 = 4.0;
 
 fn clear_no_order_reason(m: &mut Market) {
     m.last_no_order_reason = None;
@@ -491,6 +494,40 @@ fn vol_extra_cents(cfg: &Config, signal: &CoinbaseSignal) -> i32 {
         .clamp(0, cfg.quote_max_vol_extra_cents as i32)
 }
 
+fn kalshi_mid_yes_cents(m: &Market) -> Option<f64> {
+    Some((m.book.best_bid(Side::Yes)? as f64 + m.book.implied_ask(Side::Yes)? as f64) / 2.0)
+}
+
+fn anchored_fair_yes_cents(m: &Market, signal: &CoinbaseSignal) -> u8 {
+    let Some(kalshi_mid) = kalshi_mid_yes_cents(m) else {
+        return signal.fair_yes_cents;
+    };
+
+    let raw = signal.fair_yes_cents as f64;
+    let blended = kalshi_mid + COINBASE_SIGNAL_WEIGHT * (raw - kalshi_mid);
+    blended.round().clamp(1.0, 99.0) as u8
+}
+
+fn can_open_pairs(cfg: &Config, m: &Market, signal: &CoinbaseSignal, t_rem: i64) -> bool {
+    if t_rem <= cfg.no_new_imbalance_s {
+        return false;
+    }
+
+    let Some(kalshi_mid) = kalshi_mid_yes_cents(m) else {
+        return false;
+    };
+
+    // Blend Coinbase back toward the live Kalshi mid so aligned drift/extreme
+    // states can still open pairs without reacting to transient dislocations.
+    let fair = anchored_fair_yes_cents(m, signal) as f64;
+    let dislocation = (fair - kalshi_mid).abs();
+
+    matches!(
+        signal.regime,
+        SignalRegime::TwoSided | SignalRegime::DriftUp | SignalRegime::DriftDown
+    ) || dislocation <= MAX_OPEN_DISLOCATION_CENTS
+}
+
 fn desired_maker_quote(
     cfg: &Config,
     m: &Market,
@@ -507,7 +544,10 @@ fn desired_maker_quote(
         }
     }
 
-    let mut center = signal.fair_yes_cents as i32 + inventory_shift_cents(cfg, m);
+    // Use the anchored fair here too so maker quotes stay close to the actual
+    // Kalshi book instead of chasing raw Coinbase fair when the venues diverge.
+    let fair_yes_cents = anchored_fair_yes_cents(m, signal);
+    let mut center = fair_yes_cents as i32 + inventory_shift_cents(cfg, m);
     center = center.clamp(1, cfg.max_buy_price_cents as i32);
 
     let half = cfg.quote_base_halfspread_cents as i32 + vol_extra_cents(cfg, signal);
@@ -544,24 +584,37 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
     let sim = m.pos.simulate_buy(side, price_cents, qty as i64);
     let old_gap = unhedged_qty(m);
     let new_gap = (sim.yes_qty - sim.no_qty).abs();
+    let old_floor = m.pos.locked_floor_cc();
+    let new_floor = sim.locked_floor_cc();
     let old_pc = m.pos.pair_cost_cc();
     let new_pc = sim.pair_cost_cc();
 
+    // When a fill reduces an imbalance, judge it on guaranteed-floor repair
+    // rather than demanding the average pair cost also improve.
+    if new_gap < old_gap {
+        if new_floor >= cfg.locked_floor_buffer_cc {
+            return true;
+        }
+
+        if old_floor < 0 && new_floor >= old_floor + MIN_HEDGE_FLOOR_IMPROVE_CC {
+            return true;
+        }
+
+        return false;
+    }
+
+    // Opening fresh same-side risk stays strict on pair cost and catch-up math.
     if let Some(pc) = new_pc {
         if pc > cfg.safe_pair_cc {
             return false;
         }
         if let Some(old) = old_pc {
-            if new_gap <= old_gap && pc > old {
+            if pc > old {
                 return false;
             }
         }
-        if new_gap == 0 {
-            return sim.locked_floor_cc() >= cfg.locked_floor_buffer_cc
-                || pc <= strict_balance_cap_cc(cfg);
-        }
     }
-    if sim.locked_floor_cc() >= cfg.locked_floor_buffer_cc {
+    if new_floor >= cfg.locked_floor_buffer_cc {
         return true;
     }
 
@@ -590,7 +643,9 @@ fn is_balanced_but_bad(cfg: &Config, m: &Market) -> bool {
     m.pos.is_balanced()
         && (m.pos.yes_qty > 0 || m.pos.no_qty > 0)
         && (m.pos.locked_floor_cc() < cfg.locked_floor_buffer_cc
-            || m.pos.pair_cost_cc().is_some_and(|pc| pc > cfg.target_pair_cc))
+            || m.pos
+                .pair_cost_cc()
+                .is_some_and(|pc| pc > cfg.target_pair_cc))
 }
 
 fn repair_side_for(regime: SignalRegime) -> Option<Side> {
@@ -867,7 +922,8 @@ pub fn decide(
     }
 
     if let Some(vulnerable) = coinbase.cancel_vulnerable_side(&signal, cfg) {
-        let skip_cancel_for_repair = balanced_but_bad && gap == 0 && repair_side == Some(vulnerable);
+        let skip_cancel_for_repair =
+            balanced_but_bad && gap == 0 && repair_side == Some(vulnerable);
         if !skip_cancel_for_repair {
             if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, vulnerable) {
                 clear_no_order_reason(m);
@@ -881,9 +937,9 @@ pub fn decide(
     let hedge = hedge_side(m);
     let strong = hedge.other();
     let no_new_imbalance = t_rem <= cfg.no_new_imbalance_s;
-    let two_sided_ok = matches!(signal.regime, SignalRegime::TwoSided) && !no_new_imbalance;
+    let open_pairs_allowed = can_open_pairs(cfg, m, &signal, t_rem);
 
-    if (!two_sided_ok && gap == 0)
+    if (!open_pairs_allowed && gap == 0)
         || (m.mode == Mode::Balance && no_new_imbalance && m.pos.is_balanced())
     {
         if balanced_but_bad && !no_new_imbalance {
@@ -922,7 +978,7 @@ pub fn decide(
         return None;
     }
 
-    if needs_hedge_only(gap, allowed_gap) || !two_sided_ok {
+    if needs_hedge_only(gap, allowed_gap) || !open_pairs_allowed {
         if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, strong) {
             clear_no_order_reason(m);
             return Some(cmd);
@@ -1033,7 +1089,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_short_side_fill_that_blows_through_safe_pair_cap() {
+    fn rejects_expensive_hedge_that_does_not_repair_floor_enough() {
         let cfg = Config::default();
         let mut m = Market::new();
 
@@ -1043,7 +1099,7 @@ mod tests {
         m.pos.apply_fill(Side::Yes, 43, 1);
         m.pos.apply_fill(Side::No, 51, 1);
 
-        assert!(!admission_ok(&cfg, &m, Side::No, 59, 1));
+        assert!(!admission_ok(&cfg, &m, Side::No, 99, 1));
     }
 
     #[test]
@@ -1054,6 +1110,57 @@ mod tests {
         m.pos.apply_fill(Side::No, 51, 1);
 
         assert!(admission_ok(&cfg, &m, Side::Yes, 47, 1));
+    }
+
+    #[test]
+    fn allows_loss_reducing_hedge_even_when_pair_cost_worsens() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+
+        m.pos.apply_fill(Side::Yes, 38, 1);
+        m.pos.apply_fill(Side::Yes, 38, 1);
+        m.pos.apply_fill(Side::No, 58, 1);
+        m.pos.apply_fill(Side::No, 58, 1);
+        m.pos.apply_fill(Side::No, 58, 1);
+
+        assert_eq!(m.pos.locked_floor_cc(), -5_000);
+        assert_eq!(m.pos.pair_cost_cc(), Some(9_600));
+        assert!(admission_ok(&cfg, &m, Side::Yes, 80, 1));
+    }
+
+    #[test]
+    fn allows_opening_when_extreme_signal_is_still_close_to_kalshi_mid() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+
+        m.book.yes_bids[70] = 1;
+        m.book.no_bids[26] = 1;
+
+        let signal = CoinbaseSignal {
+            price: 0.0,
+            microprice: 0.0,
+            ema_fast: 0.0,
+            ema_slow: 0.0,
+            vol_ema_usd: 0.0,
+            fair_yes: 0.80,
+            fair_yes_cents: 80,
+            trend_z: 0.0,
+            distance_usd: 0.0,
+            sigma_usd: 1.0,
+            age_ms: 0,
+            regime: SignalRegime::ExtremeUp,
+            realized_final_avg: None,
+            required_remaining_avg: None,
+        };
+
+        assert_eq!(kalshi_mid_yes_cents(&m), Some(72.0));
+        assert_eq!(anchored_fair_yes_cents(&m, &signal), 75);
+        assert!(can_open_pairs(
+            &cfg,
+            &m,
+            &signal,
+            cfg.no_new_imbalance_s + 1
+        ));
     }
 
     #[test]

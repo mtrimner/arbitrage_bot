@@ -230,7 +230,7 @@ impl Default for Config {
             hedge_quote_boost_cents: 0,
             inventory_skew_per_contract_cents: 1,
             inventory_skew_max_cents: 3,
-            market_entry_pair_cost_cc: 9800,
+            market_entry_pair_cost_cc: 9900,
             locked_floor_buffer_cc: 100,
             catchup_plausibility_buffer_cents: 1,
             no_new_imbalance_s: 30,

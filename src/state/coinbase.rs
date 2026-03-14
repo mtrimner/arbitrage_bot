@@ -445,18 +445,12 @@ impl CoinbaseState {
         let before = self.snapshot();
 
         self.last_trade_price = Some(last_trade_price);
-        if best_bid.is_some() {
-            self.best_bid = best_bid;
-        }
-        if best_ask.is_some() {
-            self.best_ask = best_ask;
-        }
-        if best_bid_qty.is_some() {
-            self.best_bid_qty = best_bid_qty;
-        }
-        if best_ask_qty.is_some() {
-            self.best_ask_qty = best_ask_qty;
-        }
+        // Keep ticker for trade prints only. The level2 channel owns top-of-book
+        // so we do not let ticker overwrite the maintained book state.
+        let _ = best_bid;
+        let _ = best_ask;
+        let _ = best_bid_qty;
+        let _ = best_ask_qty;
 
         let _ = self.refresh_price_state(cfg, ts_ms);
         let after = self.snapshot();
@@ -534,5 +528,41 @@ impl CoinbaseState {
             heartbeat_counter: self.heartbeat_counter,
             samples: self.samples.iter().cloned().collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ticker_updates_last_trade_without_overwriting_level2_book() {
+        let cfg = Config::default();
+        let mut state = CoinbaseState::new("BTC-USD".to_string());
+
+        state.apply_level2_snapshot(
+            &cfg,
+            1_000,
+            &[
+                (CoinbaseBookSide::Bid, 90_000.0, 2.0),
+                (CoinbaseBookSide::Ask, 90_010.0, 1.5),
+            ],
+        );
+
+        state.apply_ticker(
+            &cfg,
+            1_100,
+            90_005.0,
+            Some(89_990.0),
+            Some(90_020.0),
+            Some(9.0),
+            Some(9.0),
+        );
+
+        assert_eq!(state.last_trade_price, Some(90_005.0));
+        assert_eq!(state.best_bid, Some(90_000.0));
+        assert_eq!(state.best_ask, Some(90_010.0));
+        assert_eq!(state.best_bid_qty, Some(2.0));
+        assert_eq!(state.best_ask_qty, Some(1.5));
     }
 }
