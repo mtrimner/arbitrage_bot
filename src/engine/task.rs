@@ -14,19 +14,23 @@ pub async fn run_engine(cfg: Config, shared: Shared, tx: mpsc::Sender<ExecComman
             _ = interval.tick() => true,
             _ = shared.notify.notified() => false,
         };
+
+        let coinbase_snapshot = {
+            let coinbase = shared.coinbase.read().await;
+            coinbase.snapshot()
+        };
+
         for item in shared.tickers.iter() {
             let ticker = item.key().clone();
             let ts = item.value().clone();
             let dirty = ts.take_dirty();
-            // If interval ticked, run “housekeeping” even if no new data.
-            // If notified, we can skip when not dirty.
             if !interval_fired && !dirty {
                 continue;
             }
 
             let cmd = {
                 let mut g = ts.mkt.write().await;
-                crate::engine::decision::decide(&cfg, &ticker, &mut g)
+                crate::engine::decision::decide(&cfg, &ticker, &mut g, Some(&coinbase_snapshot))
             };
 
             if let Some(cmd) = cmd {

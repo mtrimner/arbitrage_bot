@@ -1,6 +1,6 @@
 use anyhow::Result;
 use tokio::time::{Duration, sleep};
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use std::collections::{HashMap, HashSet};
@@ -65,6 +65,7 @@ pub async fn run_ws(
             sleep(Duration::from_millis(500)).await;
             continue;
         }
+        info!(markets = ?trefs, channels = ?WS_CHANNELS, "kalshi ws subscribe requested");
 
         // Inner loop: handle WS messages and control commands concurrently.
         loop {
@@ -145,6 +146,7 @@ pub async fn run_ws(
 fn handle_subscribed(sids: &mut HashMap<String, u64>, sr: SubscribedResponse) {
     let ch = sr.msg.channel;
     let sid = sr.msg.sid as u64;
+    info!(channel = %ch, sid, "kalshi ws subscribed");
     sids.insert(ch, sid);
 }
 

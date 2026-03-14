@@ -5,3 +5,6 @@ private_keys
 /coinbase_kalshi_leadlag.csv
 
 results.csv
+/kalshi_bot_strategy_patch/
+kalshi_bot_code_bundle_plain.txt
+new_strategy.txt

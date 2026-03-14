@@ -9,7 +9,7 @@ use chrono::DateTime;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::watch;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::leadlag::{
@@ -17,17 +17,18 @@ use crate::leadlag::{
     SharedLeadLag,
 };
 use crate::state::Shared;
+use crate::state::coinbase::CoinbaseBookSide;
 use crate::types::Side;
 
 #[derive(Debug, Clone)]
 pub struct CoinbasePrice {
-    pub product_id: String,          // "BTC-USD"
-    pub price: f64,                  // last trade / ticker price
-    pub best_bid: Option<f64>,       // optional top-of-book from Coinbase
-    pub best_ask: Option<f64>,       // optional top-of-book from Coinbase
-    pub ts_ms: u64,                  // local receive timestamp
-    pub exchange_ts_ms: Option<u64>, // Coinbase event timestamp if parseable
-    pub sequence_num: Option<u64>,   // Coinbase sequence number
+    pub product_id: String,
+    pub price: f64,
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+    pub ts_ms: u64,
+    pub exchange_ts_ms: Option<u64>,
+    pub sequence_num: Option<u64>,
 }
 
 impl CoinbasePrice {
@@ -40,18 +41,23 @@ impl CoinbasePrice {
 }
 
 #[derive(Debug, Deserialize)]
-struct CoinbaseEnvelope {
+struct CoinbaseHeader {
+    channel: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CoinbaseTickerEnvelope {
     channel: String,
     #[serde(default)]
     timestamp: Option<String>,
     #[serde(default)]
     sequence_num: Option<u64>,
     #[serde(default)]
-    events: Vec<CoinbaseEvent>,
+    events: Vec<CoinbaseTickerEvent>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct CoinbaseEvent {
+struct CoinbaseTickerEvent {
     #[serde(default)]
     r#type: Option<String>,
     #[serde(default)]
@@ -66,6 +72,71 @@ struct CoinbaseTicker {
     best_bid: Option<String>,
     #[serde(default)]
     best_ask: Option<String>,
+    #[serde(default)]
+    best_bid_quantity: Option<String>,
+    #[serde(default)]
+    best_ask_quantity: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CoinbaseL2Envelope {
+    channel: String,
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
+    sequence_num: Option<u64>,
+    #[serde(default)]
+    events: Vec<CoinbaseL2Event>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CoinbaseL2Event {
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    product_id: Option<String>,
+    #[serde(default)]
+    updates: Vec<CoinbaseL2Update>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CoinbaseL2Update {
+    side: String,
+    price_level: String,
+    new_quantity: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CoinbaseHeartbeatEnvelope {
+    channel: String,
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
+    sequence_num: Option<u64>,
+    #[serde(default)]
+    events: Vec<CoinbaseHeartbeatEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum JsonU64 {
+    String(String),
+    Number(u64),
+}
+
+impl JsonU64 {
+    fn to_u64(&self) -> Option<u64> {
+        match self {
+            JsonU64::String(s) => s.parse::<u64>().ok(),
+            JsonU64::Number(v) => Some(*v),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CoinbaseHeartbeatEvent {
+    #[serde(default)]
+    heartbeat_counter: Option<JsonU64>,
 }
 
 fn parse_f64_field(raw: &str, field: &str, product_id: &str) -> Option<f64> {
@@ -109,18 +180,22 @@ fn should_publish(cur: &CoinbasePrice, next: &CoinbasePrice) -> bool {
         || cur.sequence_num != next.sequence_num
 }
 
-fn handle_text_message(text: &str, expected_product_id: &str, tx: &watch::Sender<CoinbasePrice>) {
-    let envelope: CoinbaseEnvelope = match serde_json::from_str(text) {
+async fn handle_ticker_message(
+    text: &str,
+    expected_product_id: &str,
+    tx: &watch::Sender<CoinbasePrice>,
+    cfg: &Config,
+    shared: &Shared,
+) {
+    let envelope: CoinbaseTickerEnvelope = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
-            warn!(err = %e, raw = %text, "coinbase ws raw json parse failed");
+            warn!(err = %e, raw = %text, "coinbase ws ticker json parse failed");
             return;
         }
     };
 
-    // We only care about ticker updates for one product.
     if envelope.channel != "ticker" {
-        debug!(channel = %envelope.channel, "coinbase ws ignoring non-ticker message");
         return;
     }
 
@@ -129,7 +204,6 @@ fn handle_text_message(text: &str, expected_product_id: &str, tx: &watch::Sender
     let sequence_num = envelope.sequence_num;
 
     for event in envelope.events {
-        // Optional sanity check; not required for correctness.
         if let Some(kind) = &event.r#type {
             if kind != "update" && kind != "snapshot" {
                 debug!(event_type = %kind, "coinbase ws ignoring unexpected ticker event type");
@@ -155,6 +229,33 @@ fn handle_text_message(text: &str, expected_product_id: &str, tx: &watch::Sender
                 "best_ask",
                 &ticker.product_id,
             );
+            let best_bid_qty = parse_optional_f64_field(
+                ticker.best_bid_quantity.as_deref(),
+                "best_bid_quantity",
+                &ticker.product_id,
+            );
+            let best_ask_qty = parse_optional_f64_field(
+                ticker.best_ask_quantity.as_deref(),
+                "best_ask_quantity",
+                &ticker.product_id,
+            );
+
+            {
+                let mut coinbase = shared.coinbase.write().await;
+                let changed = coinbase.apply_ticker(
+                    cfg,
+                    now_ms,
+                    price,
+                    best_bid,
+                    best_ask,
+                    best_bid_qty,
+                    best_ask_qty,
+                );
+                drop(coinbase);
+                if changed {
+                    shared.touch_all();
+                }
+            }
 
             let next = CoinbasePrice {
                 product_id: ticker.product_id,
@@ -178,10 +279,119 @@ fn handle_text_message(text: &str, expected_product_id: &str, tx: &watch::Sender
     }
 }
 
-/// Spawns a Coinbase websocket client subscribed to `Channel::Ticker` for `product_id`.
-///
-/// Returns a `watch::Receiver` that always holds the most recent price snapshot.
-pub fn spawn_coinbase_ticker(product_id: String) -> watch::Receiver<CoinbasePrice> {
+async fn handle_l2_message(text: &str, expected_product_id: &str, cfg: &Config, shared: &Shared) {
+    let envelope: CoinbaseL2Envelope = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(err = %e, raw = %text, "coinbase ws l2 json parse failed");
+            return;
+        }
+    };
+
+    if envelope.channel != "l2_data" && envelope.channel != "level2" {
+        return;
+    }
+
+    let now_ms = CoinbasePrice::now_ms();
+
+    for event in envelope.events {
+        let event_type = event.r#type.clone();
+        let product_id = event.product_id.as_deref().unwrap_or(expected_product_id);
+        if product_id != expected_product_id {
+            continue;
+        }
+
+        let mut parsed = Vec::with_capacity(event.updates.len());
+        for update in event.updates {
+            let Some(price) = parse_f64_field(&update.price_level, "price_level", product_id)
+            else {
+                continue;
+            };
+            let Some(qty) = parse_f64_field(&update.new_quantity, "new_quantity", product_id)
+            else {
+                continue;
+            };
+            let side = match update.side.to_ascii_lowercase().as_str() {
+                "bid" => CoinbaseBookSide::Bid,
+                "offer" | "ask" => CoinbaseBookSide::Ask,
+                other => {
+                    debug!(side = %other, "coinbase ws ignoring unknown l2 side");
+                    continue;
+                }
+            };
+            parsed.push((side, price, qty));
+        }
+
+        if parsed.is_empty() {
+            continue;
+        }
+
+        let changed = {
+            let mut coinbase = shared.coinbase.write().await;
+            match event_type.as_deref() {
+                Some("snapshot") => coinbase.apply_level2_snapshot(cfg, now_ms, &parsed),
+                _ => coinbase.apply_level2_update(cfg, now_ms, &parsed),
+            }
+        };
+
+        if changed {
+            shared.touch_all();
+        }
+    }
+}
+
+async fn handle_heartbeat_message(text: &str, shared: &Shared) {
+    let envelope: CoinbaseHeartbeatEnvelope = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(err = %e, raw = %text, "coinbase ws heartbeat json parse failed");
+            return;
+        }
+    };
+
+    if envelope.channel != "heartbeats" {
+        return;
+    }
+
+    let ts_ms = CoinbasePrice::now_ms();
+    let heartbeat_counter = envelope
+        .events
+        .first()
+        .and_then(|e| e.heartbeat_counter.as_ref())
+        .and_then(JsonU64::to_u64);
+
+    let mut coinbase = shared.coinbase.write().await;
+    coinbase.record_heartbeat(ts_ms, heartbeat_counter);
+}
+
+async fn handle_text_message(
+    text: &str,
+    expected_product_id: &str,
+    tx: &watch::Sender<CoinbasePrice>,
+    cfg: &Config,
+    shared: &Shared,
+) {
+    let header: CoinbaseHeader = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(err = %e, raw = %text, "coinbase ws raw json parse failed");
+            return;
+        }
+    };
+
+    match header.channel.as_str() {
+        "ticker" => handle_ticker_message(text, expected_product_id, tx, cfg, shared).await,
+        "l2_data" | "level2" => handle_l2_message(text, expected_product_id, cfg, shared).await,
+        "heartbeats" => handle_heartbeat_message(text, shared).await,
+        other => debug!(channel = %other, "coinbase ws ignoring channel"),
+    }
+}
+
+pub fn spawn_coinbase_ticker(
+    product_id: String,
+    cfg: Config,
+    shared: Shared,
+) -> watch::Receiver<CoinbasePrice> {
     let (tx, rx) = watch::channel(CoinbasePrice {
         product_id: product_id.clone(),
         price: f64::NAN,
@@ -194,11 +404,17 @@ pub fn spawn_coinbase_ticker(product_id: String) -> watch::Receiver<CoinbasePric
 
     tokio::spawn(async move {
         loop {
-            match run_coinbase_ticker_once(product_id.clone(), tx.clone()).await {
+            match run_coinbase_ticker_once(
+                product_id.clone(),
+                tx.clone(),
+                cfg.clone(),
+                shared.clone(),
+            )
+            .await
+            {
                 Ok(()) => warn!("coinbase ws exited; restarting"),
                 Err(e) => warn!(err = %format!("{e:?}"), "coinbase ws error; restarting"),
             }
-
             tokio::time::sleep(Duration::from_millis(750)).await;
         }
     });
@@ -209,21 +425,27 @@ pub fn spawn_coinbase_ticker(product_id: String) -> watch::Receiver<CoinbasePric
 async fn run_coinbase_ticker_once(
     product_id: String,
     tx: watch::Sender<CoinbasePrice>,
+    cfg: Config,
+    shared: Shared,
 ) -> CbResult<()> {
-    // Let our outer loop own reconnect behavior.
     let mut ws_client = WebSocketClientBuilder::new()
         .use_public(true)
         .auto_reconnect(false)
         .build()?;
 
     let readers = ws_client.connect().await?;
+    let products = vec![product_id.clone()];
+    let empty: Vec<String> = Vec::new();
 
-    // Only subscribe to ticker. Heartbeats add noise and are not needed for your lead/lag use case.
-    ws_client
-        .subscribe(&Channel::Ticker, &[product_id.clone()])
-        .await?;
+    ws_client.subscribe(&Channel::Ticker, &products).await?;
+    ws_client.subscribe(&Channel::Level2, &products).await?;
+    ws_client.subscribe(&Channel::Heartbeats, &empty).await?;
 
-    debug!(product_id = %product_id, "coinbase ws connected and subscribed");
+    info!(
+        product_id = %product_id,
+        channels = ?["ticker", "level2", "heartbeats"],
+        "coinbase ws connected and subscribed"
+    );
 
     let mut stream: EndpointStream = readers.into();
 
@@ -236,7 +458,7 @@ async fn run_coinbase_ticker_once(
                 }
 
                 if let Ok(text) = ws_msg.to_text() {
-                    handle_text_message(text, &product_id, &tx);
+                    handle_text_message(text, &product_id, &tx, &cfg, &shared).await;
                 }
             }
             Err(e) => {
@@ -249,8 +471,6 @@ async fn run_coinbase_ticker_once(
     Ok(())
 }
 
-/// Optional: logs the ticker when it moves by at least `min_delta_usd`.
-/// Useful for eyeballing lead/lag against Kalshi orderbook timestamps.
 pub fn spawn_coinbase_logger(mut rx: watch::Receiver<CoinbasePrice>, min_delta_usd: f64) {
     tokio::spawn(async move {
         let mut last = None::<CoinbasePrice>;
@@ -346,7 +566,6 @@ pub async fn spawn_coinbase_move_detector(
         };
 
         let m = ts.mkt.read().await;
-
         let kalshi_strike_price = m.strike_price;
         let trigger_yes_bid = m.book.best_yes_bid();
         let trigger_no_bid = m.book.best_no_bid();

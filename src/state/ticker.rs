@@ -31,6 +31,7 @@ pub struct Market {
     // Cooldowns for takers so we don’t spam.
     pub last_taker_yes: Option<Instant>,
     pub last_taker_no: Option<Instant>,
+    pub last_no_order_reason: Option<&'static str>,
 
     pub mode: Mode,
 }
@@ -48,6 +49,7 @@ impl Market {
             resting_no: None,
             last_taker_yes: None,
             last_taker_no: None,
+            last_no_order_reason: None,
             mode: Mode::Accumulate,
         }
     }

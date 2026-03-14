@@ -1,4 +1,3 @@
-// src/report.rs
 use tracing::info;
 
 use crate::state::position::Position;
@@ -20,10 +19,10 @@ fn cc_to_dollars(cc: i64) -> f64 {
 pub fn log_position(ticker: &str, pos: &Position) {
     let yes_avg_cents = pos.avg_yes_cc().map(cc_to_cents);
     let no_avg_cents = pos.avg_no_cc().map(cc_to_cents);
-
-    // “total avg price” in your world is really “pair cost” (avg_yes + avg_no)
     let pair_cost_cents = pos.pair_cost_cc().map(cc_to_cents);
     let pair_cost_dollars = pos.pair_cost_cc().map(cc_to_dollars);
+    let locked_floor_cents = cc_to_cents(pos.locked_floor_cc());
+    let locked_floor_dollars = cc_to_dollars(pos.locked_floor_cc());
 
     info!(
         ticker = %ticker,
@@ -33,11 +32,12 @@ pub fn log_position(ticker: &str, pos: &Position) {
         no_avg_cents = ?no_avg_cents,
         pair_cost_cents = ?pair_cost_cents,
         pair_cost_dollars = ?pair_cost_dollars,
+        locked_floor_cents,
+        locked_floor_dollars,
         "position snapshot"
     );
 }
 
-// NEW: append one CSV row per closed window
 fn fmt_ts_rfc3339(ts: i64) -> String {
     Utc.timestamp_opt(ts, 0)
         .single()
@@ -77,7 +77,7 @@ pub async fn append_result_csv(
         .with_context(|| format!("open results file {}", p.display()))?;
 
     if needs_header {
-        let header = "run_ts_utc,open_time_utc,close_time_utc,yes_qty,no_qty,yes_avg_cents,no_avg_cents,pair_cost_cents,pair_cost_dollars,pnl_yes_win,pnl_no_win\n";
+        let header = "run_ts_utc,open_time_utc,close_time_utc,yes_qty,no_qty,yes_avg_cents,no_avg_cents,pair_cost_cents,pair_cost_dollars,locked_floor_cents,locked_floor_dollars,pnl_yes_win,pnl_no_win\n";
         f.write_all(header.as_bytes()).await?;
     }
 
@@ -89,25 +89,26 @@ pub async fn append_result_csv(
     let no_avg_cents = pos.avg_no_cc().map(cc_to_cents);
     let pair_cost_cents = pos.pair_cost_cc().map(cc_to_cents);
     let pair_cost_dollars = pos.pair_cost_cc().map(cc_to_dollars);
+    let locked_floor_cents = cc_to_cents(pos.locked_floor_cc());
+    let locked_floor_dollars = cc_to_dollars(pos.locked_floor_cc());
 
     let total_cost_cc = pos.yes_cost_cc.saturating_add(pos.no_cost_cc);
-
     let total_cost_dollars = cc_to_dollars(total_cost_cc);
-
     let yes_qty = pos.yes_qty.max(0) as f64;
     let no_qty = pos.no_qty.max(0) as f64;
-
     let pnl_yes_win_dollars = yes_qty - total_cost_dollars;
     let pnl_no_win_dollars = no_qty - total_cost_dollars;
 
     let line = format!(
-        "{run_ts},{open_time},{close_time},{},{},{},{},{},{},{},{}\n",
+        "{run_ts},{open_time},{close_time},{},{},{},{},{},{},{:.2},{:.4},{},{}\n",
         pos.yes_qty,
         pos.no_qty,
         fmt_opt_2(yes_avg_cents),
         fmt_opt_2(no_avg_cents),
         fmt_opt_2(pair_cost_cents),
         fmt_opt_4(pair_cost_dollars),
+        locked_floor_cents,
+        locked_floor_dollars,
         pnl_yes_win_dollars,
         pnl_no_win_dollars,
     );

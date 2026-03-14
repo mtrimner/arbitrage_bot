@@ -11,6 +11,7 @@ mod ws;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use dotenv::dotenv;
@@ -27,37 +28,35 @@ use kalshi_rs::{KalshiClient, KalshiWebsocketClient};
 async fn main() -> Result<()> {
     dotenv().ok();
 
-    // Basic logging: set RUST_LOG=info (or debug) to see output.
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let cfg = Config::from_env();
+    info!(
+        exec_mode = ?cfg.exec_mode,
+        series = ?cfg.series_tickers,
+        coinbase_ws = cfg.coinbase_ws_enabled,
+        coinbase_product = %cfg.coinbase_product_id,
+        "bot starting"
+    );
 
     let api_key_id = env::var("API_KEY").expect("No API_KEY");
     let account = Account::from_file("./private_keys/kalshi_private.pem", api_key_id.as_str())?;
 
-    // KalshiClient is NOT Clone in your build, so we wrap it in Arc.
     let http = Arc::new(KalshiClient::new(account.clone()));
     let ws_client = KalshiWebsocketClient::new(account);
 
-    // Bootstrap: one active market per series
     let active = market_manager::bootstrap_active_markets(&http, &cfg.series_tickers).await?;
 
-    // Create Shared with all current active tickers (so engine/ws start correct)
     let tickers: Vec<String> = active.iter().map(|m| m.market_ticker.clone()).collect();
-    let shared = Shared::new(tickers.clone());
+    info!(tickers = ?tickers, "bootstrapped active markets");
+    let shared = Shared::new(tickers.clone(), cfg.coinbase_product_id.clone());
     let leadlag = leadlag::new_shared_leadlag();
-    // Seed close_ts/open_ts into Market state for each ticker
     market_manager::seed_shared_times(&shared, &active).await?;
 
-    // Exec channel (engine + market_manager can both send ExecCommand)
     let (exec_tx, exec_rx) = mpsc::channel(256);
-
-    // WS control channel (market_manager -> ws task)
     let (ws_ctl_tx, ws_ctl_rx) = mpsc::channel(64);
 
-    // WS task
     {
         let shared = shared.clone();
         let http = http.clone();
@@ -72,7 +71,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Exec task
     {
         let shared = shared.clone();
         let http = http.clone();
@@ -84,7 +82,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Market manager task (rotates tickers based on close_time)
     {
         let shared = shared.clone();
         let http = http.clone();
@@ -102,9 +99,16 @@ async fn main() -> Result<()> {
         });
     }
 
-    // --- Coinbase ticker feed (optional) ---
+    if !cfg.coinbase_ws_enabled {
+        tracing::warn!("COINBASE_WS disabled; signal-driven strategy will stay idle");
+    }
+
     let _coinbase_rx = if cfg.coinbase_ws_enabled {
-        let rx = coinbase_ws::spawn_coinbase_ticker(cfg.coinbase_product_id.clone());
+        let rx = coinbase_ws::spawn_coinbase_ticker(
+            cfg.coinbase_product_id.clone(),
+            cfg.clone(),
+            shared.clone(),
+        );
         let rx_clone = rx.clone();
         coinbase_ws::spawn_coinbase_logger(rx.clone(), cfg.coinbase_log_delta_usd);
 
@@ -123,7 +127,6 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Engine runs on the main task
     engine::task::run_engine(cfg, shared, exec_tx).await?;
 
     Ok(())
