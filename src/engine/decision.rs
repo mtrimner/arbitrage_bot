@@ -11,9 +11,11 @@ const DOLLAR_CC: i64 = 100 * CC_PER_CENT;
 const MAX_CAP_CC: i64 = 200 * CC_PER_CENT;
 const NO_ORDER_LOG_REPEAT_SECS: u64 = 5;
 const COINBASE_SIGNAL_LOG_REPEAT_MS: u64 = 5_000;
+const PAIR_OPEN_LOG_REPEAT_MS: u64 = 5_000;
 const MIN_HEDGE_FLOOR_IMPROVE_CC: i64 = 500;
 const COINBASE_SIGNAL_WEIGHT: f64 = 0.35;
 const MAX_OPEN_DISLOCATION_CENTS: f64 = 4.0;
+const MAX_PAIR_OPEN_BACKOFF_CENTS: u8 = 1;
 
 fn clear_no_order_reason(m: &mut Market) {
     m.last_no_order_reason = None;
@@ -104,6 +106,33 @@ fn log_coinbase_fair_value(
         realized_final_avg = ?signal.realized_final_avg,
         required_remaining_avg = ?signal.required_remaining_avg,
         "coinbase fair value"
+    );
+}
+
+fn log_pair_open_quote_prices(
+    ticker: &str,
+    m: &mut Market,
+    now: Instant,
+    yes_price: u8,
+    no_price: u8,
+) {
+    let due = match m.last_pair_open_log_ts {
+        Some(ts) => now.duration_since(ts).as_millis() as u64 >= PAIR_OPEN_LOG_REPEAT_MS,
+        None => true,
+    };
+    if !due {
+        return;
+    }
+
+    m.last_pair_open_log_ts = Some(now);
+
+    tracing::info!(
+        ticker = %ticker,
+        yes_price,
+        no_price,
+        current_pair_cost_cc = ?m.pos.pair_cost_cc(),
+        current_locked_floor_cc = m.pos.locked_floor_cc(),
+        "pair open quote prices"
     );
 }
 
@@ -712,6 +741,73 @@ fn maybe_signal_maker_quote(
     place_or_manage_resting(cfg, ticker, m, now, side, price, qty, sticky)
 }
 
+fn pair_open_ok(cfg: &Config, m: &Market, yes_price: u8, no_price: u8, qty: u64) -> bool {
+    let sim = m
+        .pos
+        .simulate_buy(Side::Yes, yes_price, qty as i64)
+        .simulate_buy(Side::No, no_price, qty as i64);
+
+    let cur_floor = m.pos.locked_floor_cc();
+    let new_floor = sim.locked_floor_cc();
+    if new_floor < cur_floor {
+        return false;
+    }
+
+    if let (Some(cur_pc), Some(new_pc)) = (m.pos.pair_cost_cc(), sim.pair_cost_cc()) {
+        if new_pc <= cur_pc {
+            return true;
+        }
+    }
+
+    two_sided_pair_cost_ok(cfg, yes_price, no_price)
+}
+
+fn pair_open_prices(cfg: &Config, m: &Market, signal: &CoinbaseSignal) -> Option<(u8, u8)> {
+    let top_yes = top_maker_price(cfg, m, Side::Yes)?;
+    let top_no = top_maker_price(cfg, m, Side::No)?;
+
+    // Balanced pair opening should start by joining the best affordable pair
+    // instead of forcing each leg through single-leg rescue pricing.
+    if pair_open_ok(cfg, m, top_yes, top_no, 1) {
+        return Some((top_yes, top_no));
+    }
+
+    let fair_yes = desired_maker_quote(cfg, m, Side::Yes, signal)
+        .unwrap_or(top_yes)
+        .max(top_yes.saturating_sub(MAX_PAIR_OPEN_BACKOFF_CENTS));
+    let fair_no = desired_maker_quote(cfg, m, Side::No, signal)
+        .unwrap_or(top_no)
+        .max(top_no.saturating_sub(MAX_PAIR_OPEN_BACKOFF_CENTS));
+
+    if pair_open_ok(cfg, m, fair_yes, fair_no, 1) {
+        return Some((fair_yes, fair_no));
+    }
+
+    None
+}
+
+fn maybe_open_pair_quote(
+    cfg: &Config,
+    ticker: &str,
+    m: &mut Market,
+    now: Instant,
+    signal: &CoinbaseSignal,
+) -> Option<ExecCommand> {
+    let (yes_price, no_price) = pair_open_prices(cfg, m, signal)?;
+
+    log_pair_open_quote_prices(ticker, m, now, yes_price, no_price);
+
+    if let Some(cmd) = place_or_manage_resting(cfg, ticker, m, now, Side::Yes, yes_price, 1, false)
+    {
+        return Some(cmd);
+    }
+    if let Some(cmd) = place_or_manage_resting(cfg, ticker, m, now, Side::No, no_price, 1, false) {
+        return Some(cmd);
+    }
+
+    None
+}
+
 fn maybe_repair_quote(
     cfg: &Config,
     ticker: &str,
@@ -1021,67 +1117,25 @@ pub fn decide(
         return None;
     }
 
-    let yes_quote = desired_maker_quote(cfg, m, Side::Yes, &signal);
-    let no_quote = desired_maker_quote(cfg, m, Side::No, &signal);
-
-    match (yes_quote, no_quote) {
-        (Some(yes_p), Some(no_p)) if two_sided_pair_cost_ok(cfg, yes_p, no_p) => {
-            if let Some(cmd) =
-                maybe_signal_maker_quote(cfg, ticker, m, now, t_rem, window_s, Side::Yes, &signal)
-            {
-                clear_no_order_reason(m);
-                return Some(cmd);
-            }
-            if let Some(cmd) =
-                maybe_signal_maker_quote(cfg, ticker, m, now, t_rem, window_s, Side::No, &signal)
-            {
-                clear_no_order_reason(m);
-                return Some(cmd);
-            }
-            log_no_order_reason(
-                ticker,
-                m,
-                "quotes_resting_or_unchanged",
-                t_rem,
-                Some(&signal),
-                gap,
-                allowed_gap,
-            );
-            None
-        }
-        (Some(_), Some(_)) => {
-            if let Some(cmd) = cancel_all_if_any(cfg, ticker, m, now) {
-                clear_no_order_reason(m);
-                return Some(cmd);
-            }
-            log_no_order_reason(
-                ticker,
-                m,
-                "pair_cost_gate_blocked",
-                t_rem,
-                Some(&signal),
-                gap,
-                allowed_gap,
-            );
-            None
-        }
-        _ => {
-            if let Some(cmd) = cancel_all_if_any(cfg, ticker, m, now) {
-                clear_no_order_reason(m);
-                return Some(cmd);
-            }
-            log_no_order_reason(
-                ticker,
-                m,
-                "maker_quote_unavailable",
-                t_rem,
-                Some(&signal),
-                gap,
-                allowed_gap,
-            );
-            None
-        }
+    if let Some(cmd) = maybe_open_pair_quote(cfg, ticker, m, now, &signal) {
+        clear_no_order_reason(m);
+        return Some(cmd);
     }
+
+    if let Some(cmd) = cancel_all_if_any(cfg, ticker, m, now) {
+        clear_no_order_reason(m);
+        return Some(cmd);
+    }
+    log_no_order_reason(
+        ticker,
+        m,
+        "pair_open_quote_unavailable",
+        t_rem,
+        Some(&signal),
+        gap,
+        allowed_gap,
+    );
+    None
 }
 
 #[cfg(test)]
@@ -1161,6 +1215,38 @@ mod tests {
             &signal,
             cfg.no_new_imbalance_s + 1
         ));
+    }
+
+    #[test]
+    fn pair_open_prices_prefer_live_top_pair_when_it_improves_the_book() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+
+        m.pos.apply_fill(Side::Yes, 51, 1);
+        m.pos.apply_fill(Side::No, 52, 1);
+        m.book.yes_bids[46] = 1;
+        m.book.no_bids[51] = 1;
+
+        let signal = CoinbaseSignal {
+            price: 0.0,
+            microprice: 0.0,
+            ema_fast: 0.0,
+            ema_slow: 0.0,
+            vol_ema_usd: 0.0,
+            fair_yes: 0.55,
+            fair_yes_cents: 55,
+            trend_z: 0.0,
+            distance_usd: 0.0,
+            sigma_usd: 1.0,
+            age_ms: 0,
+            regime: SignalRegime::TwoSided,
+            realized_final_avg: None,
+            required_remaining_avg: None,
+        };
+
+        assert_eq!(m.pos.pair_cost_cc(), Some(10_300));
+        assert_eq!(m.pos.locked_floor_cc(), -300);
+        assert_eq!(pair_open_prices(&cfg, &m, &signal), Some((47, 52)));
     }
 
     #[test]

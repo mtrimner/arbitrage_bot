@@ -35,6 +35,7 @@ pub struct Market {
     pub last_no_order_reason_ts: Option<Instant>,
     pub last_signal_log_ts: Option<Instant>,
     pub last_signal_log_fair_cents: Option<u8>,
+    pub last_pair_open_log_ts: Option<Instant>,
 
     pub mode: Mode,
 }
@@ -56,6 +57,7 @@ impl Market {
             last_no_order_reason_ts: None,
             last_signal_log_ts: None,
             last_signal_log_fair_cents: None,
+            last_pair_open_log_ts: None,
             mode: Mode::Accumulate,
         }
     }
