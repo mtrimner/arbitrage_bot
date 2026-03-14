@@ -32,6 +32,9 @@ pub struct Market {
     pub last_taker_yes: Option<Instant>,
     pub last_taker_no: Option<Instant>,
     pub last_no_order_reason: Option<&'static str>,
+    pub last_no_order_reason_ts: Option<Instant>,
+    pub last_signal_log_ts: Option<Instant>,
+    pub last_signal_log_fair_cents: Option<u8>,
 
     pub mode: Mode,
 }
@@ -50,6 +53,9 @@ impl Market {
             last_taker_yes: None,
             last_taker_no: None,
             last_no_order_reason: None,
+            last_no_order_reason_ts: None,
+            last_signal_log_ts: None,
+            last_signal_log_fair_cents: None,
             mode: Mode::Accumulate,
         }
     }

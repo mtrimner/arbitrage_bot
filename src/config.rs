@@ -162,8 +162,8 @@ impl Default for Config {
             late_imbalance_cap: 0.10,
             imbalance_min_total: 20,
             imbalance_cap_small_total: 0.50,
-            max_unhedged_qty_early: 2,
-            max_unhedged_qty_late: 1,
+            max_unhedged_qty_early: 1,
+            max_unhedged_qty_late: 0,
             freeze_if_balanced_s: 45,
 
             max_order_qty: 10,
@@ -179,7 +179,7 @@ impl Default for Config {
             maker_qty_price_tol_cents: 1,
             maker_qty_price_tol_cents_balance: 1,
             cancel_drift_cents_hedge: 1,
-            hedge_force_ask_minus_one_gap: 1,
+            hedge_force_ask_minus_one_gap: 2,
 
             taker_cooldown_ms: 1000,
             min_taker_improve_cc: 25,
@@ -227,7 +227,7 @@ impl Default for Config {
             quote_base_halfspread_cents: 2,
             quote_vol_per_extra_cent_usd: 20.0,
             quote_max_vol_extra_cents: 3,
-            hedge_quote_boost_cents: 1,
+            hedge_quote_boost_cents: 0,
             inventory_skew_per_contract_cents: 1,
             inventory_skew_max_cents: 3,
             market_entry_pair_cost_cc: 9800,
