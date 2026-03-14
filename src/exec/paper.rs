@@ -152,7 +152,9 @@ pub async fn paper_place(
             }
         }
 
-        ts.touch(&shared);
+        // Ack/reject state should be visible on the next engine tick without
+        // immediately re-entering the strategy mid-order batch.
+        ts.mark_dirty();
         return;
     }
 
@@ -163,7 +165,7 @@ pub async fn paper_place(
                 info!(ticker, ?side, price_cents, "PAPER ioc reject no-ask");
                 g.orders
                     .set_status_by_client(client_order_id, OrderStatus::Rejected);
-                ts.touch(&shared);
+                ts.mark_dirty();
                 return;
             };
 
@@ -192,7 +194,11 @@ pub async fn paper_place(
                     .set_status_by_client(client_order_id, OrderStatus::Rejected);
             }
 
-            ts.touch(&shared);
+            if ask <= price_cents {
+                ts.touch(&shared);
+            } else {
+                ts.mark_dirty();
+            }
         }
 
         Tif::Gtc => {
@@ -209,7 +215,7 @@ pub async fn paper_place(
                 }
             }
 
-            ts.touch(&shared);
+            ts.mark_dirty();
         }
     }
 }
@@ -234,5 +240,5 @@ pub async fn paper_cancel(shared: &Shared, ticker: &str, order_id: &str) {
     }
 
     info!(ticker, order_id, "PAPER cancel ack");
-    ts.touch(&shared);
+    ts.mark_dirty();
 }

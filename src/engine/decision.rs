@@ -13,6 +13,7 @@ const NO_ORDER_LOG_REPEAT_SECS: u64 = 5;
 const COINBASE_SIGNAL_LOG_REPEAT_MS: u64 = 5_000;
 const PAIR_OPEN_LOG_REPEAT_MS: u64 = 5_000;
 const MIN_HEDGE_FLOOR_IMPROVE_CC: i64 = 500;
+const PAIR_REPAIR_HYST_CC: i64 = 50;
 const COINBASE_SIGNAL_WEIGHT: f64 = 0.35;
 const MAX_OPEN_DISLOCATION_CENTS: f64 = 4.0;
 const MAX_PAIR_OPEN_BACKOFF_CENTS: u8 = 1;
@@ -410,6 +411,11 @@ fn cancel_side_force(
         return None;
     };
 
+    let age_ms = now.duration_since(h.created_at).as_millis() as u64;
+    if age_ms < cfg.min_resting_life_ms {
+        return None;
+    }
+
     if let Some(t0) = h.cancel_requested_at {
         let since = now.duration_since(t0).as_millis() as u64;
         if since < cfg.cancel_retry_ms {
@@ -674,7 +680,7 @@ fn is_balanced_but_bad(cfg: &Config, m: &Market) -> bool {
         && (m.pos.locked_floor_cc() < cfg.locked_floor_buffer_cc
             || m.pos
                 .pair_cost_cc()
-                .is_some_and(|pc| pc > cfg.target_pair_cc))
+                .is_some_and(|pc| pc > cfg.target_pair_cc + PAIR_REPAIR_HYST_CC))
 }
 
 fn repair_side_for(regime: SignalRegime) -> Option<Side> {
@@ -741,6 +747,32 @@ fn maybe_signal_maker_quote(
     place_or_manage_resting(cfg, ticker, m, now, side, price, qty, sticky)
 }
 
+enum PairOpenResult {
+    Command(ExecCommand),
+    Working,
+    Unavailable,
+}
+
+fn has_active_resting_pair(m: &Market) -> bool {
+    m.pos.yes_qty == 0
+        && m.pos.no_qty == 0
+        && m.resting_yes
+            .as_ref()
+            .is_some_and(|h| h.cancel_requested_at.is_none())
+        && m.resting_no
+            .as_ref()
+            .is_some_and(|h| h.cancel_requested_at.is_none())
+}
+
+fn pair_open_is_working(m: &Market, yes_price: u8, no_price: u8) -> bool {
+    m.resting_yes
+        .as_ref()
+        .is_some_and(|h| h.price_cents == yes_price && h.cancel_requested_at.is_none())
+        && m.resting_no
+            .as_ref()
+            .is_some_and(|h| h.price_cents == no_price && h.cancel_requested_at.is_none())
+}
+
 fn pair_open_ok(cfg: &Config, m: &Market, yes_price: u8, no_price: u8, qty: u64) -> bool {
     let sim = m
         .pos
@@ -792,20 +824,26 @@ fn maybe_open_pair_quote(
     m: &mut Market,
     now: Instant,
     signal: &CoinbaseSignal,
-) -> Option<ExecCommand> {
-    let (yes_price, no_price) = pair_open_prices(cfg, m, signal)?;
+) -> PairOpenResult {
+    let Some((yes_price, no_price)) = pair_open_prices(cfg, m, signal) else {
+        return PairOpenResult::Unavailable;
+    };
 
     log_pair_open_quote_prices(ticker, m, now, yes_price, no_price);
 
     if let Some(cmd) = place_or_manage_resting(cfg, ticker, m, now, Side::Yes, yes_price, 1, false)
     {
-        return Some(cmd);
+        return PairOpenResult::Command(cmd);
     }
     if let Some(cmd) = place_or_manage_resting(cfg, ticker, m, now, Side::No, no_price, 1, false) {
-        return Some(cmd);
+        return PairOpenResult::Command(cmd);
     }
 
-    None
+    if pair_open_is_working(m, yes_price, no_price) {
+        return PairOpenResult::Working;
+    }
+
+    PairOpenResult::Unavailable
 }
 
 fn maybe_repair_quote(
@@ -1011,6 +1049,7 @@ pub fn decide(
 
     let balanced_but_bad = is_balanced_but_bad(cfg, m);
     let repair_side = repair_side_for(signal.regime);
+    let resting_pair_open = has_active_resting_pair(m);
 
     if let Some(cmd) = cancel_stale_if_needed(cfg, ticker, m, now) {
         clear_no_order_reason(m);
@@ -1020,7 +1059,7 @@ pub fn decide(
     if let Some(vulnerable) = coinbase.cancel_vulnerable_side(&signal, cfg) {
         let skip_cancel_for_repair =
             balanced_but_bad && gap == 0 && repair_side == Some(vulnerable);
-        if !skip_cancel_for_repair {
+        if !skip_cancel_for_repair && !resting_pair_open {
             if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, vulnerable) {
                 clear_no_order_reason(m);
                 return Some(cmd);
@@ -1117,9 +1156,16 @@ pub fn decide(
         return None;
     }
 
-    if let Some(cmd) = maybe_open_pair_quote(cfg, ticker, m, now, &signal) {
-        clear_no_order_reason(m);
-        return Some(cmd);
+    match maybe_open_pair_quote(cfg, ticker, m, now, &signal) {
+        PairOpenResult::Command(cmd) => {
+            clear_no_order_reason(m);
+            return Some(cmd);
+        }
+        PairOpenResult::Working => {
+            clear_no_order_reason(m);
+            return None;
+        }
+        PairOpenResult::Unavailable => {}
     }
 
     if let Some(cmd) = cancel_all_if_any(cfg, ticker, m, now) {
@@ -1247,6 +1293,89 @@ mod tests {
         assert_eq!(m.pos.pair_cost_cc(), Some(10_300));
         assert_eq!(m.pos.locked_floor_cc(), -300);
         assert_eq!(pair_open_prices(&cfg, &m, &signal), Some((47, 52)));
+    }
+
+    #[test]
+    fn balanced_bad_ignores_small_pair_cost_overage_with_hysteresis() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+
+        m.pos.apply_fill(Side::Yes, 49, 1);
+        m.pos.apply_fill(Side::Yes, 49, 1);
+        m.pos.apply_fill(Side::Yes, 50, 1);
+        m.pos.apply_fill(Side::No, 50, 1);
+        m.pos.apply_fill(Side::No, 50, 1);
+        m.pos.apply_fill(Side::No, 50, 1);
+
+        assert_eq!(m.pos.pair_cost_cc(), Some(9_933));
+        assert_eq!(m.pos.locked_floor_cc(), 200);
+        assert!(!is_balanced_but_bad(&cfg, &m));
+    }
+
+    #[test]
+    fn cancel_side_force_respects_min_resting_life() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+        let now = Instant::now();
+
+        m.resting_yes = Some(RestingHint {
+            price_cents: 47,
+            created_at: now,
+            cancel_requested_at: None,
+            client_order_id: uuid::Uuid::new_v4(),
+            order_id: Some("yes-1".to_string()),
+            queue_ahead: 0,
+        });
+
+        assert!(cancel_side_force(&cfg, "TEST", &mut m, now, Side::Yes).is_none());
+    }
+
+    #[test]
+    fn pair_open_quote_treats_matching_resting_pair_as_working() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+        let now = Instant::now();
+
+        m.book.yes_bids[46] = 1;
+        m.book.no_bids[51] = 1;
+        m.resting_yes = Some(RestingHint {
+            price_cents: 47,
+            created_at: now,
+            cancel_requested_at: None,
+            client_order_id: uuid::Uuid::new_v4(),
+            order_id: Some("yes-1".to_string()),
+            queue_ahead: 0,
+        });
+        m.resting_no = Some(RestingHint {
+            price_cents: 52,
+            created_at: now,
+            cancel_requested_at: None,
+            client_order_id: uuid::Uuid::new_v4(),
+            order_id: Some("no-1".to_string()),
+            queue_ahead: 0,
+        });
+
+        let signal = CoinbaseSignal {
+            price: 0.0,
+            microprice: 0.0,
+            ema_fast: 0.0,
+            ema_slow: 0.0,
+            vol_ema_usd: 0.0,
+            fair_yes: 0.55,
+            fair_yes_cents: 55,
+            trend_z: 0.0,
+            distance_usd: 0.0,
+            sigma_usd: 1.0,
+            age_ms: 0,
+            regime: SignalRegime::TwoSided,
+            realized_final_avg: None,
+            required_remaining_avg: None,
+        };
+
+        assert!(matches!(
+            maybe_open_pair_quote(&cfg, "TEST", &mut m, now, &signal),
+            PairOpenResult::Working
+        ));
     }
 
     #[test]
