@@ -8,6 +8,8 @@ pub struct Position {
     pub no_qty: i64,
     pub yes_cost_cc: i64,
     pub no_cost_cc: i64,
+    pub opening_yes_price_cents: Option<u8>,
+    pub opening_no_price_cents: Option<u8>,
 }
 
 impl Position {
@@ -78,10 +80,16 @@ impl Position {
         let add_cc = (price_cents as i64) * CC_PER_CENT * qty;
         match side {
             Side::Yes => {
+                if qty > 0 && self.yes_qty <= 0 && self.opening_yes_price_cents.is_none() {
+                    self.opening_yes_price_cents = Some(price_cents);
+                }
                 self.yes_qty += qty;
                 self.yes_cost_cc += add_cc;
             }
             Side::No => {
+                if qty > 0 && self.no_qty <= 0 && self.opening_no_price_cents.is_none() {
+                    self.opening_no_price_cents = Some(price_cents);
+                }
                 self.no_qty += qty;
                 self.no_cost_cc += add_cc;
             }
@@ -92,5 +100,23 @@ impl Position {
         let mut p = self.clone();
         p.apply_fill(side, price_cents, qty);
         p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_opening_fill_price_once_per_side() {
+        let mut pos = Position::default();
+
+        pos.apply_fill(Side::Yes, 49, 1);
+        pos.apply_fill(Side::Yes, 51, 1);
+        pos.apply_fill(Side::No, 50, 2);
+        pos.apply_fill(Side::No, 48, 1);
+
+        assert_eq!(pos.opening_yes_price_cents, Some(49));
+        assert_eq!(pos.opening_no_price_cents, Some(50));
     }
 }
