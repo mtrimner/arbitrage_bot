@@ -525,36 +525,40 @@ pub async fn spawn_coinbase_move_detector(
             continue;
         }
 
-        let mut g = leadlag.lock().await;
+        let (anchor, delta) = {
+            let mut g = leadlag.lock().await;
 
-        if g.pending.is_some() {
-            continue;
-        }
-
-        g.recent_ticks.push_back(CoinbaseTickPoint {
-            price: cur.price,
-            exchange_ts_ms: cur.exchange_ts_ms,
-            local_ts_ms: cur.ts_ms,
-            sequence_num: cur.sequence_num,
-        });
-
-        let cutoff_ms = cur.ts_ms.saturating_sub(cfg.coinbase_leadlag_window_ms);
-        while let Some(front) = g.recent_ticks.front() {
-            if front.local_ts_ms < cutoff_ms {
-                g.recent_ticks.pop_front();
-            } else {
-                break;
+            if g.pending.is_some() {
+                continue;
             }
-        }
 
-        let Some(anchor) = g.recent_ticks.front().cloned() else {
-            continue;
+            g.recent_ticks.push_back(CoinbaseTickPoint {
+                price: cur.price,
+                exchange_ts_ms: cur.exchange_ts_ms,
+                local_ts_ms: cur.ts_ms,
+                sequence_num: cur.sequence_num,
+            });
+
+            let cutoff_ms = cur.ts_ms.saturating_sub(cfg.coinbase_leadlag_window_ms);
+            while let Some(front) = g.recent_ticks.front() {
+                if front.local_ts_ms < cutoff_ms {
+                    g.recent_ticks.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            let Some(anchor) = g.recent_ticks.front().cloned() else {
+                continue;
+            };
+
+            let delta = cur.price - anchor.price;
+            if delta.abs() < cfg.coinbase_leadlag_min_move_usd {
+                continue;
+            }
+
+            (anchor, delta)
         };
-
-        let delta = cur.price - anchor.price;
-        if delta.abs() < cfg.coinbase_leadlag_min_move_usd {
-            continue;
-        }
 
         let kalshi_ticker = match shared.tickers.iter().next() {
             Some(item) => item.key().clone(),
@@ -594,6 +598,13 @@ pub async fn spawn_coinbase_move_detector(
 
         drop(m);
 
+        // Keep the lead/lag mutex out of the market-lock path. The WS task updates
+        // lead/lag while holding the market write lock, so holding both here can
+        // deadlock the bot.
+        let mut g = leadlag.lock().await;
+        if g.pending.is_some() {
+            continue;
+        }
         g.pending = Some(PendingLeadLag {
             move_event: CoinbaseMove {
                 product_id: cur.product_id.clone(),
