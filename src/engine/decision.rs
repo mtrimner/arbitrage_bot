@@ -612,7 +612,16 @@ fn desired_maker_quote(
 }
 
 fn plausible_missing_price_cents(cfg: &Config, m: &Market, missing_side: Side) -> Option<u8> {
-    top_maker_price(cfg, m, missing_side).or_else(|| m.book.best_bid(missing_side))
+    if m.mode == Mode::Balance {
+        m.book
+            .implied_ask(missing_side)
+            .or_else(|| top_maker_price(cfg, m, missing_side))
+            .or_else(|| m.book.best_bid(missing_side))
+    } else {
+        top_maker_price(cfg, m, missing_side)
+            .or_else(|| m.book.implied_ask(missing_side))
+            .or_else(|| m.book.best_bid(missing_side))
+    }
 }
 
 fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64) -> bool {
@@ -627,6 +636,21 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
     // When a fill reduces an imbalance, judge it on guaranteed-floor repair
     // rather than demanding the average pair cost also improve.
     if new_gap < old_gap {
+        if let Some(pc) = new_pc {
+            match old_pc {
+                Some(old) => {
+                    if pc > old {
+                        return false;
+                    }
+                }
+                None => {
+                    if pc > DOLLAR_CC {
+                        return false;
+                    }
+                }
+            }
+        }
+
         if new_floor >= cfg.locked_floor_buffer_cc {
             return true;
         }
@@ -1074,10 +1098,8 @@ pub fn decide(
     let no_new_imbalance = t_rem <= cfg.no_new_imbalance_s;
     let open_pairs_allowed = can_open_pairs(cfg, m, &signal, t_rem);
 
-    if (!open_pairs_allowed && gap == 0)
-        || (m.mode == Mode::Balance && no_new_imbalance && m.pos.is_balanced())
-    {
-        if balanced_but_bad && !no_new_imbalance {
+    if balanced_but_bad && gap == 0 {
+        if !no_new_imbalance {
             if let Some(repair_side) = repair_side {
                 if let Some(cmd) =
                     maybe_repair_quote(cfg, ticker, m, now, t_rem, window_s, repair_side, &signal)
@@ -1085,19 +1107,44 @@ pub fn decide(
                     clear_no_order_reason(m);
                     return Some(cmd);
                 }
+
+                if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, repair_side.other()) {
+                    clear_no_order_reason(m);
+                    return Some(cmd);
+                }
+
+                log_no_order_reason(
+                    ticker,
+                    m,
+                    "balanced_bad_no_repair_quote",
+                    t_rem,
+                    Some(&signal),
+                    gap,
+                    allowed_gap,
+                );
+                return None;
             }
-            log_no_order_reason(
-                ticker,
-                m,
-                "balanced_bad_no_repair_quote",
-                t_rem,
-                Some(&signal),
-                gap,
-                allowed_gap,
-            );
-            return None;
         }
 
+        if let Some(cmd) = cancel_all_if_any(cfg, ticker, m, now) {
+            clear_no_order_reason(m);
+            return Some(cmd);
+        }
+        log_no_order_reason(
+            ticker,
+            m,
+            "balanced_bad_no_repair_quote",
+            t_rem,
+            Some(&signal),
+            gap,
+            allowed_gap,
+        );
+        return None;
+    }
+
+    if (!open_pairs_allowed && gap == 0)
+        || (m.mode == Mode::Balance && no_new_imbalance && m.pos.is_balanced())
+    {
         if let Some(cmd) = cancel_all_if_any(cfg, ticker, m, now) {
             clear_no_order_reason(m);
             return Some(cmd);
@@ -1213,7 +1260,17 @@ mod tests {
     }
 
     #[test]
-    fn allows_loss_reducing_hedge_even_when_pair_cost_worsens() {
+    fn rejects_first_pair_completion_above_dollar_even_when_floor_improves() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+
+        m.pos.apply_fill(Side::No, 62, 1);
+
+        assert!(!admission_ok(&cfg, &m, Side::Yes, 51, 1));
+    }
+
+    #[test]
+    fn rejects_loss_reducing_hedge_when_pair_cost_worsens() {
         let cfg = Config::default();
         let mut m = Market::new();
 
@@ -1225,7 +1282,7 @@ mod tests {
 
         assert_eq!(m.pos.locked_floor_cc(), -5_000);
         assert_eq!(m.pos.pair_cost_cc(), Some(9_600));
-        assert!(admission_ok(&cfg, &m, Side::Yes, 80, 1));
+        assert!(!admission_ok(&cfg, &m, Side::Yes, 80, 1));
     }
 
     #[test]
@@ -1302,14 +1359,55 @@ mod tests {
 
         m.pos.apply_fill(Side::Yes, 49, 1);
         m.pos.apply_fill(Side::Yes, 49, 1);
-        m.pos.apply_fill(Side::Yes, 50, 1);
+        m.pos.apply_fill(Side::Yes, 49, 1);
         m.pos.apply_fill(Side::No, 50, 1);
         m.pos.apply_fill(Side::No, 50, 1);
         m.pos.apply_fill(Side::No, 50, 1);
 
-        assert_eq!(m.pos.pair_cost_cc(), Some(9_933));
-        assert_eq!(m.pos.locked_floor_cc(), 200);
+        assert_eq!(m.pos.pair_cost_cc(), Some(9_900));
+        assert_eq!(m.pos.locked_floor_cc(), 300);
         assert!(!is_balanced_but_bad(&cfg, &m));
+    }
+
+    #[test]
+    fn balanced_bad_book_does_not_open_fresh_pair_quotes() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+        let now_s = unix_now_s();
+
+        m.open_ts = Some(now_s - 300);
+        m.close_ts = Some(now_s + 300);
+        m.strike_price = Some(100_000.0);
+        m.book.yes_bids[46] = 1;
+        m.book.no_bids[51] = 1;
+        m.pos.apply_fill(Side::Yes, 51, 1);
+        m.pos.apply_fill(Side::No, 50, 1);
+
+        let coinbase = CoinbaseSnapshot {
+            product_id: "BTC-USD".to_string(),
+            last_trade_price: Some(100_000.0),
+            best_bid: Some(99_999.0),
+            best_ask: Some(100_001.0),
+            best_bid_qty: Some(1.0),
+            best_ask_qty: Some(1.0),
+            microprice: Some(100_000.0),
+            ema_fast: Some(100_000.0),
+            ema_slow: Some(100_000.0),
+            vol_ema_usd: Some(1.0),
+            last_update_ms: Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            ),
+            last_heartbeat_ms: None,
+            heartbeat_counter: None,
+            samples: Vec::new(),
+        };
+
+        assert!(m.pos.is_balanced());
+        assert!(is_balanced_but_bad(&cfg, &m));
+        assert!(decide(&cfg, "TEST", &mut m, Some(&coinbase)).is_none());
     }
 
     #[test]
@@ -1336,10 +1434,10 @@ mod tests {
         let mut m = Market::new();
         let now = Instant::now();
 
-        m.book.yes_bids[46] = 1;
+        m.book.yes_bids[45] = 1;
         m.book.no_bids[51] = 1;
         m.resting_yes = Some(RestingHint {
-            price_cents: 47,
+            price_cents: 46,
             created_at: now,
             cancel_requested_at: None,
             client_order_id: uuid::Uuid::new_v4(),

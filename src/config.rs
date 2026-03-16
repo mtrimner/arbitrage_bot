@@ -141,7 +141,7 @@ impl Default for Config {
             tick_ms: 250,
             window_s: 900,
             accumulate_s: 120,
-            balance_s: 120,
+            balance_s: 180,
             series_tickers: vec!["KXBTC15M".to_string()],
             market_refresh_ms: 5000,
 
@@ -150,11 +150,11 @@ impl Default for Config {
             maker_improve_tick_balance: 1,
             max_buy_price_cents: 99,
 
-            safe_pair_cc: 9950,
-            target_pair_cc: 9900,
+            safe_pair_cc: 9900,
+            target_pair_cc: 9850,
             bootstrap_pair_cc: 9950,
             balance_pair_cc: 9950,
-            final_balance_pair_cc: 10050,
+            final_balance_pair_cc: 10000,
             bootstrap_max_one_side_qty: 2,
             bootstrap_rescue_min_improve_cc: 500,
 
@@ -162,7 +162,7 @@ impl Default for Config {
             late_imbalance_cap: 0.10,
             imbalance_min_total: 20,
             imbalance_cap_small_total: 0.50,
-            max_unhedged_qty_early: 1,
+            max_unhedged_qty_early: 0,
             max_unhedged_qty_late: 0,
             freeze_if_balanced_s: 45,
 
@@ -178,7 +178,7 @@ impl Default for Config {
             maker_max_edge_cents_balance: 12,
             maker_qty_price_tol_cents: 1,
             maker_qty_price_tol_cents_balance: 1,
-            cancel_drift_cents_hedge: 1,
+            cancel_drift_cents_hedge: 2,
             hedge_force_ask_minus_one_gap: 2,
 
             taker_cooldown_ms: 1000,
@@ -230,7 +230,7 @@ impl Default for Config {
             hedge_quote_boost_cents: 0,
             inventory_skew_per_contract_cents: 1,
             inventory_skew_max_cents: 3,
-            market_entry_pair_cost_cc: 9900,
+            market_entry_pair_cost_cc: 9850,
             locked_floor_buffer_cc: 100,
             catchup_plausibility_buffer_cents: 1,
             no_new_imbalance_s: 30,
