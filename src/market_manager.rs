@@ -332,11 +332,25 @@ pub async fn run_market_manager(
                     let g = ts.mkt.read().await;
                     g.pos.clone()
                 };
+                let coinbase_price = {
+                    let coinbase = shared.coinbase.read().await;
+                    let snap = coinbase.snapshot();
+                    snap.last_trade_price.or(snap.microprice).or_else(|| {
+                        match (snap.best_bid, snap.best_ask) {
+                            (Some(b), Some(a)) => Some((a + b) * 0.5),
+                            _ => None,
+                        }
+                    })
+                };
 
                 if let Err(e) = crate::report::append_result_csv(
                     cfg.results_file.as_str(),
+                    &cur.series_ticker,
+                    &cur.market_ticker,
                     cur.open_ts,
                     cur.close_ts,
+                    cur.strike_price,
+                    coinbase_price,
                     &pos,
                 )
                 .await

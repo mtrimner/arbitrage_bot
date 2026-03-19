@@ -96,9 +96,10 @@ pub async fn run_exec(
                                 }
                             }
 
-                            // If it was IOC, we don’t keep any resting hint.
-                            // Fills will come through websocket (fill channel).
-                            ts.touch(&shared);
+                            // HTTP place/cancel responses update order state, but
+                            // fills still arrive separately. Avoid waking the
+                            // engine immediately on pure ack traffic.
+                            ts.mark_dirty();
                         }
                     }
                     Err(e) => {
@@ -116,7 +117,7 @@ pub async fn run_exec(
                                 *g.resting_hint_mut(side) = None;
                             }
 
-                            ts.touch(&shared);
+                            ts.mark_dirty();
                         }
                     }
                 }
@@ -148,7 +149,7 @@ pub async fn run_exec(
                                 }
                             }
 
-                            ts.touch(&shared);
+                            ts.mark_dirty();
                         }
                     }
                     Err(e) => {
