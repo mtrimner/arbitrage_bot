@@ -10,7 +10,7 @@ use crate::types::{CC_PER_CENT, ExecCommand, RestingHint, Side, Tif};
 const DOLLAR_CC: i64 = 100 * CC_PER_CENT;
 const MAX_CAP_CC: i64 = 200 * CC_PER_CENT;
 const NO_ORDER_LOG_REPEAT_SECS: u64 = 5;
-const COINBASE_SIGNAL_LOG_REPEAT_MS: u64 = 5_000;
+const COINBASE_SIGNAL_LOG_REPEAT_MS: u64 = 10_000;
 const PAIR_OPEN_LOG_REPEAT_MS: u64 = 5_000;
 const MIN_HEDGE_FLOOR_IMPROVE_CC: i64 = 500;
 const PAIR_REPAIR_HYST_CC: i64 = 50;
@@ -80,13 +80,11 @@ fn log_coinbase_fair_value(
         Some(ts) => now.duration_since(ts).as_millis() as u64 >= COINBASE_SIGNAL_LOG_REPEAT_MS,
         None => true,
     };
-    let fair_changed = m.last_signal_log_fair_cents != Some(signal.fair_yes_cents);
-    if !due && !fair_changed {
+    if !due {
         return;
     }
 
     m.last_signal_log_ts = Some(now);
-    m.last_signal_log_fair_cents = Some(signal.fair_yes_cents);
 
     tracing::info!(
         ticker = %ticker,
@@ -637,15 +635,26 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
     // rather than demanding the average pair cost also improve.
     if new_gap < old_gap {
         if let Some(pc) = new_pc {
-            match old_pc {
-                Some(old) => {
-                    if pc > old {
-                        return false;
-                    }
+            if new_gap == 0 {
+                let flatten_cap = if m.mode == Mode::Balance {
+                    cfg.balance_pair_cc.min(DOLLAR_CC)
+                } else {
+                    cfg.safe_pair_cc.min(DOLLAR_CC)
+                };
+                if pc > flatten_cap {
+                    return false;
                 }
-                None => {
-                    if pc > DOLLAR_CC {
-                        return false;
+            } else {
+                match old_pc {
+                    Some(old) => {
+                        if pc > old {
+                            return false;
+                        }
+                    }
+                    None => {
+                        if pc > DOLLAR_CC {
+                            return false;
+                        }
                     }
                 }
             }
@@ -1267,6 +1276,23 @@ mod tests {
         m.pos.apply_fill(Side::No, 62, 1);
 
         assert!(!admission_ok(&cfg, &m, Side::Yes, 51, 1));
+    }
+
+    #[test]
+    fn allows_final_balancing_lot_to_worsen_pair_cost_within_cap() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+
+        for _ in 0..7 {
+            m.pos.apply_fill(Side::Yes, 35, 1);
+        }
+        for _ in 0..6 {
+            m.pos.apply_fill(Side::No, 60, 1);
+        }
+
+        assert_eq!(m.pos.pair_cost_cc(), Some(9_500));
+        assert_eq!(m.pos.locked_floor_cc(), -500);
+        assert!(admission_ok(&cfg, &m, Side::No, 87, 1));
     }
 
     #[test]

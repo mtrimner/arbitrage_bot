@@ -141,7 +141,7 @@ impl Default for Config {
             tick_ms: 250,
             window_s: 900,
             accumulate_s: 120,
-            balance_s: 180,
+            balance_s: 300,
             series_tickers: vec!["KXBTC15M".to_string()],
             market_refresh_ms: 5000,
 
@@ -153,7 +153,7 @@ impl Default for Config {
             safe_pair_cc: 9900,
             target_pair_cc: 9850,
             bootstrap_pair_cc: 9950,
-            balance_pair_cc: 9950,
+            balance_pair_cc: 9900,
             final_balance_pair_cc: 10000,
             bootstrap_max_one_side_qty: 2,
             bootstrap_rescue_min_improve_cc: 500,
@@ -164,7 +164,7 @@ impl Default for Config {
             imbalance_cap_small_total: 0.50,
             max_unhedged_qty_early: 0,
             max_unhedged_qty_late: 0,
-            freeze_if_balanced_s: 45,
+            freeze_if_balanced_s: 300,
 
             max_order_qty: 10,
             catchup_aggressiveness: 0.45,
@@ -184,9 +184,9 @@ impl Default for Config {
             taker_cooldown_ms: 1000,
             min_taker_improve_cc: 25,
             maker_first_ms: 1500,
-            taker_desperate_s: 20,
+            taker_desperate_s: 60,
             taker_big_improve_cc: 150,
-            taker_force_gap: 2,
+            taker_force_gap: 1,
             short_side_min_order_qty: 1,
 
             coinbase_ws_enabled: true,
@@ -233,7 +233,7 @@ impl Default for Config {
             market_entry_pair_cost_cc: 9850,
             locked_floor_buffer_cc: 100,
             catchup_plausibility_buffer_cents: 1,
-            no_new_imbalance_s: 30,
+            no_new_imbalance_s: 300,
 
             results_file: "results.csv".to_string(),
         }
