@@ -47,6 +47,7 @@ pub struct Config {
     pub bootstrap_pair_cc: i64,
     pub balance_pair_cc: i64,
     pub final_balance_pair_cc: i64,
+    pub flatten_rescue_pair_cc: i64,
 
     pub bootstrap_max_one_side_qty: i64,
     pub bootstrap_rescue_min_improve_cc: i64,
@@ -73,11 +74,13 @@ pub struct Config {
     pub maker_qty_price_tol_cents: u8,
     pub maker_qty_price_tol_cents_balance: u8,
     pub cancel_drift_cents_hedge: u8,
+    pub late_rescue_cancel_drift_cents: u8,
     pub hedge_force_ask_minus_one_gap: i64,
 
     pub taker_cooldown_ms: u64,
     pub min_taker_improve_cc: i64,
     pub maker_first_ms: u64,
+    pub late_rescue_maker_first_ms: u64,
     pub taker_desperate_s: i64,
     pub taker_big_improve_cc: i64,
     pub taker_force_gap: i64,
@@ -155,6 +158,7 @@ impl Default for Config {
             bootstrap_pair_cc: 9950,
             balance_pair_cc: 9900,
             final_balance_pair_cc: 10000,
+            flatten_rescue_pair_cc: 10000,
             bootstrap_max_one_side_qty: 2,
             bootstrap_rescue_min_improve_cc: 500,
 
@@ -179,11 +183,13 @@ impl Default for Config {
             maker_qty_price_tol_cents: 1,
             maker_qty_price_tol_cents_balance: 1,
             cancel_drift_cents_hedge: 2,
+            late_rescue_cancel_drift_cents: 1,
             hedge_force_ask_minus_one_gap: 2,
 
             taker_cooldown_ms: 1000,
             min_taker_improve_cc: 25,
             maker_first_ms: 1500,
+            late_rescue_maker_first_ms: 750,
             taker_desperate_s: 60,
             taker_big_improve_cc: 150,
             taker_force_gap: 1,
@@ -233,7 +239,7 @@ impl Default for Config {
             market_entry_pair_cost_cc: 9850,
             locked_floor_buffer_cc: 100,
             catchup_plausibility_buffer_cents: 1,
-            no_new_imbalance_s: 300,
+            no_new_imbalance_s: 120,
 
             results_file: "results.csv".to_string(),
         }

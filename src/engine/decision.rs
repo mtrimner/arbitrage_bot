@@ -173,6 +173,10 @@ fn needs_hedge_only(gap: i64, allowed_gap: i64) -> bool {
     gap > 0 && gap >= allowed_gap.max(1)
 }
 
+fn late_rescue_active(m: &Market) -> bool {
+    m.mode == Mode::Balance && unhedged_qty(m) == 1 && m.pos.locked_floor_cc() <= 0
+}
+
 fn strict_balance_cap_cc(cfg: &Config) -> i64 {
     cfg.balance_pair_cc.clamp(0, DOLLAR_CC)
 }
@@ -320,13 +324,17 @@ fn desired_buy_qty(cfg: &Config, m: &Market, side: Side, t_rem: i64, window_s: i
 
 fn drift_threshold_cents(cfg: &Config, m: &Market, side: Side) -> u8 {
     if side == hedge_side(m) {
-        cfg.cancel_drift_cents_hedge.max(1)
-    } else {
-        cfg.cancel_drift_cents.max(1)
+        if late_rescue_active(m) {
+            return cfg.late_rescue_cancel_drift_cents.max(1);
+        }
+        return cfg.cancel_drift_cents_hedge.max(1);
     }
+    cfg.cancel_drift_cents.max(1)
 }
 
 fn top_maker_price(cfg: &Config, m: &Market, side: Side) -> Option<u8> {
+    let hedge = hedge_side(m);
+    let rescue = side == hedge && late_rescue_active(m);
     let improve = if m.mode == Mode::Balance {
         cfg.maker_improve_tick_balance
     } else {
@@ -348,7 +356,7 @@ fn top_maker_price(cfg: &Config, m: &Market, side: Side) -> Option<u8> {
     };
 
     let gap = unhedged_qty(m);
-    if side == hedge_side(m) && gap >= cfg.hedge_force_ask_minus_one_gap.max(1) {
+    if rescue || (side == hedge && gap >= cfg.hedge_force_ask_minus_one_gap.max(1)) {
         if let Some(ask) = m.book.implied_ask(side) {
             if ask > 0 {
                 p = p.max(ask.saturating_sub(1));
@@ -567,15 +575,14 @@ fn desired_maker_quote(
     side: Side,
     signal: &CoinbaseSignal,
 ) -> Option<u8> {
-    let mut top = top_maker_price(cfg, m, side)?;
-    let gap = unhedged_qty(m);
-    if side == hedge_side(m) && gap >= cfg.hedge_force_ask_minus_one_gap.max(1) {
-        if let Some(ask) = m.book.implied_ask(side) {
-            if ask > 0 {
-                top = top.max(ask.saturating_sub(1));
-            }
-        }
+    let top = top_maker_price(cfg, m, side)?;
+    let hedge = hedge_side(m);
+    let rescue = side == hedge && late_rescue_active(m);
+    if rescue {
+        return Some(top);
     }
+
+    let gap = unhedged_qty(m);
 
     // Use the anchored fair here too so maker quotes stay close to the actual
     // Kalshi book instead of chasing raw Coinbase fair when the venues diverge.
@@ -589,7 +596,7 @@ fn desired_maker_quote(
         Side::No => 100 - (center + half),
     };
 
-    if side == hedge_side(m) && gap > 0 {
+    if side == hedge && gap > 0 {
         target += cfg.hedge_quote_boost_cents as i32;
     }
 
@@ -630,13 +637,16 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
     let new_floor = sim.locked_floor_cc();
     let old_pc = m.pos.pair_cost_cc();
     let new_pc = sim.pair_cost_cc();
+    let late_rescue = late_rescue_active(m);
 
     // When a fill reduces an imbalance, judge it on guaranteed-floor repair
     // rather than demanding the average pair cost also improve.
     if new_gap < old_gap {
         if let Some(pc) = new_pc {
             if new_gap == 0 {
-                let flatten_cap = if m.mode == Mode::Balance {
+                let flatten_cap = if late_rescue {
+                    cfg.flatten_rescue_pair_cc.min(DOLLAR_CC)
+                } else if m.mode == Mode::Balance {
                     cfg.balance_pair_cc.min(DOLLAR_CC)
                 } else {
                     cfg.safe_pair_cc.min(DOLLAR_CC)
@@ -658,6 +668,10 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
                     }
                 }
             }
+        }
+
+        if new_gap == 0 && late_rescue {
+            return new_floor >= 0;
         }
 
         if new_floor >= cfg.locked_floor_buffer_cc {
@@ -851,6 +865,15 @@ fn pair_open_prices(cfg: &Config, m: &Market, signal: &CoinbaseSignal) -> Option
     None
 }
 
+fn pair_open_side_order(regime: SignalRegime) -> [Side; 2] {
+    match regime {
+        SignalRegime::DriftDown | SignalRegime::ExtremeDown | SignalRegime::PinnedDown => {
+            [Side::No, Side::Yes]
+        }
+        _ => [Side::Yes, Side::No],
+    }
+}
+
 fn maybe_open_pair_quote(
     cfg: &Config,
     ticker: &str,
@@ -864,12 +887,14 @@ fn maybe_open_pair_quote(
 
     log_pair_open_quote_prices(ticker, m, now, yes_price, no_price);
 
-    if let Some(cmd) = place_or_manage_resting(cfg, ticker, m, now, Side::Yes, yes_price, 1, false)
-    {
-        return PairOpenResult::Command(cmd);
-    }
-    if let Some(cmd) = place_or_manage_resting(cfg, ticker, m, now, Side::No, no_price, 1, false) {
-        return PairOpenResult::Command(cmd);
+    for side in pair_open_side_order(signal.regime) {
+        let price = match side {
+            Side::Yes => yes_price,
+            Side::No => no_price,
+        };
+        if let Some(cmd) = place_or_manage_resting(cfg, ticker, m, now, side, price, 1, false) {
+            return PairOpenResult::Command(cmd);
+        }
     }
 
     if pair_open_is_working(m, yes_price, no_price) {
@@ -912,7 +937,14 @@ fn maybe_balance_ioc(
     if t_rem > cfg.taker_desperate_s {
         if let Some(h) = m.resting_hint(hedge).as_ref() {
             let age_ms = now.duration_since(h.created_at).as_millis() as u64;
-            if age_ms < cfg.maker_first_ms {
+            let maker_wait_ms = if late_rescue_active(m) {
+                cfg.late_rescue_maker_first_ms
+                    .max(1)
+                    .min(cfg.maker_first_ms.max(1))
+            } else {
+                cfg.maker_first_ms.max(1)
+            };
+            if age_ms < maker_wait_ms {
                 return None;
             }
         }
@@ -938,7 +970,12 @@ fn maybe_balance_ioc(
 
     let sim = m.pos.simulate_buy(hedge, ask, qty as i64);
     if let Some(new_pc) = sim.pair_cost_cc() {
-        if new_pc > closeout_cap_cc(cfg, t_rem) {
+        let pair_cap = if late_rescue_active(m) {
+            cfg.flatten_rescue_pair_cc.min(DOLLAR_CC)
+        } else {
+            closeout_cap_cc(cfg, t_rem)
+        };
+        if new_pc > pair_cap {
             return None;
         }
     }
@@ -1092,7 +1129,9 @@ pub fn decide(
     if let Some(vulnerable) = coinbase.cancel_vulnerable_side(&signal, cfg) {
         let skip_cancel_for_repair =
             balanced_but_bad && gap == 0 && repair_side == Some(vulnerable);
-        if !skip_cancel_for_repair && !resting_pair_open {
+        let skip_cancel_for_late_rescue =
+            late_rescue_active(m) && gap > 0 && hedge_side(m) == vulnerable;
+        if !skip_cancel_for_repair && !skip_cancel_for_late_rescue && !resting_pair_open {
             if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, vulnerable) {
                 clear_no_order_reason(m);
                 return Some(cmd);
@@ -1293,6 +1332,57 @@ mod tests {
         assert_eq!(m.pos.pair_cost_cc(), Some(9_500));
         assert_eq!(m.pos.locked_floor_cc(), -500);
         assert!(admission_ok(&cfg, &m, Side::No, 87, 1));
+    }
+
+    #[test]
+    fn allows_late_gap_one_flatten_up_to_rescue_cap_when_floor_reaches_non_negative() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+
+        m.mode = Mode::Balance;
+        m.pos.apply_fill(Side::No, 62, 1);
+
+        assert_eq!(m.pos.locked_floor_cc(), -6_200);
+        assert!(admission_ok(&cfg, &m, Side::Yes, 38, 1));
+    }
+
+    #[test]
+    fn late_gap_one_ioc_uses_shorter_maker_wait() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+        let now = Instant::now();
+
+        m.mode = Mode::Balance;
+        m.pos.apply_fill(Side::No, 62, 1);
+        m.book.no_bids[62] = 1; // yes ask = 38
+        m.resting_yes = Some(RestingHint {
+            price_cents: 37,
+            created_at: now - std::time::Duration::from_millis(800),
+            cancel_requested_at: None,
+            client_order_id: uuid::Uuid::new_v4(),
+            order_id: Some("yes-1".to_string()),
+            queue_ahead: 0,
+        });
+
+        let cmd = maybe_balance_ioc(
+            &cfg,
+            "TEST",
+            &mut m,
+            now,
+            cfg.taker_desperate_s + 120,
+            Side::Yes,
+            1,
+        );
+
+        assert!(matches!(
+            cmd,
+            Some(ExecCommand::PlaceOrder {
+                side: Side::Yes,
+                price_cents: 38,
+                tif: Tif::Ioc,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1500,6 +1590,78 @@ mod tests {
             maybe_open_pair_quote(&cfg, "TEST", &mut m, now, &signal),
             PairOpenResult::Working
         ));
+    }
+
+    #[test]
+    fn late_gap_one_rescue_quotes_hedge_at_best_maker_price() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+
+        m.mode = Mode::Balance;
+        m.pos.apply_fill(Side::No, 70, 1);
+        m.book.yes_bids[25] = 1;
+        m.book.no_bids[60] = 1; // yes ask = 40
+
+        let signal = CoinbaseSignal {
+            price: 0.0,
+            microprice: 0.0,
+            ema_fast: 0.0,
+            ema_slow: 0.0,
+            vol_ema_usd: 0.0,
+            fair_yes: 0.05,
+            fair_yes_cents: 5,
+            trend_z: -0.5,
+            distance_usd: 0.0,
+            sigma_usd: 1.0,
+            age_ms: 0,
+            regime: SignalRegime::PinnedDown,
+            realized_final_avg: None,
+            required_remaining_avg: None,
+        };
+
+        assert_eq!(top_maker_price(&cfg, &m, Side::Yes), Some(39));
+        assert_eq!(desired_maker_quote(&cfg, &m, Side::Yes, &signal), Some(39));
+        assert_eq!(
+            drift_threshold_cents(&cfg, &m, Side::Yes),
+            cfg.late_rescue_cancel_drift_cents
+        );
+    }
+
+    #[test]
+    fn pair_open_places_no_first_in_down_regime() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+        let now = Instant::now();
+
+        m.book.yes_bids[45] = 1;
+        m.book.no_bids[51] = 1;
+
+        let signal = CoinbaseSignal {
+            price: 0.0,
+            microprice: 0.0,
+            ema_fast: 0.0,
+            ema_slow: 0.0,
+            vol_ema_usd: 0.0,
+            fair_yes: 0.20,
+            fair_yes_cents: 20,
+            trend_z: -0.3,
+            distance_usd: 0.0,
+            sigma_usd: 1.0,
+            age_ms: 0,
+            regime: SignalRegime::DriftDown,
+            realized_final_avg: None,
+            required_remaining_avg: None,
+        };
+
+        match maybe_open_pair_quote(&cfg, "TEST", &mut m, now, &signal) {
+            PairOpenResult::Command(ExecCommand::PlaceOrder {
+                side, price_cents, ..
+            }) => {
+                assert_eq!(side, Side::No);
+                assert_eq!(price_cents, 52);
+            }
+            _ => panic!("expected the down-regime pair opener to place NO first"),
+        }
     }
 
     #[test]

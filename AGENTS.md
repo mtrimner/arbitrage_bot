@@ -32,6 +32,7 @@ The actual objective is:
 - maintain or improve **guaranteed locked-in value** (`locked_floor_cc`),
 - keep **average pair cost** low,
 - only tolerate small temporary imbalances,
+- if the bot is one lot away from flat late in the window and the matched book still has non-positive floor, become materially more aggressive about finishing the hedge while still capping the completed pair at **$1.00**,
 - use Coinbase to decide when it is safe to open pairs, when it should hedge, and when a balanced book is “bad” enough to justify repair attempts.
 
 The most important mental model:
@@ -478,7 +479,12 @@ Opening a pair is allowed if:
 
 ### Important nuance
 
-Pair opening is symmetric. The bot wants both sides working. If a matching resting pair already exists, `maybe_open_pair_quote()` returns `Working` and emits no new order.
+Pair opening is still sequential rather than atomic, but the first leg is now regime-aware so the more vulnerable side is not exposed first:
+
+- `DriftDown`, `ExtremeDown`, `PinnedDown` → place **NO first**, then **YES**
+- all other regimes → place **YES first**, then **NO**
+
+If a matching resting pair already exists, `maybe_open_pair_quote()` returns `Working` and emits no new order.
 
 ---
 
@@ -505,6 +511,21 @@ In hedge-only situations, the bot may:
 If a fill **reduces imbalance**, the bot mostly judges it by whether it improves `locked_floor_cc` enough.
 
 That is intentionally more permissive than the fresh-risk path.
+
+### Late 1-lot rescue
+
+When the bot is in `Balance` mode, is exactly one contract away from flat, and the matched inventory still has `locked_floor_cc() <= 0`, it switches into a more aggressive cleanup path on the missing side.
+
+That path does all of the following:
+
+- forces the hedge-side maker ceiling to `ask - 1` even when the gap is only 1 lot,
+- quotes the hedge side at the top admissible maker price instead of sitting several cents back from the book,
+- tightens hedge reprice drift to `late_rescue_cancel_drift_cents`,
+- shortens the maker-first wait before IOC to `late_rescue_maker_first_ms`,
+- allows the final flattening pair to use `flatten_rescue_pair_cc` rather than `balance_pair_cc`,
+- but still requires the resulting `locked_floor_cc()` to be non-negative.
+
+This path is intentionally narrow. It is there to reduce end-of-window 1-lot leftovers without loosening normal pair opening.
 
 ---
 
@@ -620,6 +641,8 @@ There is one special case:
 
 Currently, hedge-side quotes while unbalanced use this stickier behavior; balanced repair quotes do not.
 
+Another special case: an active late 1-lot rescue hedge is **not** canceled just because Coinbase trend says that side is vulnerable. That avoids repeatedly pulling the exact quote the bot is trying to use to get flat.
+
 ### Minimum life matters
 
 `cancel_side_force()` and other cancel flows respect `min_resting_life_ms`.
@@ -730,12 +753,17 @@ These are the most strategy-relevant defaults in `src/config.rs`.
 
 ### Risk / inventory
 
-- `safe_pair_cc = 9950`
-- `target_pair_cc = 9900`
+- `safe_pair_cc = 9900`
+- `target_pair_cc = 9850`
+- `balance_pair_cc = 9900`
+- `final_balance_pair_cc = 10000`
+- `flatten_rescue_pair_cc = 10000`
+- `market_entry_pair_cost_cc = 9850`
 - `locked_floor_buffer_cc = 100`
-- `max_unhedged_qty_early = 1`
+- `max_unhedged_qty_early = 0`
 - `max_unhedged_qty_late = 0`
-- `no_new_imbalance_s = 30`
+- `no_new_imbalance_s = 120`
+- `freeze_if_balanced_s = 300`
 
 ### Quote behavior
 
@@ -745,8 +773,10 @@ These are the most strategy-relevant defaults in `src/config.rs`.
 - `inventory_skew_per_contract_cents = 1`
 - `inventory_skew_max_cents = 3`
 - `maker_improve_tick = 1`
+- `maker_improve_tick_balance = 1`
 - `maker_max_edge_cents = 8`
 - `maker_max_edge_cents_balance = 12`
+- `hedge_force_ask_minus_one_gap = 2`
 
 ### Cancel / churn control
 
@@ -754,14 +784,16 @@ These are the most strategy-relevant defaults in `src/config.rs`.
 - `cancel_retry_ms = 600`
 - `cancel_stale_ms = 30000`
 - `cancel_drift_cents = 2`
-- `cancel_drift_cents_hedge = 1`
+- `cancel_drift_cents_hedge = 2`
+- `late_rescue_cancel_drift_cents = 1`
 
 ### Taker fallback
 
 - `maker_first_ms = 1500`
+- `late_rescue_maker_first_ms = 750`
 - `taker_cooldown_ms = 1000`
-- `taker_desperate_s = 20`
-- `taker_force_gap = 2`
+- `taker_desperate_s = 60`
+- `taker_force_gap = 1`
 
 ### Coinbase signal
 
@@ -839,7 +871,10 @@ So “repair” is about improving the bot’s inventory economics, not fixing t
 4. **Logs can be semantically broader than they sound**
    - Example: `balanced_bad_no_repair_quote` can coexist with `resting_yes=true`.
 
-5. **Paper simulator uses through-price fill assumptions**
+5. **There is still no bootstrap / single-leg entry mode for pinned or highly dislocated opens**
+   - If Coinbase fair is far from the Kalshi book, `can_open_pairs()` can still block fresh opening entirely.
+
+6. **Paper simulator uses through-price fill assumptions**
    - Useful for testing, but not a perfect live fill model.
 
 ---
@@ -913,8 +948,11 @@ Look at:
 7. **Defaults are paper-mode defaults.**
    Be careful when reasoning about fills, cancels, and queue behavior; paper mode is an approximation.
 
+8. **Do not loosen normal pair-opening thresholds just because `flatten_rescue_pair_cc` is 10000.**
+   That cap is only meant for the late 1-lot cleanup path when the matched book still does not have a positive floor.
+
 ---
 
 ## One-sentence summary
 
-This bot is a Coinbase-informed, Kalshi-maker strategy that tries to accumulate and maintain low-cost balanced YES/NO inventory, repair bad balanced books when possible, and strictly gate any quote that worsens the bot’s guaranteed inventory economics.
+This bot is a Coinbase-informed, Kalshi-maker strategy that tries to accumulate and maintain low-cost balanced YES/NO inventory, repair bad balanced books when possible, open fresh pairs with regime-aware leg ordering, and use an aggressive late 1-lot rescue path to get flat without paying more than $1.00 for the completed pair.
