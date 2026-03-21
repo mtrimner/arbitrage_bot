@@ -31,7 +31,7 @@ The actual objective is:
 - accumulate **balanced YES/NO inventory** at favorable combined prices,
 - maintain or improve **guaranteed locked-in value** (`locked_floor_cc`),
 - keep **average pair cost** low,
-- only tolerate small temporary imbalances,
+- with current defaults, only tolerate transient fill-driven imbalances and otherwise target zero intentional unhedged inventory,
 - use Coinbase to decide when it is safe to open pairs, when it should hedge, and when a balanced book is “bad” enough to justify repair attempts.
 
 The most important mental model:
@@ -456,7 +456,7 @@ Used when the bot is allowed to open new balanced inventory.
 
 - there is still enough time left (`t_rem > no_new_imbalance_s`), and
 - either the regime is mild enough (`TwoSided`, `DriftUp`, `DriftDown`),
-- or raw-vs-Kalshi dislocation is small enough.
+- or anchored-fair-vs-Kalshi-mid dislocation is small enough.
 
 ### How opening pair prices are chosen
 
@@ -728,25 +728,43 @@ Current CSV includes:
 
 These are the most strategy-relevant defaults in `src/config.rs`.
 
-### Risk / inventory
+### Time / mode
 
-- `safe_pair_cc = 9950`
-- `target_pair_cc = 9900`
+- `window_s = 900`
+- `accumulate_s = 120`
+- `balance_s = 300`
+- `freeze_if_balanced_s = 300`
+- `no_new_imbalance_s = 300`
+
+### Risk / inventory quality
+
+- `safe_pair_cc = 9900`
+- `target_pair_cc = 9850`
+- `balance_pair_cc = 9900`
+- `final_balance_pair_cc = 10000`
+- `market_entry_pair_cost_cc = 9850`
 - `locked_floor_buffer_cc = 100`
-- `max_unhedged_qty_early = 1`
+- `max_unhedged_qty_early = 0`
 - `max_unhedged_qty_late = 0`
-- `no_new_imbalance_s = 30`
 
-### Quote behavior
+### Quote / hedge behavior
 
 - `quote_base_halfspread_cents = 2`
 - `quote_vol_per_extra_cent_usd = 20.0`
 - `quote_max_vol_extra_cents = 3`
+- `hedge_quote_boost_cents = 0`
 - `inventory_skew_per_contract_cents = 1`
 - `inventory_skew_max_cents = 3`
 - `maker_improve_tick = 1`
+- `maker_improve_tick_balance = 1`
 - `maker_max_edge_cents = 8`
 - `maker_max_edge_cents_balance = 12`
+- `hedge_force_ask_minus_one_gap = 2`
+- `catchup_aggressiveness = 0.45`
+- `catchup_balance_boost = 1.5`
+- `catchup_plausibility_buffer_cents = 1`
+- `short_side_min_order_qty = 1`
+- `max_order_qty = 10`
 
 ### Cancel / churn control
 
@@ -754,22 +772,34 @@ These are the most strategy-relevant defaults in `src/config.rs`.
 - `cancel_retry_ms = 600`
 - `cancel_stale_ms = 30000`
 - `cancel_drift_cents = 2`
-- `cancel_drift_cents_hedge = 1`
+- `cancel_drift_cents_hedge = 2`
 
 ### Taker fallback
 
 - `maker_first_ms = 1500`
 - `taker_cooldown_ms = 1000`
-- `taker_desperate_s = 20`
-- `taker_force_gap = 2`
+- `taker_desperate_s = 60`
+- `taker_force_gap = 1`
 
 ### Coinbase signal
 
+- `signal_late_threshold_s = 90`
+- `signal_two_sided_low/high = 0.35 / 0.65`
+- `signal_extreme_low/high = 0.20 / 0.80`
+- `signal_pinned_low/high = 0.10 / 0.90`
+- `signal_two_sided_low/high_late = 0.40 / 0.60`
+- `signal_extreme_low/high_late = 0.25 / 0.75`
+- `signal_pinned_low/high_late = 0.15 / 0.85`
 - `fair_sigma_floor_usd = 35.0`
 - `fair_vol_sqrt_scale = 1.25`
 - `fair_logistic_k = 1.8`
 - `fair_trend_weight = 0.07`
 - `cancel_trend_z = 0.30`
+
+### Config reality check
+
+- `Config::from_env()` currently overrides only `RESULTS_FILE`, `COINBASE_WS`, `COINBASE_PRODUCT_ID`, `COINBASE_LOG_DELTA_USD`, `COINBASE_STALE_MS`, `QUOTE_BASE_HALFSPREAD_CENTS`, `MARKET_ENTRY_PAIR_CC`, and `LOCKED_FLOOR_BUFFER_CC`.
+- Several fields still exist in `Config` but are currently unused anywhere in `src/`: `aggressive_tick`, `bootstrap_pair_cc`, `bootstrap_max_one_side_qty`, `bootstrap_rescue_min_improve_cc`, `early_imbalance_cap`, `late_imbalance_cap`, `imbalance_min_total`, `imbalance_cap_small_total`, `maker_qty_price_tol_cents`, `maker_qty_price_tol_cents_balance`, `min_taker_improve_cc`, and `taker_big_improve_cc`.
 
 ---
 
