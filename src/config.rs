@@ -179,7 +179,7 @@ impl Default for Config {
             maker_qty_price_tol_cents: 1,
             maker_qty_price_tol_cents_balance: 1,
             cancel_drift_cents_hedge: 2,
-            hedge_force_ask_minus_one_gap: 2,
+            hedge_force_ask_minus_one_gap: 1,
 
             taker_cooldown_ms: 1000,
             min_taker_improve_cc: 25,

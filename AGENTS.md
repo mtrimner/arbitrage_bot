@@ -498,13 +498,31 @@ In hedge-only situations, the bot may:
 
 - cancel the strong side,
 - place a maker quote on the weak side,
-- or eventually use IOC if late and desperate.
+- or use IOC earlier if the signal is clearly running away from the missing side.
 
 ### Admission rule for hedges
 
 If a fill **reduces imbalance**, the bot mostly judges it by whether it improves `locked_floor_cc` enough.
 
 That is intentionally more permissive than the fresh-risk path.
+
+Most important current nuance:
+
+- if a hedge fill fully flattens the book (`new_gap == 0`), admission is now based on whether the resulting `locked_floor_cc` meets `locked_floor_buffer_cc`,
+- it is **not** rejected just because the resulting average pair cost is above the old `safe_pair_cc` / `balance_pair_cc` closeout cap.
+
+### Early IOC trigger
+
+The bot now has a `signal_runs_away_from()` helper for hedge-only situations:
+
+- missing **YES** + `DriftUp` / `ExtremeUp` / `PinnedUp` => IOC can trigger early,
+- missing **NO** + `DriftDown` / `ExtremeDown` / `PinnedDown` => IOC can trigger early.
+
+This is meant to stop one-way windows from stranding the last lot while the missing side reprices away.
+
+### Temporary Coinbase outage behavior
+
+If Coinbase snapshot/signal data is temporarily unavailable while the bot already has an imbalance (`gap > 0`), it now keeps useful hedge-side resting orders alive instead of canceling everything immediately.
 
 ---
 
@@ -719,6 +737,7 @@ Current CSV includes:
 - final inventory,
 - average YES/NO costs,
 - pair cost,
+- `max_balance_price_cents` for unbalanced end states under the current `locked_floor_buffer_cc`,
 - locked floor,
 - simple YES-win / NO-win PnL projections.
 
@@ -741,7 +760,6 @@ These are the most strategy-relevant defaults in `src/config.rs`.
 - `safe_pair_cc = 9900`
 - `target_pair_cc = 9850`
 - `balance_pair_cc = 9900`
-- `final_balance_pair_cc = 10000`
 - `market_entry_pair_cost_cc = 9850`
 - `locked_floor_buffer_cc = 100`
 - `max_unhedged_qty_early = 0`
@@ -759,7 +777,7 @@ These are the most strategy-relevant defaults in `src/config.rs`.
 - `maker_improve_tick_balance = 1`
 - `maker_max_edge_cents = 8`
 - `maker_max_edge_cents_balance = 12`
-- `hedge_force_ask_minus_one_gap = 2`
+- `hedge_force_ask_minus_one_gap = 1`
 - `catchup_aggressiveness = 0.45`
 - `catchup_balance_boost = 1.5`
 - `catchup_plausibility_buffer_cents = 1`
@@ -799,7 +817,7 @@ These are the most strategy-relevant defaults in `src/config.rs`.
 ### Config reality check
 
 - `Config::from_env()` currently overrides only `RESULTS_FILE`, `COINBASE_WS`, `COINBASE_PRODUCT_ID`, `COINBASE_LOG_DELTA_USD`, `COINBASE_STALE_MS`, `QUOTE_BASE_HALFSPREAD_CENTS`, `MARKET_ENTRY_PAIR_CC`, and `LOCKED_FLOOR_BUFFER_CC`.
-- Several fields still exist in `Config` but are currently unused anywhere in `src/`: `aggressive_tick`, `bootstrap_pair_cc`, `bootstrap_max_one_side_qty`, `bootstrap_rescue_min_improve_cc`, `early_imbalance_cap`, `late_imbalance_cap`, `imbalance_min_total`, `imbalance_cap_small_total`, `maker_qty_price_tol_cents`, `maker_qty_price_tol_cents_balance`, `min_taker_improve_cc`, and `taker_big_improve_cc`.
+- Several fields still exist in `Config` but are currently unused anywhere in `src/`: `aggressive_tick`, `bootstrap_pair_cc`, `final_balance_pair_cc`, `bootstrap_max_one_side_qty`, `bootstrap_rescue_min_improve_cc`, `early_imbalance_cap`, `late_imbalance_cap`, `imbalance_min_total`, `imbalance_cap_small_total`, `maker_qty_price_tol_cents`, `maker_qty_price_tol_cents_balance`, `min_taker_improve_cc`, and `taker_big_improve_cc`.
 
 ---
 
@@ -818,6 +836,13 @@ Common causes:
 ### `rebalancing_quote_ineligible`
 
 The bot has an imbalance and wants to hedge, but the candidate hedge quote fails admission/risk logic.
+
+Current logs for this reason also include:
+
+- `hedge_side`
+- `short_side_ask`
+- `max_balance_price_cents`
+- `floor_if_filled_at_short_ask_cc`
 
 ### `balanced_bad_no_repair_quote`
 

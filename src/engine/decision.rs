@@ -8,7 +8,6 @@ use crate::state::ticker::{Market, Mode};
 use crate::types::{CC_PER_CENT, ExecCommand, RestingHint, Side, Tif};
 
 const DOLLAR_CC: i64 = 100 * CC_PER_CENT;
-const MAX_CAP_CC: i64 = 200 * CC_PER_CENT;
 const NO_ORDER_LOG_REPEAT_SECS: u64 = 5;
 const COINBASE_SIGNAL_LOG_REPEAT_MS: u64 = 10_000;
 const PAIR_OPEN_LOG_REPEAT_MS: u64 = 5_000;
@@ -24,6 +23,7 @@ fn clear_no_order_reason(m: &mut Market) {
 }
 
 fn log_no_order_reason(
+    cfg: &Config,
     ticker: &str,
     m: &mut Market,
     reason: &'static str,
@@ -42,6 +42,29 @@ fn log_no_order_reason(
     }
     m.last_no_order_reason = Some(reason);
     m.last_no_order_reason_ts = Some(now);
+
+    let hedge_telemetry =
+        if matches!(reason, "rebalancing_quote_ineligible" | "hedge_only_quote_ineligible") {
+            let hedge = hedge_side(m);
+            let short_side_ask = m.book.implied_ask(hedge);
+            let max_balance_price_cents = m
+                .pos
+                .max_avg_price_to_balance_cc(hedge, cfg.locked_floor_buffer_cc)
+                .map(|cc| cc as f64 / CC_PER_CENT as f64);
+            let floor_if_filled_at_short_ask_cc = short_side_ask.map(|ask| {
+                m.pos
+                    .simulate_buy(hedge, ask, gap.max(1))
+                    .locked_floor_cc()
+            });
+            (
+                Some(hedge),
+                short_side_ask,
+                max_balance_price_cents,
+                floor_if_filled_at_short_ask_cc,
+            )
+        } else {
+            (None, None, None, None)
+        };
 
     tracing::info!(
         ticker = %ticker,
@@ -64,6 +87,10 @@ fn log_no_order_reason(
         fair_yes_cents = ?signal.map(|s| s.fair_yes_cents),
         trend_z = ?signal.map(|s| s.trend_z),
         signal_age_ms = ?signal.map(|s| s.age_ms),
+        hedge_side = ?hedge_telemetry.0,
+        short_side_ask = ?hedge_telemetry.1,
+        max_balance_price_cents = ?hedge_telemetry.2,
+        floor_if_filled_at_short_ask_cc = ?hedge_telemetry.3,
         "no order placed"
     );
 }
@@ -175,14 +202,6 @@ fn needs_hedge_only(gap: i64, allowed_gap: i64) -> bool {
 
 fn strict_balance_cap_cc(cfg: &Config) -> i64 {
     cfg.balance_pair_cc.clamp(0, DOLLAR_CC)
-}
-
-fn closeout_cap_cc(cfg: &Config, t_rem: i64) -> i64 {
-    if t_rem <= cfg.taker_desperate_s {
-        cfg.final_balance_pair_cc.clamp(0, MAX_CAP_CC)
-    } else {
-        cfg.balance_pair_cc.clamp(0, DOLLAR_CC)
-    }
 }
 
 fn time_remaining_s(now_s: i64, window_s: i64) -> i64 {
@@ -634,27 +653,20 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
     // When a fill reduces an imbalance, judge it on guaranteed-floor repair
     // rather than demanding the average pair cost also improve.
     if new_gap < old_gap {
+        if new_gap == 0 {
+            return new_floor >= cfg.locked_floor_buffer_cc;
+        }
+
         if let Some(pc) = new_pc {
-            if new_gap == 0 {
-                let flatten_cap = if m.mode == Mode::Balance {
-                    cfg.balance_pair_cc.min(DOLLAR_CC)
-                } else {
-                    cfg.safe_pair_cc.min(DOLLAR_CC)
-                };
-                if pc > flatten_cap {
-                    return false;
-                }
-            } else {
-                match old_pc {
-                    Some(old) => {
-                        if pc > old {
-                            return false;
-                        }
+            match old_pc {
+                Some(old) => {
+                    if pc > old {
+                        return false;
                     }
-                    None => {
-                        if pc > DOLLAR_CC {
-                            return false;
-                        }
+                }
+                None => {
+                    if pc > DOLLAR_CC {
+                        return false;
                     }
                 }
             }
@@ -724,6 +736,19 @@ fn repair_side_for(regime: SignalRegime) -> Option<Side> {
         SignalRegime::DriftUp | SignalRegime::ExtremeUp | SignalRegime::PinnedUp => Some(Side::No),
         SignalRegime::TwoSided => None,
     }
+}
+
+fn signal_runs_away_from(hedge: Side, regime: SignalRegime) -> bool {
+    matches!(
+        (hedge, regime),
+        (
+            Side::Yes,
+            SignalRegime::DriftUp | SignalRegime::ExtremeUp | SignalRegime::PinnedUp
+        ) | (
+            Side::No,
+            SignalRegime::DriftDown | SignalRegime::ExtremeDown | SignalRegime::PinnedDown
+        )
+    )
 }
 
 fn repair_quote_improves_book(cfg: &Config, m: &Market, side: Side, price_cents: u8) -> bool {
@@ -936,13 +961,6 @@ fn maybe_balance_ioc(
         return None;
     }
 
-    let sim = m.pos.simulate_buy(hedge, ask, qty as i64);
-    if let Some(new_pc) = sim.pair_cost_cc() {
-        if new_pc > closeout_cap_cc(cfg, t_rem) {
-            return None;
-        }
-    }
-
     let (_client_order_id, cmd) = stage_place_order(ticker, m, hedge, ask, qty, Tif::Ioc, false);
     set_last_taker(m, hedge, now);
     Some(cmd)
@@ -990,7 +1008,7 @@ pub fn decide(
 
     if let Some(close_ts) = m.close_ts {
         if now_s >= close_ts {
-            log_no_order_reason(ticker, m, "market_closed", t_rem, None, gap, allowed_gap);
+            log_no_order_reason(cfg, ticker, m, "market_closed", t_rem, None, gap, allowed_gap);
             return None;
         }
     }
@@ -1006,7 +1024,7 @@ pub fn decide(
             clear_no_order_reason(m);
             return Some(cmd);
         }
-        log_no_order_reason(ticker, m, "freeze_balanced", t_rem, None, gap, allowed_gap);
+        log_no_order_reason(cfg, ticker, m, "freeze_balanced", t_rem, None, gap, allowed_gap);
         return None;
     }
 
@@ -1016,6 +1034,7 @@ pub fn decide(
             return Some(cmd);
         }
         log_no_order_reason(
+            cfg,
             ticker,
             m,
             "waiting_strike_price",
@@ -1027,11 +1046,14 @@ pub fn decide(
         return None;
     };
     let Some(coinbase) = coinbase else {
-        if let Some(cmd) = cancel_all_if_any(cfg, ticker, m, now) {
-            clear_no_order_reason(m);
-            return Some(cmd);
+        if gap == 0 {
+            if let Some(cmd) = cancel_all_if_any(cfg, ticker, m, now) {
+                clear_no_order_reason(m);
+                return Some(cmd);
+            }
         }
         log_no_order_reason(
+            cfg,
             ticker,
             m,
             "waiting_coinbase_snapshot",
@@ -1043,11 +1065,14 @@ pub fn decide(
         return None;
     };
     let Some(signal) = coinbase.build_signal(cfg, strike_price, m.close_ts, t_rem) else {
-        if let Some(cmd) = cancel_all_if_any(cfg, ticker, m, now) {
-            clear_no_order_reason(m);
-            return Some(cmd);
+        if gap == 0 {
+            if let Some(cmd) = cancel_all_if_any(cfg, ticker, m, now) {
+                clear_no_order_reason(m);
+                return Some(cmd);
+            }
         }
         log_no_order_reason(
+            cfg,
             ticker,
             m,
             "coinbase_signal_unavailable",
@@ -1123,6 +1148,7 @@ pub fn decide(
                 }
 
                 log_no_order_reason(
+                    cfg,
                     ticker,
                     m,
                     "balanced_bad_no_repair_quote",
@@ -1140,6 +1166,7 @@ pub fn decide(
             return Some(cmd);
         }
         log_no_order_reason(
+            cfg,
             ticker,
             m,
             "balanced_bad_no_repair_quote",
@@ -1165,7 +1192,7 @@ pub fn decide(
         } else {
             "regime_blocks_opening"
         };
-        log_no_order_reason(ticker, m, reason, t_rem, Some(&signal), gap, allowed_gap);
+        log_no_order_reason(cfg, ticker, m, reason, t_rem, Some(&signal), gap, allowed_gap);
         return None;
     }
 
@@ -1175,9 +1202,11 @@ pub fn decide(
             return Some(cmd);
         }
 
-        let force_ioc = m.mode == Mode::Balance
-            && gap > 0
-            && (t_rem <= cfg.taker_desperate_s || gap >= cfg.taker_force_gap.max(1));
+        let force_ioc = gap > 0
+            && (signal_runs_away_from(hedge, signal.regime)
+                || (m.mode == Mode::Balance
+                    && (t_rem <= cfg.taker_desperate_s
+                        || gap >= cfg.taker_force_gap.max(1))));
         if force_ioc {
             if let Some(cmd) = maybe_balance_ioc(cfg, ticker, m, now, t_rem, hedge, gap) {
                 clear_no_order_reason(m);
@@ -1197,10 +1226,11 @@ pub fn decide(
             } else {
                 "hedge_only_quote_ineligible"
             };
-            log_no_order_reason(ticker, m, reason, t_rem, Some(&signal), gap, allowed_gap);
+            log_no_order_reason(cfg, ticker, m, reason, t_rem, Some(&signal), gap, allowed_gap);
             return None;
         }
         log_no_order_reason(
+            cfg,
             ticker,
             m,
             "regime_blocks_new_imbalance",
@@ -1229,6 +1259,7 @@ pub fn decide(
         return Some(cmd);
     }
     log_no_order_reason(
+        cfg,
         ticker,
         m,
         "pair_open_quote_unavailable",
@@ -1293,6 +1324,25 @@ mod tests {
         assert_eq!(m.pos.pair_cost_cc(), Some(9_500));
         assert_eq!(m.pos.locked_floor_cc(), -500);
         assert!(admission_ok(&cfg, &m, Side::No, 87, 1));
+    }
+
+    #[test]
+    fn final_flatten_uses_floor_buffer_instead_of_pair_cost_cap() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+
+        for _ in 0..22 {
+            m.pos.apply_fill(Side::Yes, 50, 1);
+            m.pos.apply_fill(Side::No, 49, 1);
+        }
+        m.pos.apply_fill(Side::No, 46, 1);
+
+        assert_eq!(m.pos.yes_qty, 22);
+        assert_eq!(m.pos.no_qty, 23);
+        assert_eq!(m.pos.locked_floor_cc(), -2_400);
+
+        assert!(admission_ok(&cfg, &m, Side::Yes, 55, 1));
+        assert!(!admission_ok(&cfg, &m, Side::Yes, 76, 1));
     }
 
     #[test]
@@ -1437,6 +1487,55 @@ mod tests {
     }
 
     #[test]
+    fn runaway_signal_can_trigger_ioc_before_balance_mode() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+        let now_s = unix_now_s();
+
+        m.open_ts = Some(now_s - 300);
+        m.close_ts = Some(now_s + 400);
+        m.strike_price = Some(100_000.0);
+        m.book.no_bids[45] = 1;
+        m.pos.apply_fill(Side::No, 40, 1);
+
+        let coinbase = CoinbaseSnapshot {
+            product_id: "BTC-USD".to_string(),
+            last_trade_price: Some(100_300.0),
+            best_bid: Some(100_299.0),
+            best_ask: Some(100_301.0),
+            best_bid_qty: Some(1.0),
+            best_ask_qty: Some(1.0),
+            microprice: Some(100_300.0),
+            ema_fast: Some(100_300.0),
+            ema_slow: Some(100_250.0),
+            vol_ema_usd: Some(1.0),
+            last_update_ms: Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            ),
+            last_heartbeat_ms: None,
+            heartbeat_counter: None,
+            samples: Vec::new(),
+        };
+
+        let cmd = decide(&cfg, "TEST", &mut m, Some(&coinbase));
+        assert!(matches!(
+            cmd,
+            Some(ExecCommand::PlaceOrder {
+                side: Side::Yes,
+                price_cents: 55,
+                qty: 1,
+                tif: Tif::Ioc,
+                post_only: false,
+                ..
+            })
+        ));
+        assert_eq!(m.mode, Mode::Hedge);
+    }
+
+    #[test]
     fn cancel_side_force_respects_min_resting_life() {
         let cfg = Config::default();
         let mut m = Market::new();
@@ -1452,6 +1551,33 @@ mod tests {
         });
 
         assert!(cancel_side_force(&cfg, "TEST", &mut m, now, Side::Yes).is_none());
+    }
+
+    #[test]
+    fn waiting_for_coinbase_does_not_cancel_helpful_hedge_order() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+        let now_s = unix_now_s();
+        let created_at = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(cfg.min_resting_life_ms + 1))
+            .unwrap();
+
+        m.open_ts = Some(now_s - 300);
+        m.close_ts = Some(now_s + 300);
+        m.strike_price = Some(100_000.0);
+        m.pos.apply_fill(Side::No, 49, 1);
+        m.resting_yes = Some(RestingHint {
+            price_cents: 50,
+            created_at,
+            cancel_requested_at: None,
+            client_order_id: uuid::Uuid::new_v4(),
+            order_id: Some("yes-hedge".to_string()),
+            queue_ahead: 0,
+        });
+
+        let cmd = decide(&cfg, "TEST", &mut m, None);
+        assert!(cmd.is_none());
+        assert!(m.resting_yes.is_some());
     }
 
     #[test]

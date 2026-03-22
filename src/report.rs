@@ -9,7 +9,7 @@ use std::io::ErrorKind;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
-const RESULTS_HEADER: &str = "run_ts_utc,series_ticker,market_ticker,open_time_utc,close_time_utc,target_price_usd,coinbase_price_usd,opening_yes_cents,opening_no_cents,yes_qty,no_qty,yes_avg_cents,no_avg_cents,pair_cost_cents,pair_cost_dollars,locked_floor_cents,locked_floor_dollars,pnl_yes_win,pnl_no_win\n";
+const RESULTS_HEADER: &str = "run_ts_utc,series_ticker,market_ticker,open_time_utc,close_time_utc,target_price_usd,coinbase_price_usd,opening_yes_cents,opening_no_cents,yes_qty,no_qty,yes_avg_cents,no_avg_cents,pair_cost_cents,pair_cost_dollars,max_balance_price_cents,locked_floor_cents,locked_floor_dollars,pnl_yes_win,pnl_no_win\n";
 
 fn cc_to_cents(cc: i64) -> f64 {
     cc as f64 / CC_PER_CENT as f64
@@ -69,6 +69,7 @@ pub async fn append_result_csv(
     close_ts: i64,
     target_price: Option<f64>,
     coinbase_price: Option<f64>,
+    locked_floor_buffer_cc: i64,
     pos: &Position,
 ) -> Result<()> {
     let p = std::path::Path::new(path);
@@ -100,6 +101,15 @@ pub async fn append_result_csv(
     let no_avg_cents = pos.avg_no_cc().map(cc_to_cents);
     let pair_cost_cents = pos.pair_cost_cc().map(cc_to_cents);
     let pair_cost_dollars = pos.pair_cost_cc().map(cc_to_dollars);
+    let max_balance_price_cents = if pos.yes_qty < pos.no_qty {
+        pos.max_avg_price_to_balance_cc(crate::types::Side::Yes, locked_floor_buffer_cc)
+            .map(cc_to_cents)
+    } else if pos.no_qty < pos.yes_qty {
+        pos.max_avg_price_to_balance_cc(crate::types::Side::No, locked_floor_buffer_cc)
+            .map(cc_to_cents)
+    } else {
+        None
+    };
     let locked_floor_cents = cc_to_cents(pos.locked_floor_cc());
     let locked_floor_dollars = cc_to_dollars(pos.locked_floor_cc());
 
@@ -111,7 +121,7 @@ pub async fn append_result_csv(
     let pnl_no_win_dollars = no_qty - total_cost_dollars;
 
     let line = format!(
-        "{run_ts},{series_ticker},{market_ticker},{open_time},{close_time},{},{},{},{},{},{},{},{},{},{},{:.2},{:.4},{},{}\n",
+        "{run_ts},{series_ticker},{market_ticker},{open_time},{close_time},{},{},{},{},{},{},{},{},{},{},{},{:.2},{:.4},{},{}\n",
         fmt_opt_2(target_price),
         fmt_opt_2(coinbase_price),
         fmt_opt_2(opening_yes_cents),
@@ -122,6 +132,7 @@ pub async fn append_result_csv(
         fmt_opt_2(no_avg_cents),
         fmt_opt_2(pair_cost_cents),
         fmt_opt_4(pair_cost_dollars),
+        fmt_opt_2(max_balance_price_cents),
         locked_floor_cents,
         locked_floor_dollars,
         pnl_yes_win_dollars,
@@ -155,6 +166,7 @@ mod tests {
             1_700_000_900,
             Some(95_000.0),
             Some(95_123.45),
+            100,
             &pos,
         )
         .await
@@ -164,6 +176,7 @@ mod tests {
         assert!(contents.contains("series_ticker,market_ticker"));
         assert!(contents.contains("target_price_usd,coinbase_price_usd"));
         assert!(contents.contains("opening_yes_cents,opening_no_cents"));
+        assert!(contents.contains("max_balance_price_cents"));
         assert!(contents.contains("KXBTC15M,KXBTC15M-TEST"));
         assert!(contents.contains("95000.00,95123.45"));
         assert!(contents.contains("49.00,50.00,1,1"));
