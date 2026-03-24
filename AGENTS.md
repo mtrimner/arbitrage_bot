@@ -389,7 +389,7 @@ Time remaining is based on the actual market open/close timestamps when availabl
 6. cancel stale orders if needed,
 7. cancel vulnerable side if the trend says one resting side is dangerous,
 8. determine if new pair opening is allowed,
-9. if balanced but bad and opening is blocked, try a repair quote,
+9. if balanced but bad, first try a fresh paired add when opening is allowed and the pair improves the book; otherwise consider a repair quote,
 10. if imbalance is too large or opening is blocked, focus on hedge-only logic,
 11. otherwise try to open a fresh pair,
 12. if none of the above emits a command, log a “no order placed” reason.
@@ -538,7 +538,7 @@ Repair logic exists for **balanced but bad** books.
 - there is inventory, and
 - either:
   - `locked_floor_cc < locked_floor_buffer_cc`, or
-  - `pair_cost_cc > target_pair_cc + PAIR_REPAIR_HYST_CC`.
+  - `pair_cost_cc > safe_pair_cc + PAIR_REPAIR_HYST_CC`.
 
 With the current hysteresis:
 
@@ -564,6 +564,7 @@ It is not a full pair order.
 
 The idea is:
 
+- if a fresh paired add would improve the current book and pair opening is allowed, prefer that over creating a new one-sided repair,
 - quote for the side that looks relatively cheap under the current regime,
 - only if simulating that fill and later pairing it with a plausible price on the other side would improve the quality of the balanced book.
 
@@ -578,6 +579,11 @@ It only allows the quote if the resulting book would improve either:
 
 - `locked_floor_cc`, or
 - `pair_cost_cc`.
+
+When the current balanced book is already above the floor buffer, repair is stricter:
+
+- completion pricing uses the current implied ask first, then falls back to maker/bid estimates,
+- the projected marginal pair must beat the current average pair by a small amount, so old edge cannot subsidize a bad new repair pair.
 
 ### Important nuance about the logs
 
@@ -599,13 +605,17 @@ not necessarily:
 
 > “There is no repair quote in the market.”
 
-### Current behavior: repair quotes are not sticky
+### Current behavior: repair quotes are sticky value quotes
 
-Because repair quotes flow through `maybe_signal_maker_quote()` and the position is balanced, the `sticky` flag is false there.
+Once a repair quote is resting on the repair side, the engine does not ratchet it more aggressive as the market moves.
 
-So current repair quotes can reprice after `min_resting_life_ms` if the desired price changes by at least the drift threshold.
+Instead it:
 
-This is one reason a repair quote may keep ratcheting rather than sit in place long enough to fill.
+- keeps the quote working if it still passes the repair test,
+- cancels it if the existing price is no longer attractive,
+- otherwise leaves it alone.
+
+This makes repair behave more like a value bid: sit, fill cheap, or get out.
 
 ---
 
