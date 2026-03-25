@@ -12,6 +12,7 @@ const NO_ORDER_LOG_REPEAT_SECS: u64 = 5;
 const COINBASE_SIGNAL_LOG_REPEAT_MS: u64 = 10_000;
 const PAIR_OPEN_LOG_REPEAT_MS: u64 = 5_000;
 const MIN_HEDGE_FLOOR_IMPROVE_CC: i64 = 500;
+const EARLY_PROFITABLE_FLATTEN_FLOOR_CC: i64 = 500;
 const PAIR_REPAIR_HYST_CC: i64 = 50;
 const MIN_REPAIR_PAIR_IMPROVE_CC: i64 = 25;
 const COINBASE_SIGNAL_WEIGHT: f64 = 0.35;
@@ -175,6 +176,22 @@ fn total_qty(m: &Market) -> i64 {
 
 fn unhedged_qty(m: &Market) -> i64 {
     (m.pos.yes_qty - m.pos.no_qty).abs().max(0)
+}
+
+fn update_imbalance_since(m: &mut Market, now: Instant, gap: i64) {
+    if gap > 0 {
+        if m.imbalance_since.is_none() {
+            m.imbalance_since = Some(now);
+        }
+    } else {
+        m.imbalance_since = None;
+    }
+}
+
+fn imbalance_age_ms(m: &Market, now: Instant) -> u64 {
+    m.imbalance_since
+        .map(|ts| now.duration_since(ts).as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn qty_for(pos: &Position, side: Side) -> i64 {
@@ -650,6 +667,33 @@ fn repair_completion_price_cents(cfg: &Config, m: &Market, missing_side: Side) -
         .or_else(|| m.book.best_bid(missing_side))
 }
 
+fn profitable_flatten_floor_cc(m: &Market, hedge: Side, gap: i64) -> Option<i64> {
+    let ask = m.book.implied_ask(hedge)?;
+    Some(m.pos.simulate_buy(hedge, ask, gap.max(1)).locked_floor_cc())
+}
+
+fn should_force_profitable_flatten(
+    cfg: &Config,
+    m: &Market,
+    now: Instant,
+    hedge: Side,
+    gap: i64,
+) -> bool {
+    if gap != 1 {
+        return false;
+    }
+
+    if imbalance_age_ms(m, now) < cfg.maker_first_ms {
+        return false;
+    }
+
+    let min_floor = cfg
+        .locked_floor_buffer_cc
+        .max(EARLY_PROFITABLE_FLATTEN_FLOOR_CC);
+
+    profitable_flatten_floor_cc(m, hedge, gap).is_some_and(|floor| floor >= min_floor)
+}
+
 fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64) -> bool {
     let sim = m.pos.simulate_buy(side, price_cents, qty as i64);
     let old_gap = unhedged_qty(m);
@@ -1009,13 +1053,8 @@ fn maybe_balance_ioc(
         return None;
     }
 
-    if t_rem > cfg.taker_desperate_s {
-        if let Some(h) = m.resting_hint(hedge).as_ref() {
-            let age_ms = now.duration_since(h.created_at).as_millis() as u64;
-            if age_ms < cfg.maker_first_ms {
-                return None;
-            }
-        }
+    if t_rem > cfg.taker_desperate_s && imbalance_age_ms(m, now) < cfg.maker_first_ms {
+        return None;
     }
 
     let Some(ask) = m.book.implied_ask(hedge) else {
@@ -1080,6 +1119,7 @@ pub fn decide(
     let mut t_rem = 0;
     let mut gap = unhedged_qty(m);
     let mut allowed_gap = allowed_unhedged_qty(cfg, m);
+    update_imbalance_since(m, now, gap);
 
     if let Some(close_ts) = m.close_ts {
         if now_s >= close_ts {
@@ -1318,11 +1358,17 @@ pub fn decide(
             return Some(cmd);
         }
 
+        let profitable_flatten = should_force_profitable_flatten(cfg, m, now, hedge, gap);
         let force_ioc = gap > 0
             && (signal_runs_away_from(hedge, signal.regime)
+                || profitable_flatten
                 || (m.mode == Mode::Balance
                     && (t_rem <= cfg.taker_desperate_s || gap >= cfg.taker_force_gap.max(1))));
         if force_ioc {
+            if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, hedge) {
+                clear_no_order_reason(m);
+                return Some(cmd);
+            }
             if let Some(cmd) = maybe_balance_ioc(cfg, ticker, m, now, t_rem, hedge, gap) {
                 clear_no_order_reason(m);
                 return Some(cmd);
@@ -1649,6 +1695,66 @@ mod tests {
     }
 
     #[test]
+    fn profitable_gap_one_flatten_triggers_ioc_after_maker_first_window() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+        let now_s = unix_now_s();
+
+        m.open_ts = Some(now_s - 300);
+        m.close_ts = Some(now_s + 400);
+        m.strike_price = Some(100_000.0);
+
+        for _ in 0..8 {
+            m.pos.apply_fill(Side::Yes, 54, 1);
+        }
+        for _ in 0..9 {
+            m.pos.apply_fill(Side::No, 44, 1);
+        }
+
+        m.imbalance_since = Some(
+            Instant::now()
+                .checked_sub(std::time::Duration::from_millis(cfg.maker_first_ms + 1))
+                .unwrap(),
+        );
+        m.book.no_bids[55] = 1;
+
+        let coinbase = CoinbaseSnapshot {
+            product_id: "BTC-USD".to_string(),
+            last_trade_price: Some(100_000.0),
+            best_bid: Some(99_999.0),
+            best_ask: Some(100_001.0),
+            best_bid_qty: Some(1.0),
+            best_ask_qty: Some(1.0),
+            microprice: Some(100_000.0),
+            ema_fast: Some(100_000.0),
+            ema_slow: Some(100_000.0),
+            vol_ema_usd: Some(1.0),
+            last_update_ms: Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            ),
+            last_heartbeat_ms: None,
+            heartbeat_counter: None,
+            samples: Vec::new(),
+        };
+
+        let cmd = decide(&cfg, "TEST", &mut m, Some(&coinbase));
+        assert!(matches!(
+            cmd,
+            Some(ExecCommand::PlaceOrder {
+                side: Side::Yes,
+                price_cents: 45,
+                qty: 1,
+                tif: Tif::Ioc,
+                post_only: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn runaway_signal_can_trigger_ioc_before_balance_mode() {
         let cfg = Config::default();
         let mut m = Market::new();
@@ -1657,6 +1763,11 @@ mod tests {
         m.open_ts = Some(now_s - 300);
         m.close_ts = Some(now_s + 400);
         m.strike_price = Some(100_000.0);
+        m.imbalance_since = Some(
+            Instant::now()
+                .checked_sub(std::time::Duration::from_millis(cfg.maker_first_ms + 1))
+                .unwrap(),
+        );
         m.book.no_bids[45] = 1;
         m.pos.apply_fill(Side::No, 40, 1);
 

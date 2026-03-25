@@ -93,7 +93,7 @@ The bot runs a few long-lived async tasks:
   - order book,
   - position,
   - resting hints,
-  - timestamps and mode.
+  - timestamps, mode, and imbalance-age tracking.
 
 - `CoinbaseState` (`src/state/coinbase.rs`)
   - live Coinbase trade/top-of-book signal state,
@@ -390,7 +390,7 @@ Time remaining is based on the actual market open/close timestamps when availabl
 7. cancel vulnerable side if the trend says one resting side is dangerous,
 8. determine if new pair opening is allowed,
 9. if balanced but bad, first try a fresh paired add when opening is allowed and the pair improves the book; otherwise consider a repair quote,
-10. if imbalance is too large or opening is blocked, focus on hedge-only logic,
+10. if imbalance is too large or opening is blocked, focus on hedge-only logic, including maker hedge, runaway/profitable IOC escalation, and cancel-before-IOC handling,
 11. otherwise try to open a fresh pair,
 12. if none of the above emits a command, log a “no order placed” reason.
 
@@ -472,13 +472,19 @@ Used when the bot is allowed to open new balanced inventory.
 
 Opening a pair is allowed if:
 
-- new locked floor does not worsen, and
-- either new pair cost improves vs current,
-- or it is below `market_entry_pair_cost_cc`.
+- the fully completed pair does not worsen locked floor, and
+- if there is no existing paired inventory, the marginal pair is at or below `market_entry_pair_cost_cc`, and
+- if there is existing paired inventory:
+  - both possible first-leg fills must still leave `locked_floor_cc >= locked_floor_buffer_cc`,
+  - the marginal pair must be **strictly** better than the current average pair cost.
 
 ### Important nuance
 
-Pair opening is symmetric. The bot wants both sides working. If a matching resting pair already exists, `maybe_open_pair_quote()` returns `Working` and emits no new order.
+The bot still wants both sides working, but placement order is no longer symmetric:
+
+- `maybe_open_pair_quote()` places the cheaper leg first,
+- then tries the other leg in the same pass,
+- if a matching resting pair already exists, it returns `Working` and emits no new order.
 
 ---
 
@@ -498,7 +504,7 @@ In hedge-only situations, the bot may:
 
 - cancel the strong side,
 - place a maker quote on the weak side,
-- or use IOC earlier if the signal is clearly running away from the missing side.
+- or use IOC earlier if the signal is clearly running away from the missing side or the last lot can be flattened profitably.
 
 ### Admission rule for hedges
 
@@ -511,14 +517,21 @@ Most important current nuance:
 - if a hedge fill fully flattens the book (`new_gap == 0`), admission is now based on whether the resulting `locked_floor_cc` meets `locked_floor_buffer_cc`,
 - it is **not** rejected just because the resulting average pair cost is above the old `safe_pair_cc` / `balance_pair_cc` closeout cap.
 
-### Early IOC trigger
+### Early IOC triggers
 
-The bot now has a `signal_runs_away_from()` helper for hedge-only situations:
+The bot now has two main early-IOC paths for hedge-only situations:
 
-- missing **YES** + `DriftUp` / `ExtremeUp` / `PinnedUp` => IOC can trigger early,
-- missing **NO** + `DriftDown` / `ExtremeDown` / `PinnedDown` => IOC can trigger early.
+- runaway signal:
+  - missing **YES** + `DriftUp` / `ExtremeUp` / `PinnedUp` => IOC can trigger early,
+  - missing **NO** + `DriftDown` / `ExtremeDown` / `PinnedDown` => IOC can trigger early.
+- profitable last-lot flatten:
+  - only for `gap == 1`,
+  - only after the imbalance has persisted for at least `maker_first_ms`,
+  - only if buying the missing side at the current implied ask would still leave `locked_floor_cc` at least `max(locked_floor_buffer_cc, 500)`.
 
-This is meant to stop one-way windows from stranding the last lot while the missing side reprices away.
+The maker-first waiting period now follows the age of the imbalance itself (`imbalance_since`), not the age of the latest repriced hedge quote.
+
+Before sending an IOC on the hedge side, the engine first tries to cancel any same-side resting hedge quote so it does not overshoot after flattening.
 
 ### Temporary Coinbase outage behavior
 
@@ -895,16 +908,19 @@ So “repair” is about improving the bot’s inventory economics, not fixing t
    - It is based on Coinbase price-vs-strike with volatility and trend overlays.
    - It is only partially anchored back to Kalshi mid.
 
-2. **Repair quotes are currently not sticky**
-   - They can walk as the signal moves.
+2. **Existing-inventory pair scaling is intentionally conservative**
+   - Non-flat books only reopen if the full pair is better, both first-leg paths preserve the floor buffer, and the marginal pair is strictly better than the current average pair.
 
-3. **Raw fair frequently saturates near 99/1**
+3. **Gap-1 profitable flatten can escalate earlier than old maker babysitting behavior**
+   - After `maker_first_ms`, the bot may take the live ask to flatten if the remaining locked floor would still be at least `max(locked_floor_buffer_cc, 500)`.
+
+4. **Raw fair frequently saturates near 99/1**
    - The anchored fair and quote clamps keep execution logic from blindly following that, but the saturation is expected.
 
-4. **Logs can be semantically broader than they sound**
+5. **Logs can be semantically broader than they sound**
    - Example: `balanced_bad_no_repair_quote` can coexist with `resting_yes=true`.
 
-5. **Paper simulator uses through-price fill assumptions**
+6. **Paper simulator uses through-price fill assumptions**
    - Useful for testing, but not a perfect live fill model.
 
 ---
@@ -933,9 +949,21 @@ Look at:
 
 Look at:
 
+- `marginal_pair_cc()`
+- `pair_open_survives_first_leg()`
 - `pair_open_ok()`
 - `pair_open_prices()`
 - `maybe_open_pair_quote()`
+
+### If changing hedge timing / last-lot flatten
+
+Look at:
+
+- `update_imbalance_since()`
+- `imbalance_age_ms()`
+- `profitable_flatten_floor_cc()`
+- `should_force_profitable_flatten()`
+- `maybe_balance_ioc()`
 
 ### If changing cancel/reprice stickiness
 
@@ -973,9 +1001,15 @@ Look at:
 5. **Remember that asks are implied from the opposite side’s best bid.**
    This drives a lot of quote math and can produce `None` asks if the opposite side book is empty.
 
-6. **If you change reporting or rotation, keep market-manager + report schema in sync.**
+6. **For hedge escalation, track imbalance age, not hedge-quote age.**
+   The maker-first IOC delay is keyed off `imbalance_since`, so repricing a maker hedge should not restart the clock.
 
-7. **Defaults are paper-mode defaults.**
+7. **Existing-inventory pair scaling must account for first-leg damage, not just full-pair economics.**
+   If you loosen pair reopening, check both first-leg floor survivability and marginal pair quality.
+
+8. **If you change reporting or rotation, keep market-manager + report schema in sync.**
+
+9. **Defaults are paper-mode defaults.**
    Be careful when reasoning about fills, cancels, and queue behavior; paper mode is an approximation.
 
 ---
