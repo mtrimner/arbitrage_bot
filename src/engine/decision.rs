@@ -725,7 +725,35 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
 }
 
 fn two_sided_pair_cost_ok(cfg: &Config, yes_price: u8, no_price: u8) -> bool {
-    (yes_price as i64 + no_price as i64) * CC_PER_CENT <= cfg.market_entry_pair_cost_cc
+    marginal_pair_cc(yes_price, no_price) <= cfg.market_entry_pair_cost_cc
+}
+
+fn marginal_pair_cc(yes_price: u8, no_price: u8) -> i64 {
+    (yes_price as i64 + no_price as i64) * CC_PER_CENT
+}
+
+fn pair_open_survives_first_leg(
+    cfg: &Config,
+    m: &Market,
+    yes_price: u8,
+    no_price: u8,
+    qty: u64,
+) -> bool {
+    if !has_pair(m) {
+        return true;
+    }
+
+    let qty = qty.max(1) as i64;
+    let yes_first_floor = m
+        .pos
+        .simulate_buy(Side::Yes, yes_price, qty)
+        .locked_floor_cc();
+    let no_first_floor = m
+        .pos
+        .simulate_buy(Side::No, no_price, qty)
+        .locked_floor_cc();
+
+    yes_first_floor >= cfg.locked_floor_buffer_cc && no_first_floor >= cfg.locked_floor_buffer_cc
 }
 
 fn is_balanced_but_bad(cfg: &Config, m: &Market) -> bool {
@@ -845,10 +873,12 @@ fn pair_open_is_working(m: &Market, yes_price: u8, no_price: u8) -> bool {
 }
 
 fn pair_open_ok(cfg: &Config, m: &Market, yes_price: u8, no_price: u8, qty: u64) -> bool {
+    let qty_u64 = qty.max(1);
+    let qty_i64 = qty_u64 as i64;
     let sim = m
         .pos
-        .simulate_buy(Side::Yes, yes_price, qty as i64)
-        .simulate_buy(Side::No, no_price, qty as i64);
+        .simulate_buy(Side::Yes, yes_price, qty_i64)
+        .simulate_buy(Side::No, no_price, qty_i64);
 
     let cur_floor = m.pos.locked_floor_cc();
     let new_floor = sim.locked_floor_cc();
@@ -856,13 +886,19 @@ fn pair_open_ok(cfg: &Config, m: &Market, yes_price: u8, no_price: u8, qty: u64)
         return false;
     }
 
-    if let (Some(cur_pc), Some(new_pc)) = (m.pos.pair_cost_cc(), sim.pair_cost_cc()) {
-        if new_pc <= cur_pc {
-            return true;
-        }
+    if !has_pair(m) {
+        return two_sided_pair_cost_ok(cfg, yes_price, no_price);
     }
 
-    two_sided_pair_cost_ok(cfg, yes_price, no_price)
+    if !pair_open_survives_first_leg(cfg, m, yes_price, no_price, qty_u64) {
+        return false;
+    }
+
+    let Some(current_pair_cost_cc) = m.pos.pair_cost_cc() else {
+        return false;
+    };
+
+    marginal_pair_cc(yes_price, no_price) < current_pair_cost_cc
 }
 
 fn pair_open_prices(cfg: &Config, m: &Market, signal: &CoinbaseSignal) -> Option<(u8, u8)> {
@@ -902,11 +938,20 @@ fn maybe_open_pair_quote(
 
     log_pair_open_quote_prices(ticker, m, now, yes_price, no_price);
 
-    if let Some(cmd) = place_or_manage_resting(cfg, ticker, m, now, Side::Yes, yes_price, 1, false)
+    let (first_side, first_price, second_side, second_price) = if no_price < yes_price {
+        (Side::No, no_price, Side::Yes, yes_price)
+    } else {
+        (Side::Yes, yes_price, Side::No, no_price)
+    };
+
+    if let Some(cmd) =
+        place_or_manage_resting(cfg, ticker, m, now, first_side, first_price, 1, false)
     {
         return PairOpenResult::Command(cmd);
     }
-    if let Some(cmd) = place_or_manage_resting(cfg, ticker, m, now, Side::No, no_price, 1, false) {
+    if let Some(cmd) =
+        place_or_manage_resting(cfg, ticker, m, now, second_side, second_price, 1, false)
+    {
         return PairOpenResult::Command(cmd);
     }
 
@@ -1476,35 +1521,18 @@ mod tests {
     }
 
     #[test]
-    fn pair_open_prices_prefer_live_top_pair_when_it_improves_the_book() {
+    fn pair_open_rejects_existing_inventory_when_first_leg_breaks_floor_buffer() {
         let cfg = Config::default();
         let mut m = Market::new();
 
-        m.pos.apply_fill(Side::Yes, 51, 1);
-        m.pos.apply_fill(Side::No, 52, 1);
-        m.book.yes_bids[46] = 1;
-        m.book.no_bids[51] = 1;
+        for _ in 0..3 {
+            m.pos.apply_fill(Side::Yes, 58, 1);
+            m.pos.apply_fill(Side::No, 40, 1);
+        }
 
-        let signal = CoinbaseSignal {
-            price: 0.0,
-            microprice: 0.0,
-            ema_fast: 0.0,
-            ema_slow: 0.0,
-            vol_ema_usd: 0.0,
-            fair_yes: 0.55,
-            fair_yes_cents: 55,
-            trend_z: 0.0,
-            distance_usd: 0.0,
-            sigma_usd: 1.0,
-            age_ms: 0,
-            regime: SignalRegime::TwoSided,
-            realized_final_avg: None,
-            required_remaining_avg: None,
-        };
-
-        assert_eq!(m.pos.pair_cost_cc(), Some(10_300));
-        assert_eq!(m.pos.locked_floor_cc(), -300);
-        assert_eq!(pair_open_prices(&cfg, &m, &signal), Some((47, 52)));
+        assert_eq!(m.pos.pair_cost_cc(), Some(9_800));
+        assert_eq!(m.pos.locked_floor_cc(), 600);
+        assert!(!pair_open_ok(&cfg, &m, 55, 40, 1));
     }
 
     #[test]
@@ -1567,50 +1595,52 @@ mod tests {
     }
 
     #[test]
-    fn balanced_bad_book_prefers_fresh_pair_add_over_repair_when_pair_improves_book() {
+    fn pair_open_requires_strict_marginal_improvement_on_existing_inventory() {
         let cfg = Config::default();
         let mut m = Market::new();
-        let now_s = unix_now_s();
 
-        m.open_ts = Some(now_s - 300);
-        m.close_ts = Some(now_s + 600);
-        m.strike_price = Some(100_000.0);
+        for _ in 0..5 {
+            m.pos.apply_fill(Side::Yes, 30, 1);
+            m.pos.apply_fill(Side::No, 40, 1);
+        }
 
-        m.book.yes_bids[46] = 1;
-        m.book.no_bids[51] = 1;
-        m.pos.apply_fill(Side::Yes, 51, 1);
-        m.pos.apply_fill(Side::No, 50, 1);
+        assert_eq!(m.pos.pair_cost_cc(), Some(7_000));
+        assert_eq!(m.pos.locked_floor_cc(), 15_000);
+        assert!(!pair_open_ok(&cfg, &m, 31, 39, 1));
+        assert!(pair_open_ok(&cfg, &m, 29, 40, 1));
+    }
 
-        let coinbase = CoinbaseSnapshot {
-            product_id: "BTC-USD".to_string(),
-            last_trade_price: Some(100_000.0),
-            best_bid: Some(99_999.0),
-            best_ask: Some(100_001.0),
-            best_bid_qty: Some(1.0),
-            best_ask_qty: Some(1.0),
-            microprice: Some(100_000.0),
-            ema_fast: Some(100_000.0),
-            ema_slow: Some(100_000.0),
-            vol_ema_usd: Some(1.0),
-            last_update_ms: Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-            ),
-            last_heartbeat_ms: None,
-            heartbeat_counter: None,
-            samples: Vec::new(),
+    #[test]
+    fn flat_book_pair_open_places_cheaper_leg_first() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+        let now = Instant::now();
+
+        m.book.yes_bids[56] = 1;
+        m.book.no_bids[40] = 1;
+
+        let signal = CoinbaseSignal {
+            price: 0.0,
+            microprice: 0.0,
+            ema_fast: 0.0,
+            ema_slow: 0.0,
+            vol_ema_usd: 0.0,
+            fair_yes: 0.50,
+            fair_yes_cents: 50,
+            trend_z: 0.0,
+            distance_usd: 0.0,
+            sigma_usd: 1.0,
+            age_ms: 0,
+            regime: SignalRegime::TwoSided,
+            realized_final_avg: None,
+            required_remaining_avg: None,
         };
 
-        assert!(m.pos.is_balanced());
-        assert!(is_balanced_but_bad(&cfg, &m));
-
-        let cmd = decide(&cfg, "TEST", &mut m, Some(&coinbase));
-
         assert!(matches!(
-            cmd,
-            Some(ExecCommand::PlaceOrder {
+            maybe_open_pair_quote(&cfg, "TEST", &mut m, now, &signal),
+            PairOpenResult::Command(ExecCommand::PlaceOrder {
+                side: Side::No,
+                price_cents: 41,
                 tif: Tif::Gtc,
                 post_only: true,
                 ..
