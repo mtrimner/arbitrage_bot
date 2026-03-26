@@ -776,6 +776,21 @@ fn marginal_pair_cc(yes_price: u8, no_price: u8) -> i64 {
     (yes_price as i64 + no_price as i64) * CC_PER_CENT
 }
 
+fn can_complete_after_first_leg(
+    cfg: &Config,
+    pos_after_first: &Position,
+    missing_side: Side,
+    completion_price_cents: u8,
+) -> bool {
+    let Some(max_avg_cc) =
+        pos_after_first.max_avg_price_to_balance_cc(missing_side, cfg.locked_floor_buffer_cc)
+    else {
+        return false;
+    };
+
+    max_avg_cc >= completion_price_cents as i64 * CC_PER_CENT
+}
+
 fn pair_open_survives_first_leg(
     cfg: &Config,
     m: &Market,
@@ -788,16 +803,20 @@ fn pair_open_survives_first_leg(
     }
 
     let qty = qty.max(1) as i64;
-    let yes_first_floor = m
-        .pos
-        .simulate_buy(Side::Yes, yes_price, qty)
-        .locked_floor_cc();
-    let no_first_floor = m
-        .pos
-        .simulate_buy(Side::No, no_price, qty)
-        .locked_floor_cc();
+    let no_completion_price = m
+        .book
+        .implied_ask(Side::No)
+        .map_or(no_price, |ask| ask.max(no_price));
+    let yes_completion_price = m
+        .book
+        .implied_ask(Side::Yes)
+        .map_or(yes_price, |ask| ask.max(yes_price));
 
-    yes_first_floor >= cfg.locked_floor_buffer_cc && no_first_floor >= cfg.locked_floor_buffer_cc
+    let yes_first = m.pos.simulate_buy(Side::Yes, yes_price, qty);
+    let no_first = m.pos.simulate_buy(Side::No, no_price, qty);
+
+    can_complete_after_first_leg(cfg, &yes_first, Side::No, no_completion_price)
+        && can_complete_after_first_leg(cfg, &no_first, Side::Yes, yes_completion_price)
 }
 
 fn is_balanced_but_bad(cfg: &Config, m: &Market) -> bool {
@@ -942,7 +961,11 @@ fn pair_open_ok(cfg: &Config, m: &Market, yes_price: u8, no_price: u8, qty: u64)
         return false;
     };
 
-    marginal_pair_cc(yes_price, no_price) < current_pair_cost_cc
+    let allowed_marginal_cc = current_pair_cost_cc
+        .saturating_add(CC_PER_CENT)
+        .min(cfg.safe_pair_cc);
+
+    marginal_pair_cc(yes_price, no_price) <= allowed_marginal_cc
 }
 
 fn pair_open_prices(cfg: &Config, m: &Market, signal: &CoinbaseSignal) -> Option<(u8, u8)> {
@@ -1567,18 +1590,16 @@ mod tests {
     }
 
     #[test]
-    fn pair_open_rejects_existing_inventory_when_first_leg_breaks_floor_buffer() {
+    fn scaling_from_one_pair_uses_completion_viability_not_temporary_floor() {
         let cfg = Config::default();
         let mut m = Market::new();
 
-        for _ in 0..3 {
-            m.pos.apply_fill(Side::Yes, 58, 1);
-            m.pos.apply_fill(Side::No, 40, 1);
-        }
+        m.pos.apply_fill(Side::Yes, 45, 1);
+        m.pos.apply_fill(Side::No, 53, 1);
 
         assert_eq!(m.pos.pair_cost_cc(), Some(9_800));
-        assert_eq!(m.pos.locked_floor_cc(), 600);
-        assert!(!pair_open_ok(&cfg, &m, 55, 40, 1));
+        assert_eq!(m.pos.locked_floor_cc(), 200);
+        assert!(pair_open_ok(&cfg, &m, 54, 44, 1));
     }
 
     #[test]
@@ -1641,19 +1662,32 @@ mod tests {
     }
 
     #[test]
-    fn pair_open_requires_strict_marginal_improvement_on_existing_inventory() {
+    fn existing_inventory_allows_same_or_one_cent_worse_but_not_more() {
         let cfg = Config::default();
         let mut m = Market::new();
 
         for _ in 0..5 {
             m.pos.apply_fill(Side::Yes, 30, 1);
-            m.pos.apply_fill(Side::No, 40, 1);
+            m.pos.apply_fill(Side::No, 68, 1);
         }
 
-        assert_eq!(m.pos.pair_cost_cc(), Some(7_000));
-        assert_eq!(m.pos.locked_floor_cc(), 15_000);
-        assert!(!pair_open_ok(&cfg, &m, 31, 39, 1));
-        assert!(pair_open_ok(&cfg, &m, 29, 40, 1));
+        assert_eq!(m.pos.pair_cost_cc(), Some(9_800));
+        assert_eq!(m.pos.locked_floor_cc(), 1_000);
+        assert!(pair_open_ok(&cfg, &m, 30, 68, 1));
+        assert!(pair_open_ok(&cfg, &m, 31, 68, 1));
+        assert!(!pair_open_ok(&cfg, &m, 32, 68, 1));
+    }
+
+    #[test]
+    fn first_leg_completion_viability_rejects_unfinishable_pair() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+
+        m.pos.apply_fill(Side::Yes, 45, 1);
+        m.pos.apply_fill(Side::No, 53, 1);
+        m.book.yes_bids[45] = 1;
+
+        assert!(!pair_open_survives_first_leg(&cfg, &m, 55, 44, 1));
     }
 
     #[test]
