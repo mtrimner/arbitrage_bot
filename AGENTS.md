@@ -1,3 +1,4 @@
+
 # AGENTS.md
 
 This file is a fast handoff for new AI/code-assistant context windows working on `kalshi_bot`.
@@ -10,15 +11,17 @@ In practice, the bot is not trying to estimate a perfect “true” probability 
 
 1. uses **Coinbase BTC-USD** as the external signal source,
 2. converts that into a **heuristic fair-value probability** for the Kalshi binary,
-3. then trades Kalshi mainly through **maker quotes** while enforcing **pair-cost** and **locked-floor** risk constraints.
+3. then trades Kalshi mainly through **maker quotes** while enforcing **pair-cost**, **size-scaled locked-floor**, and **planned-pair completion** constraints.
 
-The core idea is:
+The core idea is now:
 
 - build inventory at acceptable pair cost,
 - keep the book reasonably balanced,
+- keep **locked floor high relative to matched size**, not just positive in total,
+- preserve the economics of an opened pair after the first leg fills,
 - repair bad balanced books when possible,
 - avoid opening inventory when the Coinbase-vs-Kalshi relationship looks too dislocated,
-- use Kalshi book structure, time remaining, and current inventory to decide quote prices.
+- use Kalshi book structure, time remaining, current inventory, and any active pair plan to decide quote prices.
 
 ---
 
@@ -30,15 +33,18 @@ The actual objective is:
 
 - accumulate **balanced YES/NO inventory** at favorable combined prices,
 - maintain or improve **guaranteed locked-in value** (`locked_floor_cc`),
+- maintain a useful **locked floor per matched pair** through a size-scaled floor requirement,
 - keep **average pair cost** low,
+- preserve the original economics of a planned pair after the first leg fills,
 - with current defaults, only tolerate transient fill-driven imbalances and otherwise target zero intentional unhedged inventory,
 - use Coinbase to decide when it is safe to open pairs, when it should hedge, and when a balanced book is “bad” enough to justify repair attempts.
 
 The most important mental model:
 
 - **Raw Coinbase fair value is a signal, not an executable price.**
-- **Kalshi inventory quality is judged by pair cost and locked floor.**
+- **Kalshi inventory quality is judged by pair cost plus a size-scaled locked-floor target.**
 - **Quote prices are derived from both Coinbase signal and live Kalshi top-of-book.**
+- **Once a pair leg fills, the remaining completion should respect the original pair budget whenever possible.**
 
 ---
 
@@ -93,6 +99,7 @@ The bot runs a few long-lived async tasks:
   - order book,
   - position,
   - resting hints,
+  - optional active **pair plan** for first-leg / completion tracking,
   - timestamps, mode, and imbalance-age tracking.
 
 - `CoinbaseState` (`src/state/coinbase.rs`)
@@ -111,6 +118,8 @@ The bot runs a few long-lived async tasks:
 This is the most important file. It contains:
 
 - fair-value anchoring into live Kalshi prices,
+- size-scaled floor math,
+- pair-plan-aware completion logic,
 - mode selection,
 - pair opening logic,
 - repair logic,
@@ -184,6 +193,7 @@ The bot also cares about:
 
 - `pair_cost_cc`
 - `locked_floor_cc`
+- **required locked floor** based on matched size
 
 A balanced book may still lock in too little value or have pair cost that is too high.
 
@@ -220,6 +230,31 @@ Interpretation:
 - positive = matched inventory is locked in above cost,
 - zero = break-even on matched inventory,
 - negative = matched inventory is underwater.
+
+### `matched_qty()`
+
+This is the number of fully matched YES/NO pairs currently held.
+
+It is now used in multiple quality checks.
+
+### Size-scaled required floor
+
+The bot no longer uses only a flat total floor buffer.
+
+It now computes:
+
+```text
+required_locked_floor_cc
+  = locked_floor_buffer_cc
+  + matched_qty * locked_floor_per_pair_cc
+```
+
+Interpretation:
+
+- `locked_floor_buffer_cc` is the base floor target,
+- `locked_floor_per_pair_cc` is the additional required floor per matched pair.
+
+This prevents large books from being considered acceptable merely because they still lock a few cents in total.
 
 ### Opening fill tracking
 
@@ -377,22 +412,48 @@ Time remaining is based on the actual market open/close timestamps when availabl
 
 ---
 
+## Pair-plan tracking
+
+The engine now keeps an optional **pair plan** whenever it opens a fresh pair quote.
+
+The pair plan stores:
+
+- target YES quote
+- target NO quote
+- total pair budget
+- preferred first side
+- first filled side
+- first fill price
+
+This matters because after the first leg fills, the completion leg is no longer treated as a generic hedge only. The engine now tries to preserve the original pair economics by capping the completion price relative to the pair budget.
+
+---
+
 ## Decision pipeline in plain English
 
 `decide()` in `src/engine/decision.rs` roughly follows this order:
 
 1. reject trading if market is closed,
 2. compute time remaining and mode,
-3. freeze if balanced and already good enough near end,
-4. require strike price and fresh Coinbase snapshot,
-5. build Coinbase signal,
-6. cancel stale orders if needed,
-7. cancel vulnerable side if the trend says one resting side is dangerous,
-8. determine if new pair opening is allowed,
-9. if balanced but bad, first try a fresh paired add when opening is allowed and the pair improves the book; otherwise consider a repair quote,
-10. if imbalance is too large or opening is blocked, focus on hedge-only logic, including maker hedge, runaway/profitable IOC escalation, and cancel-before-IOC handling,
-11. otherwise try to open a fresh pair,
-12. if none of the above emits a command, log a “no order placed” reason.
+3. clear stale inactive pair-plan state,
+4. freeze if balanced **and** already good enough under the size-scaled floor and pair-cost constraints,
+5. require strike price and fresh Coinbase snapshot,
+6. build Coinbase signal,
+7. cancel stale orders if needed,
+8. cancel vulnerable side if the trend says one resting side is dangerous,
+9. determine if new pair opening is allowed,
+10. if balanced but bad:
+    - before `no_new_imbalance_s`, first try a fresh paired add when opening is allowed and the pair improves the book,
+    - otherwise consider a repair quote,
+    - and continue allowing repair until `repair_cutoff_s`,
+11. if imbalance is too large or opening is blocked, focus on hedge-only logic, including:
+    - maker hedge,
+    - pair-plan-aware completion quoting,
+    - runaway / profitable IOC escalation,
+    - emergency flatten for bad books,
+    - cancel-before-IOC only when an IOC candidate is actually admissible,
+12. otherwise try to open a fresh pair,
+13. if none of the above emits a command, log a “no order placed” reason.
 
 ---
 
@@ -434,6 +495,12 @@ target = 100 - (center + halfspread)
 
 Then the target is clamped to be no more aggressive than the side’s `top_maker_price()`.
 
+### Pair-plan completion cap
+
+If a pair plan exists and one leg has already filled, the hedge-side quote may be capped by the remaining pair budget.
+
+This is what prevents a good first-leg fill from automatically turning into a near-$1 pair just because the generic hedge logic still had spare total floor.
+
 ### Key takeaway
 
 The final quote is **not just fair value**. It is:
@@ -442,6 +509,7 @@ The final quote is **not just fair value**. It is:
 - inventory adjusted,
 - volatility adjusted,
 - clipped to the live Kalshi book,
+- sometimes capped by a pair-plan completion budget,
 - then passed through risk admission checks.
 
 ---
@@ -464,27 +532,33 @@ Used when the bot is allowed to open new balanced inventory.
 
 1. tries the best live affordable pair:
    - `top_yes`,
-   - `top_no`.
-2. if that pair passes `pair_open_ok()`, it uses it.
-3. otherwise it falls back to fair-based maker quotes, but only backed off by at most `MAX_PAIR_OPEN_BACKOFF_CENTS = 1` from the top.
+   - `top_no`
+2. if that pair passes `pair_open_ok()`, it uses it
+3. otherwise it falls back to fair-based maker quotes, but only backed off by at most `MAX_PAIR_OPEN_BACKOFF_CENTS = 1` from the top
 
 ### `pair_open_ok()` checks
 
 Opening a pair is allowed if:
 
-- the fully completed pair does not worsen locked floor, and
-- if there is no existing paired inventory, the marginal pair is at or below `market_entry_pair_cost_cc`, and
+- the completed simulated book satisfies the size-scaled required floor,
+- if there is no existing paired inventory, the marginal pair is at or below `market_entry_pair_cost_cc`,
 - if there is existing paired inventory:
-  - both possible first-leg fills must still leave `locked_floor_cc >= locked_floor_buffer_cc`,
-  - the marginal pair must be **strictly** better than the current average pair cost.
+  - both possible first-leg paths must still allow a completion that satisfies the size-scaled floor,
+  - the marginal pair must stay below `safe_pair_cc`,
+  - if current pair cost is already above target, the marginal pair must improve it by at least `pair_scale_min_improve_cc`,
+  - otherwise it may be equal or better, but not worse.
 
-### Important nuance
+### First-leg ordering
 
-The bot still wants both sides working, but placement order is no longer symmetric:
+The bot no longer always places the cheaper leg first.
 
-- `maybe_open_pair_quote()` places the cheaper leg first,
-- then tries the other leg in the same pass,
-- if a matching resting pair already exists, it returns `Working` and emits no new order.
+It now uses:
+
+- `DriftDown` / `ExtremeDown` / `PinnedDown` → **NO first**
+- `DriftUp` / `ExtremeUp` / `PinnedUp` → **YES first**
+- `TwoSided` → cheaper first
+
+This reduces the chance that the leg most likely to run away is left for later completion.
 
 ---
 
@@ -504,38 +578,43 @@ In hedge-only situations, the bot may:
 
 - cancel the strong side,
 - place a maker quote on the weak side,
-- or use IOC earlier if the signal is clearly running away from the missing side or the last lot can be flattened profitably.
+- use a pair-plan-aware completion cap when appropriate,
+- or use IOC if the signal is clearly running away from the missing side, the last lot can still complete at good quality, or the book is bad enough that an emergency flatten materially improves floor.
 
-### Admission rule for hedges
+### Admission rule for ordinary hedges
 
-If a fill **reduces imbalance**, the bot mostly judges it by whether it improves `locked_floor_cc` enough.
+If a fill **reduces imbalance**, ordinary maker / quality-completion admission now uses:
 
-That is intentionally more permissive than the fresh-risk path.
+- size-scaled floor requirements,
+- `safe_pair_cc` protection on final balance,
+- pair-plan completion caps when relevant.
 
-Most important current nuance:
+This is stricter than the old “final balance only needs to leave 1 cent total floor” rule.
 
-- if a hedge fill fully flattens the book (`new_gap == 0`), admission is now based on whether the resulting `locked_floor_cc` meets `locked_floor_buffer_cc`,
-- it is **not** rejected just because the resulting average pair cost is above the old `safe_pair_cc` / `balance_pair_cc` closeout cap.
+### Emergency flatten
 
-### Early IOC triggers
+The engine now distinguishes **quality completion** from **emergency flatten**.
 
-The bot now has two main early-IOC paths for hedge-only situations:
+Emergency flatten exists for cases like:
 
-- runaway signal:
-  - missing **YES** + `DriftUp` / `ExtremeUp` / `PinnedUp` => IOC can trigger early,
-  - missing **NO** + `DriftDown` / `ExtremeDown` / `PinnedDown` => IOC can trigger early.
-- profitable last-lot flatten:
-  - only for `gap == 1`,
-  - only after the imbalance has persisted for at least `maker_first_ms`,
-  - only if buying the missing side at the current implied ask would still leave `locked_floor_cc` at least `max(locked_floor_buffer_cc, 500)`.
+- runaway signal on the missing side,
+- gap-1 last lot late in the window,
+- already bad book where the live ask cannot satisfy the full quality gate but would still materially improve worst-case PnL.
 
-The maker-first waiting period now follows the age of the imbalance itself (`imbalance_since`), not the age of the latest repriced hedge quote.
+In those cases, the engine may use IOC even when the resulting final book still does not satisfy the normal quality bar, provided the fill improves floor by at least a minimum amount.
 
-Before sending an IOC on the hedge side, the engine first tries to cancel any same-side resting hedge quote so it does not overshoot after flattening.
+### IOC candidate gating
 
-### Temporary Coinbase outage behavior
+Before canceling the same-side hedge quote, the engine now first checks whether there is a real IOC candidate that passes either:
 
-If Coinbase snapshot/signal data is temporarily unavailable while the bot already has an imbalance (`gap > 0`), it now keeps useful hedge-side resting orders alive instead of canceling everything immediately.
+- ordinary admission, or
+- emergency flatten admission.
+
+This prevents the old cancel / repost churn where the bot repeatedly canceled a useful maker hedge and then failed the IOC admission anyway.
+
+### Profitable last-lot flatten
+
+The “profitable flatten” path is now judged against the **size-scaled final floor requirement**, not just a flat `max(locked_floor_buffer_cc, 500)` threshold.
 
 ---
 
@@ -547,11 +626,11 @@ Repair logic exists for **balanced but bad** books.
 
 `is_balanced_but_bad()` returns true when:
 
-- `yes_qty == no_qty`, and
-- there is inventory, and
-- either:
-  - `locked_floor_cc < locked_floor_buffer_cc`, or
-  - `pair_cost_cc > safe_pair_cc + PAIR_REPAIR_HYST_CC`.
+- `yes_qty == no_qty`,
+- inventory exists,
+- and either:
+  - `locked_floor_cc < required_locked_floor_cc`, or
+  - `pair_cost_cc > safe_pair_cc + PAIR_REPAIR_HYST_CC`
 
 With the current hysteresis:
 
@@ -569,6 +648,16 @@ That is half a cent in `cc` units.
 - `DriftUp`, `ExtremeUp`, `PinnedUp` → repair with **NO**
 - `TwoSided` → no repair side
 
+### Repair window
+
+Balanced-book repair is now allowed later than fresh pair opening.
+
+Typical behavior is:
+
+- fresh pair opening shuts off at `no_new_imbalance_s`,
+- single-sided repair can continue until `repair_cutoff_s`,
+- after that, no new repair risk is opened.
+
 ### What a repair quote is
 
 A repair quote is a **single-sided maker quote** on the repair side.
@@ -577,8 +666,8 @@ It is not a full pair order.
 
 The idea is:
 
-- if a fresh paired add would improve the current book and pair opening is allowed, prefer that over creating a new one-sided repair,
-- quote for the side that looks relatively cheap under the current regime,
+- if a fresh paired add would improve the current book and pair opening is still allowed, prefer that over creating a new one-sided repair,
+- otherwise quote for the side that looks relatively cheap under the current regime,
 - only if simulating that fill and later pairing it with a plausible price on the other side would improve the quality of the balanced book.
 
 ### Repair admission rule
@@ -590,45 +679,10 @@ The idea is:
 
 It only allows the quote if the resulting book would improve either:
 
-- `locked_floor_cc`, or
-- `pair_cost_cc`.
+- locked floor, or
+- pair cost.
 
-When the current balanced book is already above the floor buffer, repair is stricter:
-
-- completion pricing uses the current implied ask first, then falls back to maker/bid estimates,
-- the projected marginal pair must beat the current average pair by a small amount, so old edge cannot subsidize a bad new repair pair.
-
-### Important nuance about the logs
-
-`balanced_bad_no_repair_quote` does **not always mean there is no repair order resting**.
-
-It only means that on that engine pass, `decide()` did not emit a **new** repair command.
-
-That can happen when:
-
-- a repair quote is already working at the current desired price,
-- the current desired repair quote fails the improvement test,
-- or the bot cannot legally cancel/reprice yet.
-
-This log reason is therefore best read as:
-
-> “No new repair action was taken on this pass.”
-
-not necessarily:
-
-> “There is no repair quote in the market.”
-
-### Current behavior: repair quotes are sticky value quotes
-
-Once a repair quote is resting on the repair side, the engine does not ratchet it more aggressive as the market moves.
-
-Instead it:
-
-- keeps the quote working if it still passes the repair test,
-- cancels it if the existing price is no longer attractive,
-- otherwise leaves it alone.
-
-This makes repair behave more like a value bid: sit, fill cheap, or get out.
+When the current balanced book already satisfies the size-scaled floor requirement, repair stays strict and requires a real projected pair improvement.
 
 ---
 
@@ -659,13 +713,13 @@ There is one special case:
 
 - if `only_reprice_if_more_aggressive = true`, then it only cancels when the new desired price is **more aggressive** and drift is large enough.
 
-Currently, hedge-side quotes while unbalanced use this stickier behavior; balanced repair quotes do not.
+Currently, hedge-side quotes while unbalanced still use this stickier behavior, but pair-plan completion caps can now override it by forcing a cancel if the existing quote is simply too expensive relative to the remaining budget.
 
 ### Minimum life matters
 
 `cancel_side_force()` and other cancel flows respect `min_resting_life_ms`.
 
-That protection is important to avoid pathological cancel/replace loops.
+That protection is still important to avoid pathological cancel/replace loops.
 
 ---
 
@@ -715,6 +769,12 @@ Defined in `src/exec/paper.rs`.
 
 This is intentionally somewhat optimistic, but much better than requiring exact-price-only fills.
 
+### Pair-plan bookkeeping in paper mode
+
+Paper fills must now update the same pair-plan state used by live fills.
+
+That means all paper fill paths should use the market’s tracked-fill helper, not call `pos.apply_fill()` directly.
+
 ### Ack handling nuance
 
 Pure acks/rejects/cancels often call `mark_dirty()` rather than `touch()` so the engine sees the new order state on the next pass without immediately re-entering mid-batch and creating churn.
@@ -749,7 +809,7 @@ This is analytics only; it does not currently drive trading decisions directly.
 
 At market rotation, `market_manager.rs` writes a summary row via `report::append_result_csv()`.
 
-Current CSV includes:
+Current CSV should now include:
 
 - series ticker,
 - market ticker,
@@ -760,9 +820,13 @@ Current CSV includes:
 - final inventory,
 - average YES/NO costs,
 - pair cost,
-- `max_balance_price_cents` for unbalanced end states under the current `locked_floor_buffer_cc`,
-- locked floor,
+- `max_balance_price_cents` under the **size-scaled** floor requirement,
+- `required_locked_floor_cents`,
+- `required_locked_floor_dollars`,
+- actual locked floor,
 - simple YES-win / NO-win PnL projections.
+
+If you change the size-scaled floor formula, update both `decision.rs` and `report.rs` together.
 
 ---
 
@@ -777,6 +841,7 @@ These are the most strategy-relevant defaults in `src/config.rs`.
 - `balance_s = 300`
 - `freeze_if_balanced_s = 300`
 - `no_new_imbalance_s = 300`
+- `repair_cutoff_s = 90`
 
 ### Risk / inventory quality
 
@@ -785,6 +850,10 @@ These are the most strategy-relevant defaults in `src/config.rs`.
 - `balance_pair_cc = 9900`
 - `market_entry_pair_cost_cc = 9850`
 - `locked_floor_buffer_cc = 100`
+- `locked_floor_per_pair_cc = 25`
+- `pair_scale_min_improve_cc = 10`
+- `pair_completion_slippage_cents = 1`
+- `emergency_flatten_min_improve_cc = 500`
 - `max_unhedged_qty_early = 0`
 - `max_unhedged_qty_late = 0`
 
@@ -839,8 +908,21 @@ These are the most strategy-relevant defaults in `src/config.rs`.
 
 ### Config reality check
 
-- `Config::from_env()` currently overrides only `RESULTS_FILE`, `COINBASE_WS`, `COINBASE_PRODUCT_ID`, `COINBASE_LOG_DELTA_USD`, `COINBASE_STALE_MS`, `QUOTE_BASE_HALFSPREAD_CENTS`, `MARKET_ENTRY_PAIR_CC`, and `LOCKED_FLOOR_BUFFER_CC`.
-- Several fields still exist in `Config` but are currently unused anywhere in `src/`: `aggressive_tick`, `bootstrap_pair_cc`, `final_balance_pair_cc`, `bootstrap_max_one_side_qty`, `bootstrap_rescue_min_improve_cc`, `early_imbalance_cap`, `late_imbalance_cap`, `imbalance_min_total`, `imbalance_cap_small_total`, `maker_qty_price_tol_cents`, `maker_qty_price_tol_cents_balance`, `min_taker_improve_cc`, and `taker_big_improve_cc`.
+`Config::from_env()` should now expose at least:
+
+- `RESULTS_FILE`
+- `COINBASE_WS`
+- `COINBASE_PRODUCT_ID`
+- `COINBASE_LOG_DELTA_USD`
+- `COINBASE_STALE_MS`
+- `QUOTE_BASE_HALFSPREAD_CENTS`
+- `MARKET_ENTRY_PAIR_CC`
+- `LOCKED_FLOOR_BUFFER_CC`
+- `LOCKED_FLOOR_PER_PAIR_CC`
+- `PAIR_SCALE_MIN_IMPROVE_CC`
+- `PAIR_COMPLETION_SLIPPAGE_CENTS`
+- `REPAIR_CUTOFF_S`
+- `EMERGENCY_FLATTEN_MIN_IMPROVE_CC`
 
 ---
 
@@ -858,13 +940,15 @@ Common causes:
 
 ### `rebalancing_quote_ineligible`
 
-The bot has an imbalance and wants to hedge, but the candidate hedge quote fails admission/risk logic.
+The bot has an imbalance and wants to hedge, but the candidate maker hedge quote fails the current quality checks.
 
-Current logs for this reason also include:
+Logs for this reason should now be interpreted alongside:
 
+- `required_locked_floor_cc`
 - `hedge_side`
 - `short_side_ask`
-- `max_balance_price_cents`
+- dynamic `max_balance_price_cents`
+- optional `pair_plan_completion_cap_cents`
 - `floor_if_filled_at_short_ask_cc`
 
 ### `balanced_bad_no_repair_quote`
@@ -873,13 +957,17 @@ Balanced inventory exists, but the book is still considered low quality, and no 
 
 Do not assume this means no repair quote is resting.
 
+### `balanced_bad_repair_window_closed`
+
+Balanced inventory is still poor quality, but the late repair window has closed, so the engine is no longer allowed to open new repair risk.
+
 ### `regime_blocks_opening`
 
 Coinbase/Kalshi relationship is too directional or too dislocated to justify opening fresh two-sided inventory.
 
 ### `freeze_balanced`
 
-Near end of market, already balanced and good enough, so bot stops trading and may cancel leftovers.
+Near end of market, already balanced **and** good enough under the stricter quality rules, so the bot stops trading and may cancel leftovers.
 
 ### `balanced_endgame_hold`
 
@@ -895,7 +983,7 @@ It means the bot’s **own held inventory** is balanced but unattractive.
 
 A balanced book is poor quality when, despite being matched:
 
-- the guaranteed locked-in value is too low, or
+- the guaranteed locked-in value is too low **relative to matched size**, or
 - the average pair cost is too high.
 
 So “repair” is about improving the bot’s inventory economics, not fixing the exchange’s market price.
@@ -908,11 +996,13 @@ So “repair” is about improving the bot’s inventory economics, not fixing t
    - It is based on Coinbase price-vs-strike with volatility and trend overlays.
    - It is only partially anchored back to Kalshi mid.
 
-2. **Existing-inventory pair scaling is intentionally conservative**
-   - Non-flat books only reopen if the full pair is better, both first-leg paths preserve the floor buffer, and the marginal pair is strictly better than the current average pair.
+2. **Pair completion is now path-aware, but only with one active plan**
+   - The bot tracks one active planned pair at a time.
+   - That is intentional because the strategy still targets zero intentional imbalance.
 
-3. **Gap-1 profitable flatten can escalate earlier than old maker babysitting behavior**
-   - After `maker_first_ms`, the bot may take the live ask to flatten if the remaining locked floor would still be at least `max(locked_floor_buffer_cc, 500)`.
+3. **Final flatten is split into quality completion vs emergency flatten**
+   - Good books should complete only when the final state still satisfies pair-cost and size-scaled floor constraints.
+   - Bad books can still be flattened late or on runaway tape if the fill materially improves floor.
 
 4. **Raw fair frequently saturates near 99/1**
    - The anchored fair and quote clamps keep execution logic from blindly following that, but the saturation is expected.
@@ -936,14 +1026,25 @@ Look at:
 - `can_open_pairs()`
 - `desired_maker_quote()`
 
-### If changing repair logic
+### If changing size-scaled floor behavior
 
 Look at:
 
+- `required_locked_floor_cc()`
+- `required_locked_floor_after_balance_cc()`
 - `is_balanced_but_bad()`
-- `repair_side_for()`
-- `repair_quote_improves_book()`
-- `maybe_repair_quote()`
+- `should_freeze_trading()`
+- `report::append_result_csv()`
+
+### If changing pair-plan behavior
+
+Look at:
+
+- `PairPlan` in `src/state/ticker.rs`
+- `apply_tracked_fill()`
+- `pair_plan_completion_cap_cents()`
+- `maybe_open_pair_quote()`
+- `maybe_signal_maker_quote()`
 
 ### If changing pair opening
 
@@ -961,15 +1062,16 @@ Look at:
 
 - `update_imbalance_since()`
 - `imbalance_age_ms()`
-- `profitable_flatten_floor_cc()`
 - `should_force_profitable_flatten()`
-- `maybe_balance_ioc()`
+- `emergency_flatten_ok()`
+- `balance_ioc_candidate()`
 
 ### If changing cancel/reprice stickiness
 
 Look at:
 
 - `place_or_manage_resting()`
+- `cancel_if_resting_above_limit()`
 - `cancel_side_force()`
 - `min_resting_life_ms`
 - `cancel_drift_cents*`
@@ -987,16 +1089,16 @@ Look at:
 ## Guidance for future AI/code agents
 
 1. **Do not confuse raw Coinbase fair with executable quote price.**
-   The trading logic intentionally anchors back toward Kalshi and then applies inventory/volatility/book constraints.
+   The trading logic intentionally anchors back toward Kalshi and then applies inventory, volatility, book, and pair-plan constraints.
 
-2. **Always track both pair cost and locked floor.**
-   Many seemingly “good” fills are actually bad once those are recomputed.
+2. **Always track both pair cost and the size-scaled floor requirement.**
+   A large balanced book with a few cents total floor is no longer automatically acceptable.
 
-3. **When analyzing logs, check resting state.**
-   A no-order reason often means “no new command emitted,” not “nothing is working.”
+3. **When analyzing logs, check pair-plan state.**
+   A missing-side hedge may be budget-capped by an earlier first-leg fill.
 
 4. **Respect `min_resting_life_ms` unless there is a very strong reason not to.**
-   Removing that usually reintroduces churn.
+   The hedge churn fix should come from IOC candidate gating, not from disabling resting-life protections.
 
 5. **Remember that asks are implied from the opposite side’s best bid.**
    This drives a lot of quote math and can produce `None` asks if the opposite side book is empty.
@@ -1004,8 +1106,8 @@ Look at:
 6. **For hedge escalation, track imbalance age, not hedge-quote age.**
    The maker-first IOC delay is keyed off `imbalance_since`, so repricing a maker hedge should not restart the clock.
 
-7. **Existing-inventory pair scaling must account for first-leg damage, not just full-pair economics.**
-   If you loosen pair reopening, check both first-leg floor survivability and marginal pair quality.
+7. **If you change pair completion, keep pair-plan tracking and fill bookkeeping aligned.**
+   Websocket fills and paper fills must both update the same state.
 
 8. **If you change reporting or rotation, keep market-manager + report schema in sync.**
 
@@ -1016,4 +1118,4 @@ Look at:
 
 ## One-sentence summary
 
-This bot is a Coinbase-informed, Kalshi-maker strategy that tries to accumulate and maintain low-cost balanced YES/NO inventory, repair bad balanced books when possible, and strictly gate any quote that worsens the bot’s guaranteed inventory economics.
+This bot is a Coinbase-informed, Kalshi-maker strategy that now tries to accumulate and maintain low-cost balanced YES/NO inventory using a size-scaled floor requirement and pair-plan-aware completion logic, repair bad balanced books when possible, and separate high-quality completion from emergency flatten when the book gets into trouble.

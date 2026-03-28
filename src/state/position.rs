@@ -43,8 +43,21 @@ impl Position {
         self.yes_qty == self.no_qty
     }
 
+    pub fn matched_qty(&self) -> i64 {
+        self.yes_qty.min(self.no_qty).max(0)
+    }
+
     pub fn locked_floor_cc(&self) -> i64 {
         self.yes_qty.min(self.no_qty) * DOLLAR_CC - self.yes_cost_cc - self.no_cost_cc
+    }
+
+    pub fn locked_floor_per_pair_cc(&self) -> Option<i64> {
+        let matched = self.matched_qty();
+        if matched <= 0 {
+            None
+        } else {
+            Some(self.locked_floor_cc() / matched)
+        }
     }
 
     pub fn total_cost_cc(&self) -> i64 {
@@ -118,5 +131,17 @@ mod tests {
 
         assert_eq!(pos.opening_yes_price_cents, Some(49));
         assert_eq!(pos.opening_no_price_cents, Some(50));
+    }
+
+    #[test]
+    fn matched_qty_and_floor_per_pair_follow_balanced_inventory() {
+        let mut pos = Position::default();
+
+        pos.apply_fill(Side::Yes, 20, 2);
+        pos.apply_fill(Side::No, 30, 1);
+
+        assert_eq!(pos.matched_qty(), 1);
+        assert_eq!(pos.locked_floor_cc(), 3_000);
+        assert_eq!(pos.locked_floor_per_pair_cc(), Some(3_000));
     }
 }

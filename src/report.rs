@@ -9,13 +9,25 @@ use std::io::ErrorKind;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
-const RESULTS_HEADER: &str = "run_ts_utc,series_ticker,market_ticker,open_time_utc,close_time_utc,target_price_usd,coinbase_price_usd,opening_yes_cents,opening_no_cents,yes_qty,no_qty,yes_avg_cents,no_avg_cents,pair_cost_cents,pair_cost_dollars,max_balance_price_cents,locked_floor_cents,locked_floor_dollars,pnl_yes_win,pnl_no_win\n";
+const RESULTS_HEADER: &str = "run_ts_utc,series_ticker,market_ticker,open_time_utc,close_time_utc,target_price_usd,coinbase_price_usd,opening_yes_cents,opening_no_cents,yes_qty,no_qty,yes_avg_cents,no_avg_cents,pair_cost_cents,pair_cost_dollars,max_balance_price_cents,required_locked_floor_cents,required_locked_floor_dollars,locked_floor_cents,locked_floor_dollars,pnl_yes_win,pnl_no_win\n";
 
 fn cc_to_cents(cc: i64) -> f64 {
     cc as f64 / CC_PER_CENT as f64
 }
 fn cc_to_dollars(cc: i64) -> f64 {
     cc as f64 / (CC_PER_CENT as f64 * 100.0)
+}
+
+fn required_locked_floor_from_matched_qty(
+    locked_floor_buffer_cc: i64,
+    locked_floor_per_pair_cc: i64,
+    matched_qty: i64,
+) -> i64 {
+    if matched_qty <= 0 {
+        0
+    } else {
+        locked_floor_buffer_cc + matched_qty * locked_floor_per_pair_cc.max(0)
+    }
 }
 
 pub fn log_position(ticker: &str, pos: &Position) {
@@ -70,6 +82,7 @@ pub async fn append_result_csv(
     target_price: Option<f64>,
     coinbase_price: Option<f64>,
     locked_floor_buffer_cc: i64,
+    locked_floor_per_pair_cc: i64,
     pos: &Position,
 ) -> Result<()> {
     let p = std::path::Path::new(path);
@@ -101,15 +114,33 @@ pub async fn append_result_csv(
     let no_avg_cents = pos.avg_no_cc().map(cc_to_cents);
     let pair_cost_cents = pos.pair_cost_cc().map(cc_to_cents);
     let pair_cost_dollars = pos.pair_cost_cc().map(cc_to_dollars);
+    let required_locked_floor_cc = required_locked_floor_from_matched_qty(
+        locked_floor_buffer_cc,
+        locked_floor_per_pair_cc,
+        pos.matched_qty(),
+    );
+    let required_locked_floor_after_balance_cc = required_locked_floor_from_matched_qty(
+        locked_floor_buffer_cc,
+        locked_floor_per_pair_cc,
+        pos.yes_qty.max(pos.no_qty).max(0),
+    );
     let max_balance_price_cents = if pos.yes_qty < pos.no_qty {
-        pos.max_avg_price_to_balance_cc(crate::types::Side::Yes, locked_floor_buffer_cc)
-            .map(cc_to_cents)
+        pos.max_avg_price_to_balance_cc(
+            crate::types::Side::Yes,
+            required_locked_floor_after_balance_cc,
+        )
+        .map(cc_to_cents)
     } else if pos.no_qty < pos.yes_qty {
-        pos.max_avg_price_to_balance_cc(crate::types::Side::No, locked_floor_buffer_cc)
-            .map(cc_to_cents)
+        pos.max_avg_price_to_balance_cc(
+            crate::types::Side::No,
+            required_locked_floor_after_balance_cc,
+        )
+        .map(cc_to_cents)
     } else {
         None
     };
+    let required_locked_floor_cents = cc_to_cents(required_locked_floor_cc);
+    let required_locked_floor_dollars = cc_to_dollars(required_locked_floor_cc);
     let locked_floor_cents = cc_to_cents(pos.locked_floor_cc());
     let locked_floor_dollars = cc_to_dollars(pos.locked_floor_cc());
 
@@ -121,7 +152,7 @@ pub async fn append_result_csv(
     let pnl_no_win_dollars = no_qty - total_cost_dollars;
 
     let line = format!(
-        "{run_ts},{series_ticker},{market_ticker},{open_time},{close_time},{},{},{},{},{},{},{},{},{},{},{},{:.2},{:.4},{},{}\n",
+        "{run_ts},{series_ticker},{market_ticker},{open_time},{close_time},{},{},{},{},{},{},{},{},{},{},{},{:.2},{:.4},{:.2},{:.4},{},{}\n",
         fmt_opt_2(target_price),
         fmt_opt_2(coinbase_price),
         fmt_opt_2(opening_yes_cents),
@@ -133,6 +164,8 @@ pub async fn append_result_csv(
         fmt_opt_2(pair_cost_cents),
         fmt_opt_4(pair_cost_dollars),
         fmt_opt_2(max_balance_price_cents),
+        required_locked_floor_cents,
+        required_locked_floor_dollars,
         locked_floor_cents,
         locked_floor_dollars,
         pnl_yes_win_dollars,
@@ -167,6 +200,7 @@ mod tests {
             Some(95_000.0),
             Some(95_123.45),
             100,
+            25,
             &pos,
         )
         .await
@@ -177,6 +211,7 @@ mod tests {
         assert!(contents.contains("target_price_usd,coinbase_price_usd"));
         assert!(contents.contains("opening_yes_cents,opening_no_cents"));
         assert!(contents.contains("max_balance_price_cents"));
+        assert!(contents.contains("required_locked_floor_cents,required_locked_floor_dollars"));
         assert!(contents.contains("KXBTC15M,KXBTC15M-TEST"));
         assert!(contents.contains("95000.00,95123.45"));
         assert!(contents.contains("49.00,50.00,1,1"));

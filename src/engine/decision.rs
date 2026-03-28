@@ -1,6 +1,6 @@
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::Config; 
+use crate::config::Config;
 use crate::state::coinbase::{CoinbaseSignal, CoinbaseSnapshot, SignalRegime};
 use crate::state::orders::{OrderRec, OrderStatus};
 use crate::state::position::Position;
@@ -12,7 +12,6 @@ const NO_ORDER_LOG_REPEAT_SECS: u64 = 5;
 const COINBASE_SIGNAL_LOG_REPEAT_MS: u64 = 10_000;
 const PAIR_OPEN_LOG_REPEAT_MS: u64 = 5_000;
 const MIN_HEDGE_FLOOR_IMPROVE_CC: i64 = 500;
-const EARLY_PROFITABLE_FLATTEN_FLOOR_CC: i64 = 500;
 const PAIR_REPAIR_HYST_CC: i64 = 50;
 const MIN_REPAIR_PAIR_IMPROVE_CC: i64 = 25;
 const COINBASE_SIGNAL_WEIGHT: f64 = 0.35;
@@ -51,9 +50,7 @@ fn log_no_order_reason(
     ) {
         let hedge = hedge_side(m);
         let short_side_ask = m.book.implied_ask(hedge);
-        let max_balance_price_cents = m
-            .pos
-            .max_avg_price_to_balance_cc(hedge, cfg.locked_floor_buffer_cc)
+        let max_balance_price_cents = max_balance_price_to_quality_cc(cfg, &m.pos, hedge)
             .map(|cc| cc as f64 / CC_PER_CENT as f64);
         let floor_if_filled_at_short_ask_cc =
             short_side_ask.map(|ask| m.pos.simulate_buy(hedge, ask, gap.max(1)).locked_floor_cc());
@@ -62,9 +59,10 @@ fn log_no_order_reason(
             short_side_ask,
             max_balance_price_cents,
             floor_if_filled_at_short_ask_cc,
+            pair_plan_completion_cap_cents(cfg, m, hedge),
         )
     } else {
-        (None, None, None, None)
+        (None, None, None, None, None)
     };
 
     tracing::info!(
@@ -75,6 +73,7 @@ fn log_no_order_reason(
         yes_qty = m.pos.yes_qty,
         no_qty = m.pos.no_qty,
         locked_floor_cc = m.pos.locked_floor_cc(),
+        required_locked_floor_cc = required_locked_floor_cc(cfg, &m.pos),
         pair_cost_cc = ?m.pos.pair_cost_cc(),
         gap,
         allowed_gap,
@@ -92,6 +91,7 @@ fn log_no_order_reason(
         short_side_ask = ?hedge_telemetry.1,
         max_balance_price_cents = ?hedge_telemetry.2,
         floor_if_filled_at_short_ask_cc = ?hedge_telemetry.3,
+        pair_plan_completion_cap_cents = ?hedge_telemetry.4,
         "no order placed"
     );
 }
@@ -213,12 +213,36 @@ fn allowed_unhedged_qty(cfg: &Config, m: &Market) -> i64 {
     }
 }
 
-fn needs_hedge_only(gap: i64, allowed_gap: i64) -> bool {
-    gap > 0 && gap >= allowed_gap.max(1)
+fn required_locked_floor_from_matched_qty(cfg: &Config, matched_qty: i64) -> i64 {
+    if matched_qty <= 0 {
+        0
+    } else {
+        cfg.locked_floor_buffer_cc + matched_qty * cfg.locked_floor_per_pair_cc.max(0)
+    }
 }
 
-fn strict_balance_cap_cc(cfg: &Config) -> i64 {
-    cfg.balance_pair_cc.clamp(0, DOLLAR_CC)
+fn required_locked_floor_cc(cfg: &Config, pos: &Position) -> i64 {
+    required_locked_floor_from_matched_qty(cfg, pos.matched_qty())
+}
+
+fn required_locked_floor_after_balance_cc(cfg: &Config, pos: &Position) -> i64 {
+    let final_matched = pos.yes_qty.max(pos.no_qty).max(0);
+    required_locked_floor_from_matched_qty(cfg, final_matched)
+}
+
+fn max_balance_price_to_quality_cc(
+    cfg: &Config,
+    pos: &Position,
+    missing_side: Side,
+) -> Option<i64> {
+    pos.max_avg_price_to_balance_cc(
+        missing_side,
+        required_locked_floor_after_balance_cc(cfg, pos),
+    )
+}
+
+fn needs_hedge_only(gap: i64, allowed_gap: i64) -> bool {
+    gap > allowed_gap.max(0)
 }
 
 fn time_remaining_s(now_s: i64, window_s: i64) -> i64 {
@@ -272,6 +296,20 @@ fn hedge_side(m: &Market) -> Side {
             (Some(_), None) => Side::Yes,
             (None, Some(_)) => Side::No,
             _ => Side::Yes,
+        }
+    }
+}
+
+fn opening_priority_side(signal: &CoinbaseSignal, yes_price: u8, no_price: u8) -> Side {
+    match signal.regime {
+        SignalRegime::DriftDown | SignalRegime::ExtremeDown | SignalRegime::PinnedDown => Side::No,
+        SignalRegime::DriftUp | SignalRegime::ExtremeUp | SignalRegime::PinnedUp => Side::Yes,
+        SignalRegime::TwoSided => {
+            if no_price < yes_price {
+                Side::No
+            } else {
+                Side::Yes
+            }
         }
     }
 }
@@ -645,6 +683,40 @@ fn desired_maker_quote(
     Some(target_u.min(top))
 }
 
+fn pair_plan_completion_cap_cents(cfg: &Config, m: &Market, side: Side) -> Option<u8> {
+    let plan = m.pair_plan.as_ref()?;
+    let filled_side = plan.first_fill_side?;
+    let filled_price = plan.first_fill_price_cents?;
+    if filled_side.other() != side {
+        return None;
+    }
+
+    let budget_cents = (plan.budget_cc / CC_PER_CENT).max(1);
+    let cap = (budget_cents - filled_price as i64 + cfg.pair_completion_slippage_cents as i64)
+        .clamp(1, cfg.max_buy_price_cents as i64);
+
+    Some(cap as u8)
+}
+
+fn cancel_if_resting_above_limit(
+    cfg: &Config,
+    ticker: &str,
+    m: &mut Market,
+    now: Instant,
+    side: Side,
+    limit: u8,
+) -> Option<ExecCommand> {
+    let should_cancel = m
+        .resting_hint(side)
+        .as_ref()
+        .is_some_and(|h| h.cancel_requested_at.is_none() && h.price_cents > limit);
+    if !should_cancel {
+        return None;
+    }
+
+    cancel_side_force(cfg, ticker, m, now, side)
+}
+
 fn plausible_missing_price_cents(cfg: &Config, m: &Market, missing_side: Side) -> Option<u8> {
     if m.mode == Mode::Balance {
         m.book
@@ -667,9 +739,47 @@ fn repair_completion_price_cents(cfg: &Config, m: &Market, missing_side: Side) -
         .or_else(|| m.book.best_bid(missing_side))
 }
 
+fn final_balance_quality_ok(
+    cfg: &Config,
+    m: &Market,
+    side: Side,
+    price_cents: u8,
+    qty: u64,
+) -> bool {
+    let sim = m.pos.simulate_buy(side, price_cents, qty as i64);
+    let new_gap = (sim.yes_qty - sim.no_qty).abs();
+    if new_gap != 0 {
+        return false;
+    }
+
+    if sim
+        .pair_cost_cc()
+        .map_or(true, |pair_cost_cc| pair_cost_cc > cfg.safe_pair_cc)
+    {
+        return false;
+    }
+
+    if sim.locked_floor_cc() < required_locked_floor_cc(cfg, &sim) {
+        return false;
+    }
+
+    if let Some(cap) = pair_plan_completion_cap_cents(cfg, m, side) {
+        if price_cents > cap {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn profitable_flatten_floor_cc(m: &Market, hedge: Side, gap: i64) -> Option<i64> {
     let ask = m.book.implied_ask(hedge)?;
-    Some(m.pos.simulate_buy(hedge, ask, gap.max(1)).locked_floor_cc())
+    let sim = m.pos.simulate_buy(hedge, ask, gap.max(1));
+    if (sim.yes_qty - sim.no_qty).abs() != 0 {
+        return None;
+    }
+
+    Some(sim.locked_floor_cc())
 }
 
 fn should_force_profitable_flatten(
@@ -687,11 +797,55 @@ fn should_force_profitable_flatten(
         return false;
     }
 
-    let min_floor = cfg
-        .locked_floor_buffer_cc
-        .max(EARLY_PROFITABLE_FLATTEN_FLOOR_CC);
+    let Some(ask) = m.book.implied_ask(hedge) else {
+        return false;
+    };
 
-    profitable_flatten_floor_cc(m, hedge, gap).is_some_and(|floor| floor >= min_floor)
+    profitable_flatten_floor_cc(m, hedge, gap).is_some()
+        && final_balance_quality_ok(cfg, m, hedge, ask, 1)
+}
+
+fn emergency_flatten_ok(
+    cfg: &Config,
+    m: &Market,
+    side: Side,
+    price_cents: u8,
+    qty: u64,
+    t_rem: i64,
+) -> bool {
+    let sim = m.pos.simulate_buy(side, price_cents, qty as i64);
+    let old_gap = unhedged_qty(m);
+    let new_gap = (sim.yes_qty - sim.no_qty).abs();
+    if old_gap <= 0 || new_gap != 0 {
+        return false;
+    }
+
+    if final_balance_quality_ok(cfg, m, side, price_cents, qty) {
+        return true;
+    }
+
+    let old_floor = m.pos.locked_floor_cc();
+    let old_required_floor = required_locked_floor_cc(cfg, &m.pos);
+    let current_bad = old_floor < old_required_floor
+        || m.pos
+            .pair_cost_cc()
+            .is_some_and(|pair_cost_cc| pair_cost_cc > cfg.safe_pair_cc);
+    if !current_bad {
+        return false;
+    }
+
+    let new_floor = sim.locked_floor_cc();
+    if new_floor < old_floor + cfg.emergency_flatten_min_improve_cc {
+        return false;
+    }
+
+    if let Some(cap) = pair_plan_completion_cap_cents(cfg, m, side) {
+        if price_cents > cap && t_rem > cfg.taker_desperate_s {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64) -> bool {
@@ -700,6 +854,8 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
     let new_gap = (sim.yes_qty - sim.no_qty).abs();
     let old_floor = m.pos.locked_floor_cc();
     let new_floor = sim.locked_floor_cc();
+    let old_required_floor = required_locked_floor_cc(cfg, &m.pos);
+    let new_required_floor = required_locked_floor_cc(cfg, &sim);
     let old_pc = m.pos.pair_cost_cc();
     let new_pc = sim.pair_cost_cc();
 
@@ -707,7 +863,7 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
     // rather than demanding the average pair cost also improve.
     if new_gap < old_gap {
         if new_gap == 0 {
-            return new_floor >= cfg.locked_floor_buffer_cc;
+            return final_balance_quality_ok(cfg, m, side, price_cents, qty);
         }
 
         if let Some(pc) = new_pc {
@@ -725,11 +881,11 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
             }
         }
 
-        if new_floor >= cfg.locked_floor_buffer_cc {
+        if new_floor >= new_required_floor {
             return true;
         }
 
-        if old_floor < 0 && new_floor >= old_floor + MIN_HEDGE_FLOOR_IMPROVE_CC {
+        if old_floor < old_required_floor && new_floor >= old_floor + MIN_HEDGE_FLOOR_IMPROVE_CC {
             return true;
         }
 
@@ -747,7 +903,7 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
             }
         }
     }
-    if new_floor >= cfg.locked_floor_buffer_cc {
+    if new_floor >= new_required_floor {
         return true;
     }
 
@@ -758,8 +914,7 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
     } else {
         return false;
     };
-    let Some(max_avg_cc) = sim.max_avg_price_to_balance_cc(missing, cfg.locked_floor_buffer_cc)
-    else {
+    let Some(max_avg_cc) = max_balance_price_to_quality_cc(cfg, &sim, missing) else {
         return false;
     };
     let plausible_cc = plausible_missing_price_cents(cfg, m, missing)
@@ -768,27 +923,19 @@ fn admission_ok(cfg: &Config, m: &Market, side: Side, price_cents: u8, qty: u64)
     max_avg_cc >= plausible_cc - cfg.catchup_plausibility_buffer_cents as i64 * CC_PER_CENT
 }
 
-fn two_sided_pair_cost_ok(cfg: &Config, yes_price: u8, no_price: u8) -> bool {
-    marginal_pair_cc(yes_price, no_price) <= cfg.market_entry_pair_cost_cc
-}
-
 fn marginal_pair_cc(yes_price: u8, no_price: u8) -> i64 {
     (yes_price as i64 + no_price as i64) * CC_PER_CENT
 }
 
-fn can_complete_after_first_leg(
+fn completed_pair_meets_floor(
     cfg: &Config,
     pos_after_first: &Position,
     missing_side: Side,
     completion_price_cents: u8,
+    qty: i64,
 ) -> bool {
-    let Some(max_avg_cc) =
-        pos_after_first.max_avg_price_to_balance_cc(missing_side, cfg.locked_floor_buffer_cc)
-    else {
-        return false;
-    };
-
-    max_avg_cc >= completion_price_cents as i64 * CC_PER_CENT
+    let completed = pos_after_first.simulate_buy(missing_side, completion_price_cents, qty);
+    completed.locked_floor_cc() >= required_locked_floor_cc(cfg, &completed)
 }
 
 fn pair_open_survives_first_leg(
@@ -815,14 +962,14 @@ fn pair_open_survives_first_leg(
     let yes_first = m.pos.simulate_buy(Side::Yes, yes_price, qty);
     let no_first = m.pos.simulate_buy(Side::No, no_price, qty);
 
-    can_complete_after_first_leg(cfg, &yes_first, Side::No, no_completion_price)
-        && can_complete_after_first_leg(cfg, &no_first, Side::Yes, yes_completion_price)
+    completed_pair_meets_floor(cfg, &yes_first, Side::No, no_completion_price, qty)
+        && completed_pair_meets_floor(cfg, &no_first, Side::Yes, yes_completion_price, qty)
 }
 
 fn is_balanced_but_bad(cfg: &Config, m: &Market) -> bool {
     m.pos.is_balanced()
         && (m.pos.yes_qty > 0 || m.pos.no_qty > 0)
-        && (m.pos.locked_floor_cc() < cfg.locked_floor_buffer_cc
+        && (m.pos.locked_floor_cc() < required_locked_floor_cc(cfg, &m.pos)
             || m.pos
                 .pair_cost_cc()
                 .is_some_and(|pc| pc > cfg.safe_pair_cc + PAIR_REPAIR_HYST_CC))
@@ -856,6 +1003,7 @@ fn repair_quote_improves_book(cfg: &Config, m: &Market, side: Side, price_cents:
         return false;
     };
     let current_locked_floor = m.pos.locked_floor_cc();
+    let current_required_floor = required_locked_floor_cc(cfg, &m.pos);
     let missing = side.other();
     let Some(missing_price) = repair_completion_price_cents(cfg, m, missing) else {
         return false;
@@ -863,7 +1011,7 @@ fn repair_quote_improves_book(cfg: &Config, m: &Market, side: Side, price_cents:
 
     let projected_pair_cc = (price_cents as i64 + missing_price as i64) * CC_PER_CENT;
 
-    if current_locked_floor >= cfg.locked_floor_buffer_cc {
+    if current_locked_floor >= current_required_floor {
         return projected_pair_cc <= current_pc - MIN_REPAIR_PAIR_IMPROVE_CC;
     }
 
@@ -886,8 +1034,35 @@ fn maybe_signal_maker_quote(
     side: Side,
     signal: &CoinbaseSignal,
 ) -> Option<ExecCommand> {
+    let plan_cap = if side == hedge_side(m) {
+        pair_plan_completion_cap_cents(cfg, m, side)
+    } else {
+        None
+    };
+    if let Some(cap) = plan_cap {
+        let resting_above_cap = m
+            .resting_hint(side)
+            .as_ref()
+            .is_some_and(|h| h.cancel_requested_at.is_none() && h.price_cents > cap);
+        if resting_above_cap {
+            if let Some(cmd) = cancel_if_resting_above_limit(cfg, ticker, m, now, side, cap) {
+                return Some(cmd);
+            }
+            return None;
+        }
+    }
+
     let mut qty = desired_buy_qty(cfg, m, side, t_rem, window_s).max(1);
-    let mut price = desired_maker_quote(cfg, m, side, signal)?;
+    let mut price = desired_maker_quote(cfg, m, side, signal);
+    if price.is_none() {
+        if let Some(cap) = plan_cap {
+            price = top_maker_price(cfg, m, side).map(|top| top.min(cap));
+        }
+    }
+    let mut price = price?;
+    if let Some(cap) = plan_cap {
+        price = price.min(cap);
+    }
 
     if !admission_ok(cfg, m, side, price, qty) {
         qty = 1;
@@ -943,14 +1118,13 @@ fn pair_open_ok(cfg: &Config, m: &Market, yes_price: u8, no_price: u8, qty: u64)
         .simulate_buy(Side::Yes, yes_price, qty_i64)
         .simulate_buy(Side::No, no_price, qty_i64);
 
-    let cur_floor = m.pos.locked_floor_cc();
-    let new_floor = sim.locked_floor_cc();
-    if new_floor < cur_floor {
+    if sim.locked_floor_cc() < required_locked_floor_cc(cfg, &sim) {
         return false;
     }
 
+    let marginal_pair_cc = marginal_pair_cc(yes_price, no_price);
     if !has_pair(m) {
-        return two_sided_pair_cost_ok(cfg, yes_price, no_price);
+        return marginal_pair_cc <= cfg.market_entry_pair_cost_cc;
     }
 
     if !pair_open_survives_first_leg(cfg, m, yes_price, no_price, qty_u64) {
@@ -961,11 +1135,15 @@ fn pair_open_ok(cfg: &Config, m: &Market, yes_price: u8, no_price: u8, qty: u64)
         return false;
     };
 
-    let allowed_marginal_cc = current_pair_cost_cc
-        .saturating_add(CC_PER_CENT)
-        .min(cfg.safe_pair_cc);
+    if marginal_pair_cc > cfg.safe_pair_cc {
+        return false;
+    }
 
-    marginal_pair_cc(yes_price, no_price) <= allowed_marginal_cc
+    if current_pair_cost_cc > cfg.target_pair_cc {
+        marginal_pair_cc.saturating_add(cfg.pair_scale_min_improve_cc) <= current_pair_cost_cc
+    } else {
+        marginal_pair_cc <= current_pair_cost_cc
+    }
 }
 
 fn pair_open_prices(cfg: &Config, m: &Market, signal: &CoinbaseSignal) -> Option<(u8, u8)> {
@@ -1005,11 +1183,20 @@ fn maybe_open_pair_quote(
 
     log_pair_open_quote_prices(ticker, m, now, yes_price, no_price);
 
-    let (first_side, first_price, second_side, second_price) = if no_price < yes_price {
-        (Side::No, no_price, Side::Yes, yes_price)
+    let first_side = opening_priority_side(signal, yes_price, no_price);
+    let (first_price, second_side, second_price) = if first_side == Side::Yes {
+        (yes_price, Side::No, no_price)
     } else {
-        (Side::Yes, yes_price, Side::No, no_price)
+        (no_price, Side::Yes, yes_price)
     };
+    let budget_cc = marginal_pair_cc(yes_price, no_price);
+
+    if pair_open_is_working(m, yes_price, no_price) {
+        m.set_pair_plan(yes_price, no_price, first_side, budget_cc, now);
+        return PairOpenResult::Working;
+    }
+
+    m.set_pair_plan(yes_price, no_price, first_side, budget_cc, now);
 
     if let Some(cmd) =
         place_or_manage_resting(cfg, ticker, m, now, first_side, first_price, 1, false)
@@ -1022,10 +1209,7 @@ fn maybe_open_pair_quote(
         return PairOpenResult::Command(cmd);
     }
 
-    if pair_open_is_working(m, yes_price, no_price) {
-        return PairOpenResult::Working;
-    }
-
+    m.clear_pair_plan_if_inactive();
     PairOpenResult::Unavailable
 }
 
@@ -1063,15 +1247,14 @@ fn maybe_repair_quote(
     place_or_manage_resting(cfg, ticker, m, now, side, price, 1, false)
 }
 
-fn maybe_balance_ioc(
+fn balance_ioc_candidate(
     cfg: &Config,
-    ticker: &str,
-    m: &mut Market,
+    m: &Market,
     now: Instant,
     t_rem: i64,
     hedge: Side,
     gap: i64,
-) -> Option<ExecCommand> {
+) -> Option<(u8, u64)> {
     if gap <= 0 {
         return None;
     }
@@ -1094,13 +1277,13 @@ fn maybe_balance_ioc(
     }
 
     let qty = (gap as u64).max(1).min(cfg.max_order_qty.max(1));
-    if !admission_ok(cfg, m, hedge, ask, qty) {
+    if !admission_ok(cfg, m, hedge, ask, qty)
+        && !emergency_flatten_ok(cfg, m, hedge, ask, qty, t_rem)
+    {
         return None;
     }
 
-    let (_client_order_id, cmd) = stage_place_order(ticker, m, hedge, ask, qty, Tif::Ioc, false);
-    set_last_taker(m, hedge, now);
-    Some(cmd)
+    Some((ask, qty))
 }
 
 fn should_freeze_trading(cfg: &Config, m: &Market, t_rem: i64) -> bool {
@@ -1110,10 +1293,10 @@ fn should_freeze_trading(cfg: &Config, m: &Market, t_rem: i64) -> bool {
     if !m.pos.is_balanced() {
         return false;
     }
-    m.pos.locked_floor_cc() >= cfg.locked_floor_buffer_cc
-        || m.pos
+    m.pos.locked_floor_cc() >= required_locked_floor_cc(cfg, &m.pos)
+        && m.pos
             .pair_cost_cc()
-            .is_some_and(|pc| pc <= cfg.target_pair_cc.min(strict_balance_cap_cc(cfg)))
+            .is_some_and(|pair_cost_cc| pair_cost_cc <= cfg.safe_pair_cc)
 }
 
 fn cancel_all_if_any(
@@ -1140,6 +1323,7 @@ pub fn decide(
     let now_s = unix_now_s();
     let now = Instant::now();
     let mut t_rem = 0;
+    m.clear_pair_plan_if_inactive();
     let mut gap = unhedged_qty(m);
     let mut allowed_gap = allowed_unhedged_qty(cfg, m);
     update_imbalance_since(m, now, gap);
@@ -1286,6 +1470,7 @@ pub fn decide(
     let hedge = hedge_side(m);
     let strong = hedge.other();
     let no_new_imbalance = t_rem <= cfg.no_new_imbalance_s;
+    let repair_window_open = t_rem > cfg.repair_cutoff_s;
     let open_pairs_allowed = can_open_pairs(cfg, m, &signal, t_rem);
 
     if balanced_but_bad && gap == 0 {
@@ -1303,7 +1488,7 @@ pub fn decide(
             }
         }
 
-        if !no_new_imbalance {
+        if repair_window_open {
             if let Some(repair_side) = repair_side {
                 if let Some(cmd) =
                     maybe_repair_quote(cfg, ticker, m, now, t_rem, window_s, repair_side, &signal)
@@ -1339,7 +1524,11 @@ pub fn decide(
             cfg,
             ticker,
             m,
-            "balanced_bad_no_repair_quote",
+            if repair_window_open {
+                "balanced_bad_no_repair_quote"
+            } else {
+                "balanced_bad_repair_window_closed"
+            },
             t_rem,
             Some(&signal),
             gap,
@@ -1387,12 +1576,21 @@ pub fn decide(
                 || profitable_flatten
                 || (m.mode == Mode::Balance
                     && (t_rem <= cfg.taker_desperate_s || gap >= cfg.taker_force_gap.max(1))));
-        if force_ioc {
-            if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, hedge) {
-                clear_no_order_reason(m);
-                return Some(cmd);
-            }
-            if let Some(cmd) = maybe_balance_ioc(cfg, ticker, m, now, t_rem, hedge, gap) {
+        let ioc_candidate = if force_ioc {
+            balance_ioc_candidate(cfg, m, now, t_rem, hedge, gap)
+        } else {
+            None
+        };
+        if let Some((ask, qty)) = ioc_candidate {
+            if m.resting_hint(hedge).is_some() {
+                if let Some(cmd) = cancel_side_force(cfg, ticker, m, now, hedge) {
+                    clear_no_order_reason(m);
+                    return Some(cmd);
+                }
+            } else {
+                let (_client_order_id, cmd) =
+                    stage_place_order(ticker, m, hedge, ask, qty, Tif::Ioc, false);
+                set_last_taker(m, hedge, now);
                 clear_no_order_reason(m);
                 return Some(cmd);
             }
@@ -1468,6 +1666,30 @@ pub fn decide(
 mod tests {
     use super::*;
 
+    fn fresh_coinbase_snapshot(price: f64) -> CoinbaseSnapshot {
+        CoinbaseSnapshot {
+            product_id: "BTC-USD".to_string(),
+            last_trade_price: Some(price),
+            best_bid: Some(price - 1.0),
+            best_ask: Some(price + 1.0),
+            best_bid_qty: Some(1.0),
+            best_ask_qty: Some(1.0),
+            microprice: Some(price),
+            ema_fast: Some(price),
+            ema_slow: Some(price),
+            vol_ema_usd: Some(1.0),
+            last_update_ms: Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            ),
+            last_heartbeat_ms: None,
+            heartbeat_counter: None,
+            samples: Vec::new(),
+        }
+    }
+
     #[test]
     fn rejects_expensive_hedge_that_does_not_repair_floor_enough() {
         let cfg = Config::default();
@@ -1520,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn final_flatten_uses_floor_buffer_instead_of_pair_cost_cap() {
+    fn emergency_flatten_can_rescue_bad_gap_one_book() {
         let cfg = Config::default();
         let mut m = Market::new();
 
@@ -1534,8 +1756,15 @@ mod tests {
         assert_eq!(m.pos.no_qty, 23);
         assert_eq!(m.pos.locked_floor_cc(), -2_400);
 
-        assert!(admission_ok(&cfg, &m, Side::Yes, 55, 1));
-        assert!(!admission_ok(&cfg, &m, Side::Yes, 76, 1));
+        assert!(!admission_ok(&cfg, &m, Side::Yes, 55, 1));
+        assert!(emergency_flatten_ok(
+            &cfg,
+            &m,
+            Side::Yes,
+            55,
+            1,
+            cfg.taker_desperate_s + 10,
+        ));
     }
 
     #[test]
@@ -1662,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_inventory_allows_same_or_one_cent_worse_but_not_more() {
+    fn existing_inventory_at_or_below_target_requires_equal_or_better_pairs() {
         let cfg = Config::default();
         let mut m = Market::new();
 
@@ -1674,8 +1903,39 @@ mod tests {
         assert_eq!(m.pos.pair_cost_cc(), Some(9_800));
         assert_eq!(m.pos.locked_floor_cc(), 1_000);
         assert!(pair_open_ok(&cfg, &m, 30, 68, 1));
-        assert!(pair_open_ok(&cfg, &m, 31, 68, 1));
-        assert!(!pair_open_ok(&cfg, &m, 32, 68, 1));
+        assert!(!pair_open_ok(&cfg, &m, 31, 68, 1));
+        assert!(pair_open_ok(&cfg, &m, 29, 68, 1));
+    }
+
+    #[test]
+    fn existing_inventory_above_target_requires_small_pair_improvement() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+
+        for _ in 0..2 {
+            m.pos.apply_fill(Side::Yes, 30, 1);
+        }
+        for _ in 0..3 {
+            m.pos.apply_fill(Side::Yes, 31, 1);
+        }
+        for _ in 0..5 {
+            m.pos.apply_fill(Side::No, 68, 1);
+        }
+
+        assert_eq!(m.pos.pair_cost_cc(), Some(9_860));
+        assert!(pair_open_ok(&cfg, &m, 30, 68, 1));
+        assert!(!pair_open_ok(&cfg, &m, 31, 68, 1));
+    }
+
+    #[test]
+    fn pair_plan_completion_cap_tracks_first_fill_budget() {
+        let cfg = Config::default();
+        let mut m = Market::new();
+
+        m.set_pair_plan(45, 53, Side::Yes, 98 * CC_PER_CENT, Instant::now());
+        m.apply_tracked_fill(Side::Yes, 45, 1);
+
+        assert_eq!(pair_plan_completion_cap_cents(&cfg, &m, Side::No), Some(54));
     }
 
     #[test]
@@ -1956,5 +2216,65 @@ mod tests {
 
         assert!(repair_quote_improves_book(&cfg, &m, Side::Yes, 32));
         assert!(!repair_quote_improves_book(&cfg, &m, Side::No, 65));
+    }
+
+    #[test]
+    fn balanced_bad_repair_stops_after_repair_cutoff() {
+        let cfg = Config::default();
+        let now_s = unix_now_s();
+
+        let mut before_cutoff = Market::new();
+        before_cutoff.open_ts = Some(now_s - (cfg.window_s - 120));
+        before_cutoff.close_ts = Some(now_s + 120);
+        before_cutoff.strike_price = Some(100_000.0);
+        before_cutoff.book.yes_bids[40] = 1;
+        before_cutoff.book.no_bids[58] = 1;
+        before_cutoff.pos.apply_fill(Side::Yes, 45, 1);
+        before_cutoff.pos.apply_fill(Side::Yes, 45, 1);
+        before_cutoff.pos.apply_fill(Side::Yes, 45, 1);
+        before_cutoff.pos.apply_fill(Side::Yes, 44, 1);
+        before_cutoff.pos.apply_fill(Side::No, 57, 1);
+        before_cutoff.pos.apply_fill(Side::No, 57, 1);
+        before_cutoff.pos.apply_fill(Side::No, 57, 1);
+        before_cutoff.pos.apply_fill(Side::No, 57, 1);
+
+        let before_cmd = decide(
+            &cfg,
+            "TEST",
+            &mut before_cutoff,
+            Some(&fresh_coinbase_snapshot(99_970.0)),
+        );
+        assert!(matches!(
+            before_cmd,
+            Some(ExecCommand::PlaceOrder {
+                side: Side::Yes,
+                tif: Tif::Gtc,
+                post_only: true,
+                ..
+            })
+        ));
+
+        let mut after_cutoff = Market::new();
+        after_cutoff.open_ts = Some(now_s - (cfg.window_s - 60));
+        after_cutoff.close_ts = Some(now_s + 60);
+        after_cutoff.strike_price = Some(100_000.0);
+        after_cutoff.book.yes_bids[40] = 1;
+        after_cutoff.book.no_bids[58] = 1;
+        after_cutoff.pos.apply_fill(Side::Yes, 45, 1);
+        after_cutoff.pos.apply_fill(Side::Yes, 45, 1);
+        after_cutoff.pos.apply_fill(Side::Yes, 45, 1);
+        after_cutoff.pos.apply_fill(Side::Yes, 44, 1);
+        after_cutoff.pos.apply_fill(Side::No, 57, 1);
+        after_cutoff.pos.apply_fill(Side::No, 57, 1);
+        after_cutoff.pos.apply_fill(Side::No, 57, 1);
+        after_cutoff.pos.apply_fill(Side::No, 57, 1);
+
+        let after_cmd = decide(
+            &cfg,
+            "TEST",
+            &mut after_cutoff,
+            Some(&fresh_coinbase_snapshot(99_970.0)),
+        );
+        assert!(after_cmd.is_none());
     }
 }

@@ -102,7 +102,7 @@ pub fn paper_on_trade_fill(
         ?maker_side,
         maker_price, fill_price, fill_qty, "PAPER maker filled"
     );
-    m.pos.apply_fill(maker_side, fill_price, fill_qty as i64);
+    m.apply_tracked_fill(maker_side, fill_price, fill_qty as i64);
     crate::report::log_position(ticker, &m.pos);
 
     let fully = m.orders.record_fill_by_client(client_id, fill_qty);
@@ -179,7 +179,7 @@ pub async fn paper_place(
                     fill_qty,
                     "PAPER ioc filled"
                 );
-                g.pos.apply_fill(side, ask, fill_qty as i64);
+                g.apply_tracked_fill(side, ask, fill_qty as i64);
                 let _ = g.orders.record_fill_by_client(client_order_id, fill_qty);
                 crate::report::log_position(ticker, &g.pos);
             } else {

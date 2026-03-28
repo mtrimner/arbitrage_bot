@@ -304,7 +304,7 @@ async fn handle_fill(shared: &Shared, uf: UserFill) -> Result<()> {
         let mut g = ts.mkt.write().await;
 
         // Update position.
-        g.pos.apply_fill(purchased, price, fill_qty);
+        g.apply_tracked_fill(purchased, price, fill_qty);
         if let Ok(client_id) = Uuid::parse_str(&m.client_order_id) {
             // Make sure order_id mapping exists even if Rest ack is late
             g.orders.link_order_id_if_missing(client_id, &m.order_id);

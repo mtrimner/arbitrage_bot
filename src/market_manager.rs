@@ -352,6 +352,7 @@ pub async fn run_market_manager(
                     cur.strike_price,
                     coinbase_price,
                     cfg.locked_floor_buffer_cc,
+                    cfg.locked_floor_per_pair_cc,
                     &pos,
                 )
                 .await

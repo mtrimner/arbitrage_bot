@@ -127,8 +127,13 @@ pub struct Config {
     pub inventory_skew_max_cents: u8,
     pub market_entry_pair_cost_cc: i64,
     pub locked_floor_buffer_cc: i64,
+    pub locked_floor_per_pair_cc: i64,
+    pub pair_scale_min_improve_cc: i64,
+    pub pair_completion_slippage_cents: u8,
     pub catchup_plausibility_buffer_cents: u8,
     pub no_new_imbalance_s: i64,
+    pub repair_cutoff_s: i64,
+    pub emergency_flatten_min_improve_cc: i64,
 
     pub results_file: String,
 }
@@ -232,8 +237,13 @@ impl Default for Config {
             inventory_skew_max_cents: 3,
             market_entry_pair_cost_cc: 9850,
             locked_floor_buffer_cc: 100,
+            locked_floor_per_pair_cc: 25,
+            pair_scale_min_improve_cc: 10,
+            pair_completion_slippage_cents: 1,
             catchup_plausibility_buffer_cents: 1,
             no_new_imbalance_s: 300,
+            repair_cutoff_s: 90,
+            emergency_flatten_min_improve_cc: 500,
 
             results_file: "results.csv".to_string(),
         }
@@ -284,6 +294,31 @@ impl Config {
         if let Ok(v) = env::var("LOCKED_FLOOR_BUFFER_CC") {
             if let Ok(x) = v.trim().parse::<i64>() {
                 cfg.locked_floor_buffer_cc = x.max(0);
+            }
+        }
+        if let Ok(v) = env::var("LOCKED_FLOOR_PER_PAIR_CC") {
+            if let Ok(x) = v.trim().parse::<i64>() {
+                cfg.locked_floor_per_pair_cc = x.max(0);
+            }
+        }
+        if let Ok(v) = env::var("PAIR_SCALE_MIN_IMPROVE_CC") {
+            if let Ok(x) = v.trim().parse::<i64>() {
+                cfg.pair_scale_min_improve_cc = x.max(0);
+            }
+        }
+        if let Ok(v) = env::var("PAIR_COMPLETION_SLIPPAGE_CENTS") {
+            if let Ok(x) = v.trim().parse::<u8>() {
+                cfg.pair_completion_slippage_cents = x;
+            }
+        }
+        if let Ok(v) = env::var("REPAIR_CUTOFF_S") {
+            if let Ok(x) = v.trim().parse::<i64>() {
+                cfg.repair_cutoff_s = x.max(0);
+            }
+        }
+        if let Ok(v) = env::var("EMERGENCY_FLATTEN_MIN_IMPROVE_CC") {
+            if let Ok(x) = v.trim().parse::<i64>() {
+                cfg.emergency_flatten_min_improve_cc = x.max(0);
             }
         }
 
